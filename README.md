@@ -23,18 +23,18 @@ network costs.
 ## Highlights
 
 - **Tokenizer-free:** inputs and outputs are UTF-8 bytes; no tokenizer files, BPE
-  merges, or vocabulary download is required.
+merges, or vocabulary download is required.
 - **Ternary weights:** quantized Transformer matrices use `{-1, 0, +1}` weights.
 - **Hybrid activations:** training transitions from W1.58A8 to a W1.58A4 path with
-  INT4 inputs, TopK sparsification, and INT8 intermediates.
+INT4 inputs, TopK sparsification, and INT8 intermediates.
 - **Parallel denoising:** multiple masked positions can be updated during each
-  diffusion step.
+diffusion step.
 - **Recurrent depth:** the default RDT executes one to three recurrent refinement
-  passes and supports an inference-time loop override.
+passes and supports an inference-time loop override.
 - **Long-context path:** 16,384-byte training sequences become 4,096 global latent
-  positions through four-byte patches.
+positions through four-byte patches.
 - **Real packed inference:** inference-only export can replace float quantization
-  simulation with packed 2-bit ternary weights and Triton/CPU kernels.
+simulation with packed 2-bit ternary weights and Triton/CPU kernels.
 
 ## Yeoubi compared with a standard LLM
 
@@ -63,7 +63,7 @@ git clone https://github.com/Fury7425/bitDiffusion-a4.8.git Yeoubi
 cd Yeoubi
 
 python -m venv .venv
-source .venv/bin/activate              # Windows PowerShell: .venv\Scripts\Activate.ps1
+source .venv/bin/activate # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
@@ -73,298 +73,301 @@ code is Apache 2.0. See [LICENSE](LICENSE).
 
 ## Step-by-step workflows
 
-<details>
-<summary><strong>Train a model from scratch</strong></summary>
-
-### 1. Review and prepare the data mixture
-
-The default manifest, [`configs/data_mix.json`](configs/data_mix.json), describes a
-multilingual 20B-unique-byte research mixture. Dataset licenses and access conditions
-can change, so review every active dataset card before downloading or training.
-
-If a source requires Hugging Face authentication, set a token in your shell:
-
-```bash
-export HF_TOKEN=hf_your_token_here
-# Windows PowerShell: $env:HF_TOKEN = "hf_your_token_here"
-```
-
-Build the configured dataset:
-
-```bash
-python prepare_hf_jsonl.py --manifest configs/data_mix.json
-```
 
-This writes the combined training and validation files to `data/train/` and
-`data/val/`, keeps resumable source shards in `data/hf_shards/`, and writes composition
-and rejection statistics to `data/dataset_report.json`.
+Train a model from scratch
 
-Do not start with the full 20B-byte download. Clone the manifest, reduce each source's
-`target_unique_bytes`, and validate a small mixture first. The detailed rollout,
-decontamination, rebuild, and audit procedure is in
-[`docs/DATASET_GUIDE.md`](docs/DATASET_GUIDE.md).
 
-### 2. Optionally pre-tokenize for faster loading
 
-Because tokenization is only UTF-8 byte encoding, the helper materializes JSONL records
-into `.pt` shards:
 
-```bash
-python scripts/pretokenize.py \
-  --jsonl "data/train/*.jsonl" \
-  --output_dir data/train_pt
-```
 
-Use either all JSONL files or all `.pt` shards for a run; do not mix both formats in
-one glob.
 
-### 3. Run a small end-to-end smoke test
 
-This validates data loading, forward/backward passes, checkpointing, and sampling with
-a deliberately small standard Transformer:
 
-```bash
-python train.py \
-  --model_type standard \
-  --hidden_dim 256 --n_layers 4 --n_heads 4 --ffn_dim 1024 \
-  --max_seq_len 512 --batch_size 2 --grad_accum_steps 1 \
-  --max_steps 20 --warmup_steps 2 --save_every 10 \
-  --val_every 10 --val_max_batches 2 --num_workers 0 \
-  --train_data "data/train/*.jsonl" \
-  --val_data "data/val/*.jsonl" \
-  --output_dir checkpoints/smoke \
-  --wandb_project ""
-```
 
-On a CPU, add `--device cpu --bf16 false`. This is only a correctness test and will be
-slow; it is not a useful training configuration.
 
-### 4. Launch the default ~1B RDT run
 
-The model and optimizer defaults are already defined in `TrainConfig`:
-
-```bash
-wandb login                              # optional; omit if WandB is disabled
-python train.py \
-  --train_data "data/train_pt/*.pt" \
-  --val_data "data/val/*.jsonl" \
-  --output_dir checkpoints/pretrain
-```
-
-If you did not create `.pt` shards, set `--train_data "data/train/*.jsonl"` instead.
-To disable Weights & Biases, pass `--wandb_project ""`.
 
-The default run performs:
 
-```text
-57,500 optimizer steps
-× 2 examples/device
-× 16 gradient-accumulation batches
-× 16,384 byte positions
-= 30.1B padded byte positions
-```
-
-Padded positions are not the same as unique dataset bytes. Use
-`data/dataset_report.json` to distinguish accepted bytes, overlap, padding, and EOS
-positions.
-
-### 5. Resume safely after interruption
-
-```bash
-python train.py \
-  --resume_from checkpoints/pretrain/step_25000.pt \
-  --train_data "data/train_pt/*.pt" \
-  --val_data "data/val/*.jsonl" \
-  --output_dir checkpoints/pretrain
-```
 
-`--resume_from` restores model, optimizer, scheduler, step, and activation stage. Only
-load checkpoints you trust; use `--trust_checkpoint true` solely for a trusted legacy
-checkpoint that requires full pickle loading.
-
-### 6. Monitor the A8 → A4 transition
-
-With the default `--a4_warmup_fraction 0.10`, steps 0–51,749 use W1.58A8 and steps
-51,750–57,500 use the target hybrid W1.58A4 path. A checkpoint is saved at the stage
-transition. Packed weights are not differentiable, so never call
-`pack_for_inference()` during training.
 
-</details>
-
-<details>
-<summary><strong>Fine-tune or post-train a checkpoint</strong></summary>
-
-### 1. Create response-supervision JSONL
-
-Each line needs a `prompt` and either a complete `response` or separate `reasoning` and
-`answer` fields:
-
-```json
-{"prompt":"If 3x + 2 = 11, find x.","reasoning":"Subtract 2, then divide by 3.","answer":"3"}
-```
-
-Store training and validation files separately, for example:
-
-```text
-data/post_train/reasoning/train/examples.jsonl
-data/post_train/reasoning/val/examples.jsonl
-```
-
-During post-training, prompt bytes are frozen and diffusion loss is applied only to the
-assistant response region. Long examples are truncated to `max_seq_len`, so inspect the
-rendered prompt/response format before a large run.
-
-### 2. Run reasoning SFT
-
-```bash
-python train.py \
-  --finetune_from checkpoints/pretrain/final.pt \
-  --training_stage reasoning_sft \
-  --train_data "data/post_train/reasoning/train/*.jsonl" \
-  --val_data "data/post_train/reasoning/val/*.jsonl" \
-  --output_dir checkpoints/reasoning_sft \
-  --lr 2e-5 --max_steps 5000 --warmup_steps 200
-```
-
-`--finetune_from` loads model weights but starts a new optimizer, scheduler, and step
-counter. It is mutually exclusive with `--resume_from`.
-
-### 3. Optionally run correction tuning
-
-Correction training can synthesize mistakes in the assistant region:
-
-```bash
-python train.py \
-  --finetune_from checkpoints/reasoning_sft/final.pt \
-  --training_stage correction \
-  --use_self_cond true --self_condition_prob 0.5 \
-  --correction_noise_prob 0.15 --correction_t_max 0.5 \
-  --train_data "data/post_train/correction/train/*.jsonl" \
-  --val_data "data/post_train/correction/val/*.jsonl" \
-  --output_dir checkpoints/correction \
-  --lr 1e-5 --max_steps 3000 --warmup_steps 100
-```
-
-Clean records are sufficient. To supply an explicit erroneous draft, add
-`corrupted_response`, or add `corrupted_reasoning` and `corrupted_answer`. The clean
-and corrupted response must have the same UTF-8 byte length after truncation so target
-positions align.
-
-### 4. Resume a fine-tuning run
-
-After the new run has started, resume its own checkpoint with `--resume_from` rather
-than returning to `--finetune_from`:
-
-```bash
-python train.py \
-  --resume_from checkpoints/reasoning_sft/step_2500.pt \
-  --training_stage reasoning_sft \
-  --train_data "data/post_train/reasoning/train/*.jsonl" \
-  --val_data "data/post_train/reasoning/val/*.jsonl" \
-  --output_dir checkpoints/reasoning_sft \
-  --lr 2e-5 --max_steps 5000 --warmup_steps 200
-```
-
-For legacy checkpoints that contain THINK embeddings, preserve the checkpoint's
-original `N_think` topology and set `--think_prob 0`. New runs keep legacy thinking
-tokens disabled.
-
-</details>
-
-<details>
-<summary><strong>Use, launch, and export the model</strong></summary>
-
-### 1. Generate from a training checkpoint
-
-```bash
-python sample.py \
-  --checkpoint checkpoints/reasoning_sft/final.pt \
-  --prompt "The theory of relativity states that" \
-  --length 512 --steps 20
-```
-
-`--length` is the total byte length of the prompt plus generated canvas, not a count of
-new subword tokens. The checkpoint's saved `model_config` is detected automatically.
-
-Useful controls:
-
-| Flag | Default | Purpose |
-|---|---:|---|
-| `--steps` | 20 | More denoising steps can improve quality but increase latency |
-| `--temperature` | 0.9 | Sampling temperature |
-| `--top_p` | 0.95 | Nucleus sampling cutoff |
-| `--num_samples` | 1 | Independent samples to generate |
-| `--device` | `auto` | `auto`, `cuda`, `xpu`, `cpu`, or `rocm` |
-| `--n_loops` | checkpoint default | Override RDT recurrence depth |
-| `--verbose` | off | Print intermediate denoising states |
-
-### 2. Use EOS-controlled or block generation
-
-Let the model stop at EOS, up to a hard cap:
-
-```bash
-python sample.py \
-  --checkpoint checkpoints/reasoning_sft/final.pt \
-  --block --auto_length --max_length 2048 \
-  --prompt "What is the mitochondrion?"
-```
-
-Generate a longer answer one block at a time while reusing committed KV state:
-
-```bash
-python sample.py \
-  --checkpoint checkpoints/reasoning_sft/final.pt \
-  --block --block_size 256 \
-  --prompt "Write a detailed explanation of" \
-  --length 2048 --steps 20
-```
-
-The repository currently provides a command-line sampler, not an HTTP inference server.
-Wrap `yeoubi.sample` in your serving framework if you need a web API.
-
-### 3. Use legacy thinking only when the checkpoint supports it
-
-```bash
-python sample.py \
-  --checkpoint checkpoints/legacy_think.pt \
-  --thinking --adaptive_think --max_think_steps 128 \
-  --prompt "Explain how neural networks learn" \
-  --length 512 --answer_steps 20 --verbose
-```
-
-Thinking is disabled by default and exists for compatible legacy checkpoints and
-ablations. `--adaptive_think` by itself does not add THINK positions to a checkpoint
-that was not trained with them.
-
-### 4. Export portable weights
-
-```bash
-python export.py \
-  --checkpoint checkpoints/reasoning_sft/final.pt \
-  --output_dir exports/yeoubi-1b \
-  --format safetensors
-```
-
-This writes `model.safetensors`, `model_config.json`, and `export_metadata.json`. No
-tokenizer files are created because byte IDs define the text interface.
-
-### 5. Export packed, inference-only weights
-
-```bash
-python export.py \
-  --checkpoint checkpoints/reasoning_sft/final.pt \
-  --output_dir exports/yeoubi-1b-packed \
-  --format safetensors --pack
-```
-
-`--pack` replaces each trainable `latent_weight` with `w_packed` and `scale_w`. The
-result is much smaller but cannot be fine-tuned. Keep the original checkpoint.
-
-GGUF runtimes such as llama.cpp cannot execute this architecture: it is a
-bidirectional diffusion model, not an autoregressive decoder. Use the included runtime
-and safetensors or PyTorch weights.
-
-</details>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Fine-tune or post-train a checkpoint
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Use, launch, and export the model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ## Architecture
 
@@ -374,13 +377,13 @@ The default `model_type="rdt"` topology is:
 
 ```text
 UTF-8 bytes
-  → local byte encoder (4 bytes → 1 latent patch)
-  → 4 prelude blocks
-  → 2 pre-recurrent bridge blocks
-  → 2 recurrent blocks × 1–3 refinement loops
-  → 2 post-recurrent bridge blocks
-  → 4 coda blocks
-  → local byte decoder (1 latent patch → 4 byte predictions)
+→ local byte encoder (4 bytes → 1 latent patch)
+→ 4 prelude blocks
+→ 2 pre-recurrent bridge blocks
+→ 2 recurrent blocks × 1–3 refinement loops
+→ 2 post-recurrent bridge blocks
+→ 4 coda blocks
+→ local byte decoder (1 latent patch → 4 byte predictions)
 ```
 
 The global stack is bidirectional. The diffusion timestep is reinjected at each
@@ -415,12 +418,12 @@ sequences; the sampler decodes these with replacement characters instead of fail
 
 - The cosine absorbing-state process replaces selected byte positions with MASK.
 - MDLM NELBO weighting is the default; uniform masked cross-entropy is available with
-  `--loss_weighting uniform`.
+`--loss_weighting uniform`.
 - Full-precision latent weights are retained during training and ternarized with a
-  straight-through estimator on each forward pass.
+straight-through estimator on each forward pass.
 - The first 90% of training uses INT8 activations (W1.58A8).
 - The last 10% uses hybrid INT4 inputs, TopK(55%) sparsification, and INT8
-  intermediates (W1.58A4).
+intermediates (W1.58A4).
 - Block-causal examples are mixed into training to support cached block diffusion.
 
 ### Reference training hyperparameters
@@ -450,8 +453,8 @@ documents to stable train or validation splits before chunking. Its default byte
 distribution is:
 
 ```text
-128: 3%    256: 5%    512: 7%    1,024: 10%
-2,048: 15%    4,096: 25%    8,192: 20%    16,384: 15%
+128: 3% 256: 5% 512: 7% 1,024: 10%
+2,048: 15% 4,096: 25% 8,192: 20% 16,384: 15%
 ```
 
 Overlap is capped at 128 bytes and at one eighth of a chunk. The final chunk of each
@@ -468,7 +471,7 @@ That path preserves trainability but does not provide a low-bit speedup. Calling
 2. stores one scale per packed matrix;
 3. removes the trainable latent matrix; and
 4. dispatches to a Triton kernel when supported, otherwise to a correctness-oriented
-   CPU fallback.
+CPU fallback.
 
 | | Training / float simulation | Packed inference |
 |---|---|---|
@@ -536,7 +539,7 @@ than stored parameter count alone.
 
 > [!IMPORTANT]
 > These are order-of-magnitude planning ranges, not measured bills. The estimates were
-> repriced on **2026-07-22** at a rounded **$4 per H100 GPU-hour**. At that time,
+> repriced on **2026-07-21** at a rounded **$4 per H100 GPU-hour**. At that time,
 > [Runpod listed H100 SXM pods at about $2.99/hour](https://www.runpod.io/pricing),
 > while [Lambda listed H100 instances around $3.99–$4.29 per GPU-hour](https://lambda.ai/pricing).
 > Prices, availability, taxes, storage, networking, orchestration, and reserved/spot
@@ -548,10 +551,10 @@ than stored parameter count alone.
 - Mixed sequence lengths rather than padding every example to the maximum window.
 - Approximately 40% training model-FLOP utilization.
 - A conservative 2–3.5× effective dense-model training reduction relative to an
-  otherwise similar full-resolution design; MoE dispatch is budgeted more cautiously.
+otherwise similar full-resolution design; MoE dispatch is budgeted more cautiously.
 - No assumed sample-efficiency gain from data cleaning.
 - GPU compute only; dataset preparation, CPU RAM, storage, egress, failed runs,
-  evaluation, and post-training are excluded.
+evaluation, and post-training are excluded.
 
 Ternary inference savings do not transfer directly to training: training keeps latent
 weights, optimizer state, and straight-through quantization. Twenty bytes are only
@@ -618,22 +621,22 @@ than a promise.
 
 ```text
 yeoubi/
-  byte_codec.py       UTF-8 byte encoding and fixed special IDs
-  data.py             JSONL and pre-tokenized streaming loaders
-  data_pipeline.py    dataset processing utilities
-  diffusion.py        absorbing-mask schedule and loss
-  model.py            BitLinear, attention, FFN/MoE, flat Transformer
-  rdt.py              recurrent-depth Transformer (default)
-  quantization.py     activation and KV-cache quantization
-  kernels.py          packed ternary kernels and fallbacks
-  muon.py             Muon optimizer
-  train.py            training and post-training loop
-  sample.py           full-canvas and block samplers
-  export.py           safetensors/PyTorch export and packing
+byte_codec.py UTF-8 byte encoding and fixed special IDs
+data.py JSONL and pre-tokenized streaming loaders
+data_pipeline.py dataset processing utilities
+diffusion.py absorbing-mask schedule and loss
+model.py BitLinear, attention, FFN/MoE, flat Transformer
+rdt.py recurrent-depth Transformer (default)
+quantization.py activation and KV-cache quantization
+kernels.py packed ternary kernels and fallbacks
+muon.py Muon optimizer
+train.py training and post-training loop
+sample.py full-canvas and block samplers
+export.py safetensors/PyTorch export and packing
 
 configs/data_mix.json dataset mixture and source quotas
 docs/DATASET_GUIDE.md curation, chunking, and audit guide
-docs/LONG_CONTEXT.md  long-context design and validation notes
+docs/LONG_CONTEXT.md long-context design and validation notes
 scripts/pretokenize.py
 scripts/bench_packed_linear.py
 prepare_hf_jsonl.py
@@ -656,16 +659,73 @@ without passing the long-context tests and a continued-training evaluation:
 python -m pytest -q tests/test_long_context.py
 ```
 
-## References
+## Research references
 
-- Ma et al., [The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits](https://arxiv.org/abs/2402.17764)
-- Wang et al., [BitNet a4.8: 4-bit Activations for 1-bit LLMs](https://arxiv.org/abs/2411.04965)
-- Sahoo et al., [Simple and Effective Masked Diffusion Language Models](https://arxiv.org/abs/2406.07524)
-- Lou et al., [Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution](https://arxiv.org/abs/2310.16834)
-- Peng et al., [YaRN: Efficient Context Window Extension of Large Language Models](https://arxiv.org/abs/2309.00071)
-- Arriola et al., [Block Diffusion: Interpolating Between Autoregressive and Diffusion Language Models](https://arxiv.org/abs/2503.09573)
-- Dao, [FlashAttention-2](https://arxiv.org/abs/2307.08691)
-- Zhang and Sennrich, [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467)
+Research-paper and lab/project references current through **2026-07-21**. These links
+identify the methods that materially informed the implementation; they do not imply
+that Yeoubi reproduces the cited results.
+
+### Core model design
+
+- Microsoft Research — Ma et al., [The Era of 1-bit LLMs: All Large Language
+Models are in 1.58 Bits](https://arxiv.org/abs/2402.17764): ternary BitNet b1.58
+weights and straight-through training.
+- Microsoft Research — Wang, Ma, and Wei, [BitNet a4.8: 4-bit Activations for
+1-bit LLMs](https://arxiv.org/abs/2411.04965): hybrid INT4/INT8 activations,
+TopK sparsity, and low-bit KV-cache design.
+- Sahoo et al., [Simple and Effective Masked Diffusion Language
+Models](https://arxiv.org/abs/2406.07524): absorbing-mask MDLM training and NELBO
+weighting.
+- Stanford — Lou, Meng, and Ermon, [Discrete Diffusion Modeling by Estimating
+the Ratios of the Data Distribution](https://arxiv.org/abs/2310.16834): discrete
+diffusion and score-entropy foundations.
+- Arriola et al., [Block Diffusion: Interpolating Between Autoregressive and
+Diffusion Language Models](https://arxiv.org/abs/2503.09573): block-causal
+training, variable-length generation, and committed KV reuse.
+- Nous Research — Peng et al., [YaRN: Efficient Context Window Extension of
+Large Language Models](https://arxiv.org/abs/2309.00071): long-context RoPE
+interpolation. The linked arXiv record was at v3 by the cutoff date.
+- Kye Gomez, [OpenMythos](https://github.com/kyegomez/OpenMythos) and
+[RDT design notes](https://github.com/kyegomez/OpenMythos/blob/main/docs/open_mythos.md):
+source for the Prelude–RecurrentBlock–Coda recurrent-depth layout.
+
+### Optimization and efficient inference
+
+- Jordan et al., [Muon: An Optimizer for Hidden Layers in Neural
+Networks](https://kellerjordan.github.io/posts/muon/) and
+[reference code](https://github.com/KellerJordan/Muon): Newton–Schulz update
+orthogonalization.
+- Moonshot AI/Kimi — Liu et al., [Muon is Scalable for LLM
+Training](https://arxiv.org/abs/2502.16982): large-model Muon scaling practice.
+- DeepSeek-AI, [DeepSeek-V4: Towards Highly Efficient Million-Token Context
+Intelligence](https://arxiv.org/abs/2606.19348): large-scale hybrid Muon usage;
+Yeoubi does not claim to implement DeepSeek-V4's attention or mHC architecture.
+- Princeton — Dao, [FlashAttention-2](https://arxiv.org/abs/2307.08691): fused,
+memory-efficient attention background for the PyTorch SDPA path.
+- Google Research — Zandieh et al., [TurboQuant: Online Vector Quantization with
+Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874): background for
+the optional rotated/Lloyd–Max KV-cache quantizer, not a complete reproduction.
+
+### Supporting methods
+
+- Vaswani et al., [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+— Transformer foundation.
+- Su et al., [RoFormer](https://arxiv.org/abs/2104.09864) — rotary position embeddings.
+- Zhang and Sennrich, [Root Mean Square Layer
+Normalization](https://arxiv.org/abs/1910.07467) — RMSNorm.
+- Fedus, Zoph, and Shazeer, [Switch Transformers](https://arxiv.org/abs/2101.03961)
+— sparse expert routing and load balancing.
+- Graves, [Adaptive Computation Time](https://arxiv.org/abs/1603.08983) — soft
+recurrent-loop weighting background.
+- Hu et al., [LoRA](https://arxiv.org/abs/2106.09685) — per-iteration low-rank adapters.
+- Strudel et al., [Self-conditioned Embedding Diffusion for Text
+Generation](https://arxiv.org/abs/2211.04236) — optional denoising self-conditioning.
+- Loshchilov and Hutter, [Decoupled Weight Decay
+Regularization](https://arxiv.org/abs/1711.05101) — AdamW.
+- Shazeer, [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202)
+— SwiGLU feed-forward layers.
+- Holtzman et al., [The Curious Case of Neural Text
+Degeneration](https://arxiv.org/abs/1904.09751) — top-p/nucleus sampling.
 
 ## License and data notice
 
@@ -675,4 +735,4 @@ python -m pytest -q tests/test_long_context.py
 
 The data manifest is provenance metadata, not legal approval. Reconfirm source terms,
 PII handling, benchmark decontamination, and the intended license for resulting weights
-before training or redistribution.
+before training or redistribution. 
