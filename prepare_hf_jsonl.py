@@ -1,428 +1,557 @@
-# SPDX-License-Identifier: BigCode-OpenRAIL-M-1.0
-# Model weights derived from this code are subject to the BigCode OpenRAIL-M license.
-# Source code is licensed under Apache 2.0. See LICENSE for details.
-"""
-BitDiffusion a4.8 — English-only data preparation (~20B tokens)
+# SPDX-License-Identifier: Apache-2.0
+"""Prepare a leakage-safe, curated byte-level pretraining mixture.
 
-OUTPUT FORMAT  (matches StreamingJsonlDataset in data.py — do NOT change)
-  Each line: {"text": "..."}
+The pipeline streams Hugging Face datasets, filters and deduplicates complete
+documents, assigns each document to a stable split, and only then creates byte
+chunks. Quotas are measured in unique accepted UTF-8 document bytes; overlap,
+EOS positions, and emitted training positions are tracked separately.
 
-RECOMMENDED TRAINING CONFIGS
-──────────────────────────────────────────────────────────────────
-NOTE: train.py ships the canonical defaults (seq_len=4096, batch_size=8,
-grad_accum=16, max_steps=57_500, lr=2e-4, warmup=4000) — also ~30.1B tokens.
-The configs below are equivalent alternatives (same token budget, different
-seq_len/batch trade-offs), not a second source of truth.
-
-1B MODEL  (~30B tokens — 30 tokens/param, uses full data mix)
-  hidden_dim=2048  n_layers=16  n_heads=16  head_dim=128
-  ffn_dim=8192     seq_len=2048  batch_size=16  grad_accum=8
-  peak_lr=1.5e-4   warmup_steps=2000  max_steps=115_000
-  a4_warmup_fraction=0.10  gradient_checkpointing=True
-  → 115K × (16 × 2048 × 8) = ~30.1B tokens
-
-  Budget variant (~13B tokens / $200 / 7 days A100 40GB spot):
-    max_steps=50_000 → ~13.1B tokens (undertrained but functional)
-
-2B MODEL  (~43B tokens — 21 tokens/param, full data mix)
-  hidden_dim=2048  n_layers=32  n_heads=16  head_dim=128
-  ffn_dim=8192     seq_len=2048  batch_size=8   grad_accum=16
-  peak_lr=1e-4     warmup_steps=2000  max_steps=165_000
-  a4_warmup_fraction=0.10  gradient_checkpointing=True
-  → 165K × (8 × 2048 × 16) = ~43.3B tokens
-
-  Budget variant (~20B tokens / $450):
-    max_steps=76_000 → ~19.9B tokens
-──────────────────────────────────────────────────────────────────
-
-DATASET MIX  (~20B tokens, English only, no code)
-┌─────────────────┬──────────────────────────────────────────────────────┬───────┐
-│ Slug            │ Source                                               │Tokens │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ fineweb_edu     │ HuggingFaceFW/fineweb-edu (sample-100BT)             │   8B  │
-│                 │ Llama-3-70B scored educational web — gold standard   │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ dclm            │ HuggingFaceFW/dclm_100BT                             │   4B  │
-│                 │ Model-filtered CC; beats SlimPajama/RefinedWeb/Dolma │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ open_web_math   │ open-web-math/open-web-math (14.7B total)            │   3B  │
-│                 │ Best-in-class math/STEM web corpus                   │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ cosmopedia      │ HuggingFaceTB/cosmopedia (~30B total)                │   2B  │
-│                 │ Synthetic textbook/story — strong reasoning signal   │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ wikipedia_en    │ wikimedia/wikipedia 20231101.en (~4.4B total)        │   1B  │
-│                 │ Encyclopedic ground-truth factual knowledge          │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ finepdfs        │ HuggingFaceFW/finepdfs_100BT                        │   1B  │
-│                 │ PDF-extracted academic papers, books, tech docs      │       │
-├─────────────────┼──────────────────────────────────────────────────────┼───────┤
-│ mathcode_pile   │ MathGenie/MathCode-Pile (19.2B total)               │   1B  │
-│                 │ Math web + textbooks + model-synth + math code       │       │
-└─────────────────┴──────────────────────────────────────────────────────┴───────┘
-                                                               TOTAL:    20B
+See ``docs/DATASET_GUIDE.md`` before starting a large run.
 """
 
+from __future__ import annotations
+
+import argparse
+import hashlib
 import json
+import math
 import os
 import random
 import tempfile
+from collections import Counter
 from pathlib import Path
+from typing import Iterator, Mapping
 
-from datasets import load_dataset
-from transformers import AutoTokenizer
+from yeoubi.data_pipeline import (
+    ContaminationIndex,
+    DedupIndex,
+    assess_quality,
+    assign_split,
+    chunk_document,
+    document_id,
+    handle_pii,
+    iter_jsonl_texts,
+    source_metadata,
+)
 
-TOKENIZER_NAME = "Qwen/Qwen-tokenizer"
-VAL_RATIO      = 0.005   # 0.5% val — plenty of data, keep val small
-SEED           = 42
-MIN_TOKENS     = 64
-MAX_TOKENS     = 4096    # hard cap — matches model max_seq_len
-CHUNK_OVERLAP  = 128     # overlap between chunks when splitting long docs
-BATCH_SIZE     = 128     # batch tokenisation — much faster than one-at-a-time
-SHUFFLE_BUCKET = 500_000 # lines held in memory during streaming shuffle
 
-# Variable sequence length distribution.
-# Teaches the model to handle short AND long contexts rather than always
-# seeing full 4096-token sequences. Weighted toward longer sequences so
-# the model gets good long-context training, but sees enough short ones
-# to handle "hi → hi, how are you?" style responses cleanly.
-# 4096 is the hard cap (matches model max_seq_len); no 8192 bucket.
-#
-# Distribution rationale (weights below sum to 100):
-#   128  —  5%  short conversational turns, single sentences
-#   256  —  8%  short paragraphs, brief answers
-#   512  — 10%  multi-sentence answers, short excerpts
-#  1024  — 15%  full paragraphs, short articles
-#  2048  — 20%  multi-paragraph, standard doc length
-#  4096  — 42%  long articles, reasoning chains, deep context
-#
-# Format: (seq_len, relative_weight)
+DATA_FORMAT_VERSION = 3
+DEFAULT_MANIFEST = Path(__file__).parent / "configs" / "data_mix.json"
+VAL_RATIO = 0.005
+SEED = 42
+MIN_BYTES = 64
+MAX_DOCUMENT_BYTES = 8_000_000
+MAX_CHUNK_LENGTH = 16384
+MAX_CHUNK_OVERLAP = 128
+SHUFFLE_BUCKET_LINES = 500_000
 SEQ_LENGTH_DIST = [
-    (128,   5),
-    (256,   8),
-    (512,  10),
-    (1024, 15),
-    (2048, 20),
-    (4096, 42),
+    (128, 3),
+    (256, 5),
+    (512, 7),
+    (1024, 10),
+    (2048, 15),
+    (4096, 25),
+    (8192, 20),
+    (16384, 15),
 ]
-_SEQ_LENS    = [l for l, _ in SEQ_LENGTH_DIST]
-_SEQ_WEIGHTS = [w for _, w in SEQ_LENGTH_DIST]
-
-TRAIN_DIR   = Path("data/train")
-VAL_DIR     = Path("data/val")
-SHARD_DIR   = Path("data/hf_shards")
-STATE_PATH  = SHARD_DIR / "progress.json"
-FINAL_TRAIN = TRAIN_DIR / "hf_mix_train.jsonl"
-FINAL_VAL   = VAL_DIR   / "hf_mix_val.jsonl"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DATASETS
-# All use text_field="text" (confirmed for fineweb_edu, dclm, open_web_math,
-# cosmopedia, wikipedia_en, finepdfs).
-# mathcode_pile field assumed "text" — if it produces 0 docs, change to "content"
-# ──────────────────────────────────────────────────────────────────────────────
-DATASETS = [
-    {
-        "slug":          "fineweb_edu",
-        "path":          "HuggingFaceFW/fineweb-edu",
-        "name":          "sample-100BT",
-        "split":         "train",
-        "target_tokens": 8_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        "slug":          "dclm",
-        "path":          "HuggingFaceFW/dclm_100BT",
-        "split":         "train",
-        "target_tokens": 4_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        "slug":          "open_web_math",
-        "path":          "open-web-math/open-web-math",
-        "split":         "train",
-        "target_tokens": 3_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        "slug":          "cosmopedia",
-        "path":          "HuggingFaceTB/cosmopedia",
-        "name":          "web_samples_v1",
-        "split":         "train",
-        "target_tokens": 2_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        "slug":          "wikipedia_en",
-        "path":          "wikimedia/wikipedia",
-        "name":          "20231101.en",
-        "split":         "train",
-        "target_tokens": 1_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        "slug":          "finepdfs",
-        "path":          "HuggingFaceFW/finepdfs_100BT",
-        "split":         "train",
-        "target_tokens": 1_000_000_000,
-        "text_field":    "text",
-    },
-    {
-        # 19.2B tokens: math web pages + textbooks + model-synthesised + math code
-        # text_field assumed "text" — if docs=0 after start, change to "content"
-        "slug":          "mathcode_pile",
-        "path":          "MathGenie/MathCode-Pile",
-        "split":         "train",
-        "target_tokens": 1_000_000_000,
-        "text_field":    "text",
-    },
-]
-# Total target: 8B + 4B + 3B + 2B + 1B + 1B + 1B = 20B tokens
+SEQ_LENGTHS = [length for length, _ in SEQ_LENGTH_DIST]
+SEQ_WEIGHTS = [weight for _, weight in SEQ_LENGTH_DIST]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ──────────────────────────────────────────────────────────────────────────────
-def ensure_dirs():
-    for d in (TRAIN_DIR, VAL_DIR, SHARD_DIR):
-        d.mkdir(parents=True, exist_ok=True)
+class PipelinePaths:
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.train_dir = self.root / "train"
+        self.val_dir = self.root / "val"
+        self.shard_dir = self.root / "hf_shards"
+        self.state = self.shard_dir / "progress.json"
+        self.dedup = self.shard_dir / "dedup.sqlite3"
+        self.final_train = self.train_dir / "hf_mix_train.jsonl"
+        self.final_val = self.val_dir / "hf_mix_val.jsonl"
+        self.report = self.root / "dataset_report.json"
+
+    def ensure(self) -> None:
+        for directory in (self.train_dir, self.val_dir, self.shard_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def shard_paths(self, slug: str) -> tuple[Path, Path]:
+        return (
+            self.shard_dir / f"{slug}.train.jsonl",
+            self.shard_dir / f"{slug}.val.jsonl",
+        )
 
 
-def shard_paths(spec):
-    return (
-        SHARD_DIR / f"{spec['slug']}.train.jsonl",
-        SHARD_DIR / f"{spec['slug']}.val.jsonl",
-    )
+def _canonical_hash(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def load_state():
-    if not STATE_PATH.exists():
+def load_manifest(path: Path) -> dict:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    sources = manifest.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("manifest must contain a non-empty 'sources' list")
+    slugs: set[str] = set()
+    for spec in sources:
+        required = {"slug", "path", "split", "text_field", "target_unique_bytes"}
+        missing = required - set(spec)
+        if missing:
+            raise ValueError(f"source is missing required fields: {sorted(missing)}")
+        slug = str(spec["slug"])
+        if slug in slugs:
+            raise ValueError(f"duplicate source slug in manifest: {slug}")
+        slugs.add(slug)
+        if int(spec["target_unique_bytes"]) <= 0:
+            raise ValueError(f"{slug}: target_unique_bytes must be positive")
+    return manifest
+
+
+def enabled_sources(manifest: Mapping[str, object]) -> list[dict]:
+    return [dict(spec) for spec in manifest["sources"] if spec.get("enabled", True)]
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
         return {}
-    return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_state(state):
-    STATE_PATH.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+def save_state(path: Path, state: Mapping[str, object]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
     )
+    os.replace(temporary, path)
 
 
-def load_stream(spec):
-    kwargs = {"path": spec["path"], "split": spec["split"], "streaming": True}
-    if spec.get("name"):     kwargs["name"]     = spec["name"]
-    if spec.get("data_dir"): kwargs["data_dir"] = spec["data_dir"]
+def load_stream(spec: Mapping[str, object]):
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError("Install the data dependency with: pip install datasets>=2.19") from exc
+
+    kwargs: dict[str, object] = {
+        "path": spec["path"],
+        "split": spec.get("split", "train"),
+        "streaming": True,
+    }
+    for key in ("name", "data_dir", "revision"):
+        if spec.get(key) is not None:
+            kwargs[key] = spec[key]
     return load_dataset(**kwargs)
 
 
-def iter_texts(spec):
-    field = spec.get("text_field", "text")
-    fallback = "content" if field == "text" else "text"
-    detected = False
+def iter_rows(spec: Mapping[str, object]) -> Iterator[tuple[str, Mapping[str, object]]]:
+    requested = str(spec.get("text_field", "text"))
+    candidates = list(dict.fromkeys([requested, "text", "content", "raw_content"]))
+    detected: str | None = None
     for row in load_stream(spec):
-        text = row.get(field)
-        if not detected and text is None:
-            text = row.get(fallback)
-            if text is not None:
-                print(f"  auto-detected text_field='{fallback}' for {spec['slug']}")
-                field = fallback
-        detected = True
-        if isinstance(text, str):
-            text = text.strip()
-        if text:
-            yield text
+        field = detected
+        if field is None:
+            field = next((name for name in candidates if isinstance(row.get(name), str)), None)
+            if field is not None:
+                detected = field
+                if field != requested:
+                    print(f"  {spec['slug']}: auto-detected text field '{field}'")
+        text = row.get(field) if field else None
+        if isinstance(text, str) and text.strip():
+            yield text.strip(), row
 
 
-def needs_rebuild(spec, state):
-    slug = spec["slug"]
-    src  = state.get(slug, {})
-    t, v = shard_paths(spec)
-    if not src.get("complete"):           return True
-    if not t.exists() or not v.exists(): return True
-    if src.get("target_tokens", 0) != spec["target_tokens"]:
-        print(f"  {slug}: target changed → rebuilding")
-        return True
-    return False
+def source_needs_rebuild(
+    spec: Mapping[str, object], state: Mapping[str, object], paths: PipelinePaths
+) -> bool:
+    source_state = state.get(str(spec["slug"]), {})
+    train_path, val_path = paths.shard_paths(str(spec["slug"]))
+    return not (
+        source_state.get("complete")
+        and source_state.get("format_version") == DATA_FORMAT_VERSION
+        and source_state.get("spec_hash") == _canonical_hash(spec)
+        and train_path.exists()
+        and val_path.exists()
+    )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# BUILD ONE SOURCE SHARD
-# Uses batched tokenisation (BATCH_SIZE docs at a time) for speed.
-# ──────────────────────────────────────────────────────────────────────────────
-def build_source(tokenizer, spec, state):
-    slug = spec["slug"]
-    train_shard, val_shard = shard_paths(spec)
+def build_source(
+    spec: Mapping[str, object],
+    *,
+    state: dict,
+    paths: PipelinePaths,
+    dedup: DedupIndex,
+    contamination: ContaminationIndex | None,
+    val_ratio: float,
+    seed: int,
+    pii_policy: str,
+) -> dict:
+    slug = str(spec["slug"])
+    train_path, val_path = paths.shard_paths(slug)
+    if not source_needs_rebuild(spec, state, paths):
+        result = state[slug]
+        print(
+            f"  skip {slug:<24} "
+            f"{result.get('unique_bytes', 0) / 1e9:.2f}B unique bytes already prepared"
+        )
+        return result
 
-    if not needs_rebuild(spec, state):
-        s = state[slug]
-        print(f"  skip {slug:<20} {s['tokens']/1e9:.2f}B tokens already collected")
-        return s
+    dedup.reset_source(slug)
+    rng = random.Random(f"{seed}:{slug}:chunks")
+    target = int(spec["target_unique_bytes"])
+    source_pii_policy = str(spec.get("pii_policy", pii_policy))
+    min_quality_score = float(spec.get("min_quality_score", 0.20))
+    counters: Counter[str] = Counter()
+    unique_bytes = 0
+    emitted_positions = 0
+    train_positions = 0
+    val_positions = 0
+    train_unique_bytes = 0
+    val_unique_bytes = 0
+    pii_totals: Counter[str] = Counter()
 
-    rng    = random.Random(f"{SEED}:{slug}")
-    target = spec["target_tokens"]
-    docs = written = train_tokens = val_tokens = 0
+    train_tmp = train_path.with_suffix(".tmp")
+    val_tmp = val_path.with_suffix(".tmp")
+    print(f"\n  building {slug} (target {target / 1e9:.2f}B unique UTF-8 bytes)")
 
-    print(f"\n  building {slug}  (target {target/1e9:.0f}B tokens)")
-
-    buf = []
-
-    with train_shard.open("w", encoding="utf-8") as tf, \
-         val_shard.open("w",   encoding="utf-8") as vf:
-
-        def flush(buf):
-            nonlocal docs, written, train_tokens, val_tokens
-            if not buf:
-                return
-            enc = tokenizer(
-                buf,
-                add_special_tokens=False,
-                return_attention_mask=False,
-                return_token_type_ids=False,
-                truncation=False,
-                verbose=False,
-            )
-            for text, ids in zip(buf, enc["input_ids"]):
-                tc = len(ids)
-                if tc < MIN_TOKENS:
+    try:
+        with train_tmp.open("w", encoding="utf-8") as train_handle, val_tmp.open(
+            "w", encoding="utf-8"
+        ) as val_handle:
+            for text, row in iter_rows(spec):
+                counters["documents_seen"] += 1
+                text, pii_counts = handle_pii(text, source_pii_policy)
+                pii_totals.update(pii_counts)
+                if text is None:
+                    counters["rejected_pii"] += 1
                     continue
-                # Chunk document into variable-length pieces drawn from
-                # SEQ_LENGTH_DIST. Each chunk independently samples its
-                # target length, teaching the model to handle the full
-                # range of context sizes (128 → 4096 tokens).
-                pos = 0
-                while pos < tc:
-                    target_len = rng.choices(_SEQ_LENS, weights=_SEQ_WEIGHTS, k=1)[0]
-                    chunk_ids = ids[pos : pos + target_len]
-                    if len(chunk_ids) < MIN_TOKENS:
-                        break
-                    chunk_text = tokenizer.decode(chunk_ids, skip_special_tokens=True)
-                    ctc = len(chunk_ids)
-                    line = json.dumps({"text": chunk_text}, ensure_ascii=False) + "\n"
-                    if rng.random() < VAL_RATIO:
-                        vf.write(line);  val_tokens   += ctc
+
+                quality = assess_quality(
+                    text,
+                    min_bytes=MIN_BYTES,
+                    max_bytes=int(spec.get("max_document_bytes", MAX_DOCUMENT_BYTES)),
+                    min_score=min_quality_score,
+                )
+                if not quality.accepted:
+                    counters[f"rejected_{quality.reason}"] += 1
+                    continue
+                if contamination is not None and contamination.contaminated(text):
+                    counters["rejected_benchmark_overlap"] += 1
+                    continue
+
+                doc_hash = document_id(text)
+                duplicate_reason = dedup.check_and_add(text, source=slug, doc_hash=doc_hash)
+                if duplicate_reason:
+                    counters[f"rejected_{duplicate_reason}"] += 1
+                    continue
+
+                byte_ids = list(text.encode("utf-8"))
+                split = assign_split(doc_hash, val_ratio=val_ratio, seed=seed)
+                handle = val_handle if split == "val" else train_handle
+                metadata = source_metadata(row, spec)
+                document_chunks = 0
+                for chunk_index, chunk in enumerate(
+                    chunk_document(
+                        byte_ids,
+                        rng=rng,
+                        lengths=SEQ_LENGTHS,
+                        weights=SEQ_WEIGHTS,
+                        min_length=MIN_BYTES,
+                        max_length=MAX_CHUNK_LENGTH,
+                        max_overlap=MAX_CHUNK_OVERLAP,
+                    )
+                ):
+                    record = {
+                        "input_ids": chunk.input_ids,
+                        "doc_id": doc_hash,
+                        "chunk_index": chunk_index,
+                        "byte_start": chunk.byte_start,
+                        "byte_end": chunk.byte_end,
+                        "document_end": chunk.document_end,
+                        "quality_score": round(quality.score, 4),
+                        "pii_redactions": sum(pii_counts.values()),
+                        **metadata,
+                    }
+                    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    positions = len(chunk.input_ids)
+                    emitted_positions += positions
+                    if split == "val":
+                        val_positions += positions
                     else:
-                        tf.write(line);  train_tokens += ctc
-                    written += ctc
-                    docs    += 1
-                    # Advance with overlap so chunks share some context
-                    pos += max(1, ctc - CHUNK_OVERLAP)
+                        train_positions += positions
+                    document_chunks += 1
 
-        for text in iter_texts(spec):
-            buf.append(text)
-            if len(buf) >= BATCH_SIZE:
-                flush(buf); buf = []
-                if docs % 10_000 == 0 and docs > 0:
-                    print(f"    {slug}: {docs:>8,} docs  {written/1e9:.3f}B / {target/1e9:.0f}B tokens")
-                if written >= target:
+                if not document_chunks:
+                    counters["rejected_no_chunks"] += 1
+                    continue
+                counters["documents_accepted"] += 1
+                counters["chunks_emitted"] += document_chunks
+                unique_bytes += len(byte_ids)
+                if split == "val":
+                    val_unique_bytes += len(byte_ids)
+                else:
+                    train_unique_bytes += len(byte_ids)
+
+                if counters["documents_accepted"] % 1000 == 0:
+                    dedup.commit()
+                if counters["documents_accepted"] % 10_000 == 0:
+                    print(
+                        f"    {slug}: {counters['documents_accepted']:>9,} accepted docs, "
+                        f"{unique_bytes / 1e9:.3f}B / {target / 1e9:.2f}B unique bytes"
+                    )
+                if unique_bytes >= target:
                     break
-        flush(buf)
 
-    # warn if almost nothing came through (wrong field name)
-    if docs < 100:
-        print(f"  WARNING: {slug} produced only {docs} docs — check text_field value")
+        dedup.commit()
+        os.replace(train_tmp, train_path)
+        os.replace(val_tmp, val_path)
+    except BaseException:
+        train_tmp.unlink(missing_ok=True)
+        val_tmp.unlink(missing_ok=True)
+        raise
 
     result = {
-        "complete":      True,
-        "target_tokens": target,
-        "docs":          docs,
-        "tokens":        written,
-        "train_tokens":  train_tokens,
-        "val_tokens":    val_tokens,
+        "complete": unique_bytes >= target,
+        "format_version": DATA_FORMAT_VERSION,
+        "spec_hash": _canonical_hash(spec),
+        "target_unique_bytes": target,
+        "unique_bytes": unique_bytes,
+        "emitted_positions": emitted_positions,
+        "overlap_and_eos_positions": max(0, emitted_positions - unique_bytes),
+        "train_unique_bytes": train_unique_bytes,
+        "val_unique_bytes": val_unique_bytes,
+        "train_positions": train_positions,
+        "val_positions": val_positions,
+        "pii_matches": dict(pii_totals),
+        **dict(counters),
     }
     state[slug] = result
-    save_state(state)
-    print(f"  done {slug:<20} {written/1e9:.3f}B tokens  {docs:,} docs")
+    save_state(paths.state, state)
+    status = "done" if result["complete"] else "source exhausted"
+    print(
+        f"  {status}: {slug} -> {unique_bytes / 1e9:.3f}B unique bytes, "
+        f"{emitted_positions / 1e9:.3f}B emitted positions"
+    )
     return result
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# GLOBAL SHUFFLE  (prevents any domain clustering in training)
-# ──────────────────────────────────────────────────────────────────────────────
-def assemble_shuffled(state):
-    """Streaming bucket-shuffle: never holds more than SHUFFLE_BUCKET lines in RAM."""
-    rng = random.Random(SEED)
-
-    for split, final in [("train", FINAL_TRAIN), ("val", FINAL_VAL)]:
-        print(f"\nassembling {split}...")
-
-        # count lines and collect shard paths
-        shards = []
+def assemble_shuffled(
+    specs: list[Mapping[str, object]], paths: PipelinePaths, *, seed: int
+) -> None:
+    """Shuffle source shards without loading the complete corpus in memory."""
+    for split, final_path in (("train", paths.final_train), ("val", paths.final_val)):
+        shards: list[Path] = []
         total_lines = 0
-        for spec in DATASETS:
-            shard = shard_paths(spec)[0 if split == "train" else 1]
+        print(f"\nassembling {split} mixture")
+        for spec in specs:
+            shard = paths.shard_paths(str(spec["slug"]))[0 if split == "train" else 1]
             if not shard.exists():
-                print(f"  WARNING: missing shard {shard.name} — skipping")
+                print(f"  missing {shard.name}; skipping")
                 continue
-            n = sum(1 for line in shard.open(encoding="utf-8") if line.strip())
-            print(f"  {spec['slug']:<20} {n:>8,} docs")
+            line_count = sum(1 for line in shard.open("r", encoding="utf-8") if line.strip())
+            total_lines += line_count
             shards.append(shard)
-            total_lines += n
-
+            print(f"  {spec['slug']:<24} {line_count:>10,} chunks")
         if total_lines == 0:
-            print(f"  WARNING: no data for {split}")
+            print(f"  no {split} chunks found")
             continue
 
-        # assign each line to a random bucket (temp file)
-        n_buckets = max(1, total_lines // SHUFFLE_BUCKET)
-        tmp_dir = tempfile.mkdtemp(prefix="hf_shuffle_")
-        bucket_files = [
-            open(os.path.join(tmp_dir, f"bucket_{i}.jsonl"), "w", encoding="utf-8")
-            for i in range(n_buckets)
+        bucket_count = max(1, math.ceil(total_lines / SHUFFLE_BUCKET_LINES))
+        rng = random.Random(f"{seed}:{split}:assembly")
+        with tempfile.TemporaryDirectory(prefix="yeoubi_shuffle_") as temporary_dir:
+            temp_root = Path(temporary_dir)
+            bucket_paths = [temp_root / f"bucket_{index:06d}.jsonl" for index in range(bucket_count)]
+            bucket_handles = [path.open("w", encoding="utf-8") for path in bucket_paths]
+            try:
+                for shard in shards:
+                    with shard.open("r", encoding="utf-8") as source_handle:
+                        for line in source_handle:
+                            if line.strip():
+                                bucket_handles[rng.randrange(bucket_count)].write(line)
+            finally:
+                for handle in bucket_handles:
+                    handle.close()
+
+            final_tmp = final_path.with_suffix(".tmp")
+            with final_tmp.open("w", encoding="utf-8") as output:
+                for bucket_path in bucket_paths:
+                    lines = bucket_path.read_text(encoding="utf-8").splitlines(keepends=True)
+                    rng.shuffle(lines)
+                    output.writelines(lines)
+            os.replace(final_tmp, final_path)
+        print(
+            f"  wrote {final_path} ({final_path.stat().st_size / 1e9:.2f} GB, "
+            f"{total_lines:,} chunks)"
+        )
+
+
+def write_report(
+    manifest: Mapping[str, object], specs: list[Mapping[str, object]], state: Mapping[str, object], paths: PipelinePaths
+) -> None:
+    totals: Counter[str] = Counter()
+    categories: Counter[str] = Counter()
+    languages: Counter[str] = Counter()
+    for spec in specs:
+        source_state = state.get(str(spec["slug"]), {})
+        for key in (
+            "unique_bytes",
+            "emitted_positions",
+            "overlap_and_eos_positions",
+            "documents_seen",
+            "documents_accepted",
+            "chunks_emitted",
+        ):
+            totals[key] += int(source_state.get(key, 0))
+        unique = int(source_state.get("unique_bytes", 0))
+        categories[str(spec.get("category", "uncategorized"))] += unique
+        languages[str(spec.get("language", "unknown"))] += unique
+    report = {
+        "format_version": DATA_FORMAT_VERSION,
+        "manifest_description": manifest.get("description"),
+        "totals": dict(totals),
+        "unique_bytes_by_category": dict(categories),
+        "unique_bytes_by_manifest_language": dict(languages),
+        "sources": {str(spec["slug"]): state.get(str(spec["slug"]), {}) for spec in specs},
+        "notes": [
+            "unique_bytes counts each accepted document once",
+            "emitted_positions includes chunk overlap and EOS",
+            "language totals use manifest labels; row-level language remains in JSONL metadata",
+            "license metadata is descriptive and is not legal advice",
+        ],
+    }
+    paths.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def print_summary(specs: list[Mapping[str, object]], state: Mapping[str, object]) -> None:
+    print("\nDataset preparation summary")
+    print(f"  {'source':<24} {'unique GB':>10} {'emitted GB':>12} {'accepted docs':>14}")
+    for spec in specs:
+        result = state.get(str(spec["slug"]), {})
+        print(
+            f"  {spec['slug']:<24} "
+            f"{result.get('unique_bytes', 0) / 1e9:>10.3f} "
+            f"{result.get('emitted_positions', 0) / 1e9:>12.3f} "
+            f"{result.get('documents_accepted', 0):>14,}"
+        )
+
+
+def reset_outputs(paths: PipelinePaths) -> None:
+    """Remove only known generated pipeline files after explicit --rebuild."""
+    known_files = [paths.state, paths.dedup, paths.final_train, paths.final_val, paths.report]
+    known_files.extend(paths.shard_dir.glob("*.train.jsonl"))
+    known_files.extend(paths.shard_dir.glob("*.val.jsonl"))
+    known_files.extend(
+        [
+            paths.dedup.with_name(paths.dedup.name + "-wal"),
+            paths.dedup.with_name(paths.dedup.name + "-shm"),
         ]
-
-        print(f"  distributing {total_lines:,} docs into {n_buckets} buckets...")
-        for shard in shards:
-            with shard.open(encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    bucket_files[rng.randrange(n_buckets)].write(line)
-
-        for bf in bucket_files:
-            bf.close()
-
-        # shuffle each bucket in memory and write to final output
-        print(f"  writing {final}...")
-        written = 0
-        with final.open("w", encoding="utf-8") as out:
-            for i in range(n_buckets):
-                bp = os.path.join(tmp_dir, f"bucket_{i}.jsonl")
-                with open(bp, encoding="utf-8") as bf:
-                    bucket = bf.readlines()
-                rng.shuffle(bucket)
-                out.writelines(bucket)
-                written += len(bucket)
-                os.remove(bp)
-
-        os.rmdir(tmp_dir)
-        gb = final.stat().st_size / 1e9
-        print(f"  wrote {final}  ({gb:.1f} GB, {written:,} docs)")
+    )
+    for path in known_files:
+        if path.is_file():
+            path.unlink()
 
 
-def print_summary(state):
-    total = sum(v.get("tokens", 0) for v in state.values())
-    print(f"\n{'─'*58}")
-    print(f"  {'Dataset':<20} {'Tokens':>10}  {'Docs':>10}  St")
-    print(f"{'─'*58}")
-    for spec in DATASETS:
-        s    = state.get(spec["slug"], {})
-        flag = "✓" if s.get("complete") else "·"
-        print(f"  {flag} {spec['slug']:<19} {s.get('tokens',0)/1e9:>8.2f}B  {s.get('docs',0):>10,}")
-    print(f"{'─'*58}")
-    print(f"  {'TOTAL':<20} {total/1e9:>8.2f}B")
-    print(f"{'─'*58}\n")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--data-root", type=Path, default=Path("data"))
+    parser.add_argument("--val-ratio", type=float, default=VAL_RATIO)
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--pii-policy", choices=("keep", "redact", "drop"), default="redact")
+    parser.add_argument("--no-fuzzy-dedup", action="store_true")
+    parser.add_argument(
+        "--decontam",
+        type=Path,
+        action="append",
+        default=[],
+        help="Plain-text or JSONL benchmark file; repeat for multiple files",
+    )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        help="Prepare only the named source slug; repeat as needed",
+    )
+    parser.add_argument("--require-reviewed-licenses", action="store_true")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Discard known generated shards/state and rebuild using this manifest",
+    )
+    return parser.parse_args()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    ensure_dirs()
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    state     = load_state()
+def main() -> None:
+    args = parse_args()
+    if not 0.0 <= args.val_ratio < 1.0:
+        raise ValueError("--val-ratio must be in [0, 1)")
+    manifest = load_manifest(args.manifest)
+    all_specs = enabled_sources(manifest)
+    if args.source:
+        requested = set(args.source)
+        known = {str(spec["slug"]) for spec in all_specs}
+        unknown = requested - known
+        if unknown:
+            raise ValueError(f"unknown source slug(s): {sorted(unknown)}")
+        build_specs = [spec for spec in all_specs if spec["slug"] in requested]
+    else:
+        build_specs = all_specs
 
-    for spec in DATASETS:
-        build_source(tokenizer, spec, state)
+    if args.require_reviewed_licenses:
+        unreviewed = [
+            spec["slug"] for spec in all_specs
+            if "review" in str(spec.get("license", "review-required")).lower()
+        ]
+        if unreviewed:
+            raise RuntimeError(
+                "license review is still required for: " + ", ".join(map(str, unreviewed))
+            )
 
-    print_summary(state)
-    assemble_shuffled(state)
+    paths = PipelinePaths(args.data_root)
+    paths.ensure()
+    if args.rebuild:
+        reset_outputs(paths)
+    state = load_state(paths.state)
+    manifest_hash = _canonical_hash(manifest)
+    previous_meta = state.get("_meta", {})
+    if state and previous_meta.get("manifest_hash") != manifest_hash:
+        raise RuntimeError(
+            "The manifest or pipeline format changed. Re-run with --rebuild after reviewing "
+            "the new mixture; existing generated data will not be silently mixed with it."
+        )
+    if state and not paths.dedup.exists():
+        raise RuntimeError("Dedup index is missing for an existing run; use --rebuild")
+    state["_meta"] = {
+        "format_version": DATA_FORMAT_VERSION,
+        "manifest_hash": manifest_hash,
+        "manifest_path": str(args.manifest.resolve()),
+        "seed": args.seed,
+        "val_ratio": args.val_ratio,
+        "pii_policy": args.pii_policy,
+        "fuzzy_dedup": not args.no_fuzzy_dedup,
+    }
+    save_state(paths.state, state)
+
+    contamination = None
+    if args.decontam:
+        contamination = ContaminationIndex(iter_jsonl_texts(args.decontam))
+        print(f"loaded {len(contamination.hashes):,} benchmark n-grams for decontamination")
+
+    with DedupIndex(paths.dedup, fuzzy=not args.no_fuzzy_dedup) as dedup:
+        for spec in build_specs:
+            build_source(
+                spec,
+                state=state,
+                paths=paths,
+                dedup=dedup,
+                contamination=contamination,
+                val_ratio=args.val_ratio,
+                seed=args.seed,
+                pii_policy=args.pii_policy,
+            )
+
+    print_summary(all_specs, state)
+    assemble_shuffled(all_specs, paths, seed=args.seed)
+    write_report(manifest, all_specs, state, paths)
+    print(f"\nAudit report: {paths.report}")
 
 
 if __name__ == "__main__":

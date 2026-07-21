@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bitdiffusion.export import export_checkpoint, load_model_from_checkpoint as load_export_model
-from bitdiffusion.model import BitDiffusionTransformer, ModelConfig
-from bitdiffusion.quantization import HybridKVCache, KVCache
-from bitdiffusion.sample import denoise, load_model_from_checkpoint as load_sample_model
-from bitdiffusion.utils import (
+from yeoubi.export import export_checkpoint, load_model_from_checkpoint as load_export_model
+from yeoubi.model import BitDiffusionTransformer, ModelConfig
+from yeoubi.quantization import HybridKVCache, KVCache
+from yeoubi.sample import denoise, load_model_from_checkpoint as load_sample_model
+from yeoubi.utils import (
     read_checkpoint,
     save_checkpoint,
     validate_model_config_topology,
@@ -290,7 +290,7 @@ class CompatibilityTests(unittest.TestCase):
         No cache should be created — doing so was pure overhead with no
         correctness or speed benefit.
         """
-        import bitdiffusion.sample as sample_module
+        import yeoubi.sample as sample_module
 
         cache_instances: list = []
 
@@ -346,13 +346,15 @@ class DefaultModelTests(unittest.TestCase):
     def test_default_train_config_is_rdt(self) -> None:
         """The repo default model_type should be 'rdt' so plain `train.py`
         invocations train BitRDTTransformer."""
-        from bitdiffusion.train import TrainConfig
+        from yeoubi.train import TrainConfig
 
         cfg = TrainConfig()
         self.assertEqual(
             cfg.model_type, "rdt",
             "Default model_type should be 'rdt' (BitRDTTransformer is the default model).",
         )
+        self.assertEqual(cfg.N_think, 64)
+        self.assertEqual(cfg.think_prob, 1.0)
 
 
 if __name__ == "__main__":

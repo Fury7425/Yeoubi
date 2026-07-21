@@ -22,8 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bitdiffusion.diffusion import CosineSchedule, MaskDiffusionLoss, apply_mask
-from bitdiffusion.model import BitDiffusionTransformer, ModelConfig
+from yeoubi.diffusion import CosineSchedule, MaskDiffusionLoss, apply_mask
+from yeoubi.model import BitDiffusionTransformer, ModelConfig
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ class TestMDLMWeighting(unittest.TestCase):
 class TestGenerateSampleVocabSlice(unittest.TestCase):
     def test_no_special_token_ids_in_output(self):
         """generate_sample() must never produce IDs >= vocab_size in its output."""
-        from bitdiffusion.train import generate_sample
+        from yeoubi.train import generate_sample
 
         config = _small_config()
         model = BitDiffusionTransformer(config)
@@ -257,8 +257,8 @@ class TestBlockSamplerMultiSample(unittest.TestCase):
     def test_per_sample_tracking_is_independent(self):
         """With temperature > 0 and num_samples=2, the sampler must maintain
         separate token lists and block-text lists per sample."""
-        from bitdiffusion.sample import BlockDiffusionSampler
-        from bitdiffusion.quantization import KVCache
+        from yeoubi.sample import BlockDiffusionSampler
+        from yeoubi.quantization import KVCache
 
         config = _small_config()
         model = BitDiffusionTransformer(config)
@@ -286,7 +286,7 @@ class TestBlockSamplerMultiSample(unittest.TestCase):
 
     def test_returns_correct_number_of_results(self):
         """generate() must always return exactly num_samples dicts."""
-        from bitdiffusion.sample import BlockDiffusionSampler
+        from yeoubi.sample import BlockDiffusionSampler
 
         config = _small_config()
         model = BitDiffusionTransformer(config)
@@ -314,7 +314,7 @@ class TestBlockSamplerMultiSample(unittest.TestCase):
 class TestDataLoaderLengthPreservation(unittest.TestCase):
     def _make_dataset(self, lines: list[str], max_length: int = 32):
         import tempfile, json
-        from bitdiffusion.data import StreamingJsonlDataset
+        from yeoubi.data import StreamingJsonlDataset
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
@@ -433,7 +433,7 @@ class TestNucleusSampling(unittest.TestCase):
     def test_top_p_keeps_top_mass_only(self):
         """After top-p filtering, the renormalised mass over kept tokens
         must equal 1.0 and removed tokens must have zero probability."""
-        from bitdiffusion.sample import nucleus_sample
+        from yeoubi.sample import nucleus_sample
 
         torch.manual_seed(0)
         B, V = 4, 64

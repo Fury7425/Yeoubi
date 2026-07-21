@@ -10,7 +10,6 @@ Example:
     python scripts/optimize_litdata.py \
         --jsonl "data/train/*.jsonl" \
         --output_dir data/train_litdata \
-        --tokenizer Qwen/Qwen-tokenizer \
         --max_length 4096
 
     python train.py --train_data data/train_litdata --use_litdata True
@@ -29,10 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from transformers import AutoTokenizer
-
-from bitdiffusion.data import optimize_to_litdata
-from bitdiffusion.utils import force_utf8_console, setup_logging
+from yeoubi.data import optimize_to_litdata
+from yeoubi.utils import force_utf8_console, setup_logging
 
 
 def main() -> None:
@@ -44,8 +41,6 @@ def main() -> None:
                         help="Glob for input .jsonl files (e.g. 'data/train/*.jsonl')")
     parser.add_argument("--output_dir", required=True,
                         help="Destination directory for the litdata-optimized chunks")
-    parser.add_argument("--tokenizer", default="Qwen/Qwen-tokenizer",
-                        help="Tokenizer path or HuggingFace name")
     parser.add_argument("--max_length", type=int, default=4096,
                         help="Maximum sequence length per stored chunk")
     parser.add_argument("--min_chunk_size", type=int, default=16,
@@ -60,12 +55,8 @@ def main() -> None:
     if not paths:
         raise FileNotFoundError(f"No files matched: {args.jsonl}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     optimize_to_litdata(
-        paths, tokenizer, args.output_dir,
+        paths, args.output_dir,
         max_length=args.max_length,
         min_chunk_size=args.min_chunk_size,
         num_workers=args.num_workers,

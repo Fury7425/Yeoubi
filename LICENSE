@@ -3,7 +3,7 @@
 
     BigCode Open RAIL-M License
     Version 1.0, August 2022
-    (Modified for BitDiffusion a4.8)
+    (Modified for Yeoubi(여우비))
 
 
     Section I: PREAMBLE
@@ -14,7 +14,7 @@
     governed by the BigCode OpenRAIL-M license (including StarCoderData),
     while establishing responsible use obligations.
 
-    This license governs use of the BitDiffusion a4.8 model weights and
+    This license governs use of the Yeoubi(여우비) model weights and
     any derivatives thereof. The model code (source files) is separately
     licensed under Apache 2.0. Only the trained model weights and
     derivatives of those weights are subject to this license.
@@ -116,7 +116,7 @@
 
     If you use this model in research, please cite:
 
-        BitDiffusion a4.8 — Masked diffusion language model with ternary
+        Yeoubi(여우비) — Masked diffusion language model with ternary
         weights and hybrid 4-bit/8-bit activation quantization.
         https://github.com/fury7425/bitdiffusion-a4.8
 

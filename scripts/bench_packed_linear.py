@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bitdiffusion.model import BitLinear  # noqa: E402
+from yeoubi.model import BitLinear  # noqa: E402
 
 
 def _cuda_or_exit() -> torch.device:

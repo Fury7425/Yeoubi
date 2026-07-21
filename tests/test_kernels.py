@@ -21,8 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bitdiffusion import kernels  # noqa: E402
-from bitdiffusion.model import BitDiffusionTransformer, BitLinear, BitMoEFFN, ModelConfig  # noqa: E402
+from yeoubi import kernels  # noqa: E402
+from yeoubi.model import BitDiffusionTransformer, BitLinear, BitMoEFFN, ModelConfig  # noqa: E402
 
 
 def _packed_param_bytes(model: torch.nn.Module) -> int:

@@ -21,10 +21,11 @@ import tempfile
 import pytest
 import torch
 
-from bitdiffusion import BitRDTTransformer, RDTConfig
-from bitdiffusion.diffusion import CosineSchedule, MaskDiffusionLoss, apply_mask
-from bitdiffusion.model import BitLinear
-from bitdiffusion.utils import load_checkpoint, save_checkpoint
+from yeoubi import BitRDTTransformer, RDTConfig
+from yeoubi.diffusion import CosineSchedule, MaskDiffusionLoss, apply_mask
+from yeoubi.model import BitLinear
+from yeoubi.quantization import KVCache
+from yeoubi.utils import load_checkpoint, save_checkpoint
 
 
 def _small_cfg(**overrides) -> RDTConfig:
@@ -261,6 +262,99 @@ def test_hidden_state_reset(model_and_inputs):
 # Test 10: bidirectional attention (no causal mask)
 # ---------------------------------------------------------------------------
 
+def test_hybrid_rdt_has_unique_bridges_and_adaptive_depth():
+    cfg = _small_cfg(
+        pre_recurrent_layers=1,
+        post_recurrent_layers=1,
+        adaptive_loops=True,
+        min_loop_iters=1,
+        max_loop_iters=3,
+        loop_specific_norms=True,
+        use_act=False,
+    )
+    model = BitRDTTransformer(cfg).eval()
+    assert len(model.pre_recurrent) == 1
+    assert len(model.post_recurrent) == 1
+    assert len(model.recurrent.loop_norms) == 3
+
+    ids = torch.randint(0, 60, (2, 12))
+    calls = []
+    handle = model.recurrent.shared_blocks[0].register_forward_hook(
+        lambda module, args, output: calls.append(1)
+    )
+    with torch.no_grad():
+        model(ids, torch.zeros(2))
+    assert len(calls) == 1, "clean diffusion states should use minimum refinement"
+
+    calls.clear()
+    with torch.no_grad():
+        model(ids, torch.ones(2))
+    handle.remove()
+    assert len(calls) == 3, "fully noisy states should use maximum refinement"
+
+
+def test_byte_patch_codec_preserves_byte_shape_and_gradients():
+    cfg = _small_cfg(
+        use_byte_patches=True,
+        byte_patch_size=4,
+        byte_local_kernel=3,
+        pre_recurrent_layers=1,
+        post_recurrent_layers=1,
+        max_loop_iters=2,
+        use_act=False,
+    )
+    model = BitRDTTransformer(cfg).train()
+    ids = torch.randint(0, 60, (2, 15))
+    t = torch.rand(2)
+
+    global_lengths = []
+    handle = model.prelude[0].register_forward_pre_hook(
+        lambda module, args: global_lengths.append(args[0].shape[1])
+    )
+    logits, aux = model(ids, t, n_loops=2)
+    handle.remove()
+
+    assert logits.shape == (2, 15, cfg.vocab_size + 1)
+    assert global_lengths == [4], "global RDT should see ceil(15 / 4) positions"
+    loss = logits.float().square().mean() + aux
+    loss.backward()
+    grad = model.byte_codec.compress.latent_weight.grad
+    assert grad is not None and torch.isfinite(grad).all()
+
+
+def test_hybrid_rdt_patch_cache_uses_virtual_layers_and_patch_positions():
+    cfg = _small_cfg(
+        use_byte_patches=True,
+        byte_patch_size=4,
+        byte_local_kernel=3,
+        pre_recurrent_layers=1,
+        post_recurrent_layers=1,
+        max_loop_iters=3,
+        use_act=False,
+    )
+    model = BitRDTTransformer(cfg).eval()
+    cache = KVCache(
+        n_layers=model.cache_layers_for_loops(2),
+        default_bits=cfg.kv_cache_bits,
+        bos_bits=cfg.kv_cache_bos_bits,
+    )
+
+    with torch.no_grad():
+        first, _ = model(
+            torch.randint(0, 60, (1, 5)), torch.zeros(1),
+            kv_cache=cache, rope_offset=0, n_loops=2,
+        )
+        assert first.shape[1] == 5
+        assert cache.committed_len() == 2
+
+        cache.ephemeral = True
+        second, _ = model(
+            torch.randint(0, 60, (1, 3)), torch.ones(1),
+            kv_cache=cache, rope_offset=5, n_loops=2,
+        )
+    assert second.shape[1] == 3
+
+
 def test_bidirectional_attention(model_and_inputs):
     """Verify that all BitAttention layers use is_causal=False.
 
@@ -271,7 +365,7 @@ def test_bidirectional_attention(model_and_inputs):
     A simpler structural check: confirm no causal mask is applied by patching
     F.scaled_dot_product_attention and asserting is_causal is never True.
     """
-    from bitdiffusion.model import BitAttention
+    from yeoubi.model import BitAttention
     import torch.nn.functional as F
 
     causal_calls = []

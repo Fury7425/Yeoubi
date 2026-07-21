@@ -22,8 +22,8 @@ class EntrypointSmokeTests(unittest.TestCase):
 
     def test_package_entrypoints_show_help(self) -> None:
         for command in (
-            ("-m", "bitdiffusion.sample", "--help"),
-            ("-m", "bitdiffusion.export", "--help"),
+            ("-m", "yeoubi.sample", "--help"),
+            ("-m", "yeoubi.export", "--help"),
         ):
             result = self._run(*command)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
