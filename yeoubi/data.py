@@ -18,12 +18,12 @@ import json
 import logging
 import os
 import random
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from .byte_codec import BYTE_VOCAB_SIZE, EOS_TOKEN_ID, MASK_TOKEN_ID, PAD_TOKEN_ID, encode_text
+from .byte_codec import BYTE_VOCAB_SIZE, EOS_TOKEN_ID, PAD_TOKEN_ID, encode_text
 
 logger = logging.getLogger("yeoubi")
 
@@ -75,14 +75,12 @@ class StreamingJsonlDataset(IterableDataset):
         paths: List of ``.jsonl`` file paths.
         max_length: Maximum sequence length (bytes). Longer documents are
                      chunked; shorter ones are padded by the collator.
-        mask_token_id: Token ID for the absorbing mask state.
     """
 
     def __init__(
         self,
         paths: List[str],
         max_length: int = 512,
-        mask_token_id: int = MASK_TOKEN_ID,
         shuffle_buffer_size: int = 8192,
         min_chunk_size: int = 16,
         post_training: bool = False,
@@ -91,17 +89,25 @@ class StreamingJsonlDataset(IterableDataset):
         super().__init__()
         self.paths = sorted(paths)
         self.max_length = max_length
-        self.mask_token_id = mask_token_id
         self.shuffle_buffer_size = shuffle_buffer_size
         self.min_chunk_size = min_chunk_size
         self.post_training = post_training
         self.assistant_separator = assistant_separator
 
-    def _iter_files(self, file_paths: List[str]) -> Iterator[Dict]:
-        """Yield raw JSON dicts from the given file paths."""
+    def _iter_files(self, file_paths: List[str], record_shard: Optional[Tuple[int, int]] = None) -> Iterator[Dict]:
+        """Yield raw JSON dicts from the given file paths.
+
+        ``record_shard = (worker_id, num_workers)`` restricts output to every
+        ``num_workers``-th line (offset by ``worker_id``) — used by
+        ``_shard_files`` when there are fewer files than workers, so a single
+        assembled JSONL (the normal output of ``prepare_hf_jsonl.py``) still
+        keeps every worker busy instead of only one.
+        """
         for path in file_paths:
             with open(path, "r", encoding="utf-8") as f:
-                for line in f:
+                for line_idx, line in enumerate(f):
+                    if record_shard is not None and line_idx % record_shard[1] != record_shard[0]:
+                        continue
                     line = line.strip()
                     if not line:
                         continue
@@ -111,12 +117,35 @@ class StreamingJsonlDataset(IterableDataset):
                         continue
 
     def _shard_files(self) -> List[str]:
-        """Return the subset of file paths for the current DataLoader worker."""
+        """Return the subset of file paths for the current DataLoader worker.
+
+        File-level sharding is cheap (each worker opens only its own files),
+        but the data pipeline (prepare_hf_jsonl.py) normally emits a single
+        assembled file, which would leave num_workers-1 workers idle forever.
+        Fall back to record-level sharding (see _record_shard/_iter_files)
+        whenever there are fewer files than workers.
+        """
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            return self.paths
-        # Shard files across workers
-        return [p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id]
+        if worker_info is None or len(self.paths) >= worker_info.num_workers:
+            return self.paths if worker_info is None else [
+                p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id
+            ]
+        return self.paths
+
+    def _record_shard(self) -> Optional[Tuple[int, int]]:
+        """(worker_id, num_workers) for record-level sharding, or None when
+        _shard_files already split the work at the file level.
+
+        ponytail: every worker still opens and line-splits every file in
+        this mode — only the JSON decode is skipped for lines outside its
+        slice. Wasteful I/O, but far better than 3-of-4 workers sitting idle.
+        """
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None or worker_info.num_workers <= 1:
+            return None
+        if len(self.paths) >= worker_info.num_workers:
+            return None
+        return (worker_info.id, worker_info.num_workers)
 
     def _produce_chunks(self, files: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
         """Read byte sequences as independent examples, preserving boundaries.
@@ -127,7 +156,7 @@ class StreamingJsonlDataset(IterableDataset):
         distribution created by ``prepare_hf_jsonl.py`` (128–4096 byte chunks)
         rather than collapsing everything into fixed-width rolling windows.
         """
-        for doc in self._iter_files(files):
+        for doc in self._iter_files(files, record_shard=self._record_shard()):
             if self.post_training:
                 prompt = doc.get("prompt")
                 response = _reasoning_response(doc)
@@ -210,7 +239,9 @@ class StreamingJsonlDataset(IterableDataset):
             return
 
         buf: List[Dict[str, torch.Tensor]] = []
-        rng = random.Random()
+        # torch.initial_seed() is derived from --seed and is distinct per worker,
+        # so the shuffle is reproducible instead of wall-clock random.
+        rng = random.Random(torch.initial_seed())
 
         for example in self._produce_chunks(files):
             buf.append(example)
@@ -279,7 +310,6 @@ def make_dataloader(
     max_length: int = 512,
     batch_size: int = 8,
     num_workers: int = 2,
-    mask_token_id: int = MASK_TOKEN_ID,
     pad_token_id: int = PAD_TOKEN_ID,
     shuffle_buffer_size: int = 8192,
     post_training: bool = False,
@@ -292,7 +322,6 @@ def make_dataloader(
         max_length: Maximum sequence length.
         batch_size: Batch size.
         num_workers: Number of DataLoader workers.
-        mask_token_id: Absorbing-state token ID.
         pad_token_id: Padding token ID.
         shuffle_buffer_size: Number of examples to buffer for shuffling.
 
@@ -302,7 +331,6 @@ def make_dataloader(
     dataset = StreamingJsonlDataset(
         paths=paths,
         max_length=max_length,
-        mask_token_id=mask_token_id,
         shuffle_buffer_size=shuffle_buffer_size,
         post_training=post_training,
         assistant_separator=assistant_separator,
@@ -350,15 +378,37 @@ class PreTokenizedDataset(IterableDataset):
         self.min_chunk_size = min_chunk_size
 
     def _shard_files(self) -> List[str]:
+        """Shard shard-files across workers (see StreamingJsonlDataset._shard_files
+        for why: file-level sharding leaves workers idle when shards < workers)."""
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            return self.paths
-        return [p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id]
+        if worker_info is None or len(self.paths) >= worker_info.num_workers:
+            return self.paths if worker_info is None else [
+                p for i, p in enumerate(self.paths) if i % worker_info.num_workers == worker_info.id
+            ]
+        return self.paths
+
+    def _record_shard(self) -> Optional[Tuple[int, int]]:
+        """(worker_id, num_workers) for record-level sharding within a shard
+        file, or None when _shard_files already split the work by file.
+
+        ponytail: every worker still calls torch.load on every shard file in
+        this mode (no cheap partial read for .pt) and keeps only its slice
+        of documents — wasted I/O, but far better than 3-of-4 workers idle.
+        """
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None or worker_info.num_workers <= 1:
+            return None
+        if len(self.paths) >= worker_info.num_workers:
+            return None
+        return (worker_info.id, worker_info.num_workers)
 
     def _produce_chunks(self, files: List[str]) -> Iterator[Dict[str, torch.Tensor]]:
+        record_shard = self._record_shard()
         for path in files:
             chunks: List[torch.Tensor] = torch.load(path, weights_only=True)
-            for ids in chunks:
+            for doc_idx, ids in enumerate(chunks):
+                if record_shard is not None and doc_idx % record_shard[1] != record_shard[0]:
+                    continue
                 num_ids = ids.numel()
                 if num_ids:
                     invalid = (ids < 0) | ((ids >= BYTE_VOCAB_SIZE) & (ids != EOS_TOKEN_ID))
@@ -380,7 +430,7 @@ class PreTokenizedDataset(IterableDataset):
             return
 
         buf: List[Dict[str, torch.Tensor]] = []
-        rng = random.Random()
+        rng = random.Random(torch.initial_seed())
         for example in self._produce_chunks(files):
             buf.append(example)
             if len(buf) >= self.shuffle_buffer_size:

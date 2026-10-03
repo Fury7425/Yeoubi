@@ -68,8 +68,6 @@ class RDTConfig(ModelConfig):
         lora_rank: Rank for the per-iteration LoRA depth adaptation.
         loop_dim: Number of hidden channels that receive the loop-index signal.
         use_act: Enable soft ACT output weighting across iterations.
-        act_ponder_weight: Weight for the soft ACT regularisation term in the
-                           total loss (encourages using all loops, not just early ones).
         randomize_loops: If True, sample n_loops ~ Uniform(1, max_loop_iters)
                          during training so every loop prefix is meaningful.
     """
@@ -80,7 +78,6 @@ class RDTConfig(ModelConfig):
     lora_rank: int = 32
     loop_dim: int = 64
     use_act: bool = True
-    act_ponder_weight: float = 0.01
     randomize_loops: bool = True
     # Unique bridge layers surrounding the recurrent core.  Zero defaults keep
     # legacy RDT checkpoint topology unchanged; new runs enable them explicitly.
@@ -93,6 +90,22 @@ class RDTConfig(ModelConfig):
     # doubling beyond this byte length, even at low diffusion noise.
     context_adaptive_loops: bool = False
     context_loop_threshold: int = 4096
+    # The recurrent core reads the prelude output ``e`` through the LTI
+    # injection on every iteration. In the recurrent-depth design that is a
+    # trained pathway: gradients from all iterations reach the prelude through
+    # it, which is how the prelude learns to emit a good *anchor* rather than
+    # just a good h_0. Detaching it (the previous behaviour) leaves
+    # ``injection.B`` fitting a signal it cannot shape. Set True to restore the
+    # old behaviour for ablation.
+    detach_recurrent_anchor: bool = False
+    # Std of the random initial recurrent state. The source architecture draws
+    # s_0 ~ N(0, sigma^2 I) so the core must learn a *contraction to a fixed
+    # point* from an arbitrary start -- that property, not the loop count
+    # alone, is what makes inference-time depth extrapolation work. 0.0 keeps
+    # the deterministic h_0 = prelude(x) start. Non-zero is only meaningful
+    # together with detach_recurrent_anchor=False, since the injected anchor
+    # then becomes the core's only route to the input.
+    recurrent_state_init_std: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -108,6 +121,11 @@ class RDTConfig(ModelConfig):
             raise ValueError("context_loop_threshold must be >= 1")
         if self.loop_dim < 2 or self.loop_dim > self.hidden_dim or self.loop_dim % 2:
             raise ValueError("loop_dim must be even and in [2, hidden_dim]")
+        if self.recurrent_state_init_std < 0.0:
+            raise ValueError(
+                "recurrent_state_init_std must be non-negative, got "
+                f"{self.recurrent_state_init_std}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +332,8 @@ class BitRecurrentBlock(nn.Module):
     The output is a soft-ACT weighted blend across all iteration hidden states,
     normalised so no single iteration dominates. The blending uses incremental
     residual updates: h_out = h_out + w_i * (h_i - h_out) which avoids the
-    blurring effect of a direct weighted average.
+    blurring effect of a direct weighted average, then divides by the achieved
+    total weight so the output magnitude does not depend on ``n_loops``.
 
     Args:
         config: ``RDTConfig`` with all hyper-parameters.
@@ -389,6 +408,12 @@ class BitRecurrentBlock(nn.Module):
         if n_loops < 1:
             raise ValueError(f"n_loops must be at least 1, got {n_loops}")
         h = x
+        std = self.config.recurrent_state_init_std
+        if std > 0.0:
+            # Random start (see RDTConfig.recurrent_state_init_std). Sampled
+            # fresh per forward; never carried across model.forward() calls,
+            # which would break the diffusion Markov property.
+            h = h + torch.randn_like(h) * std
         total_aux_loss = x.new_zeros(())
 
         all_h: list[torch.Tensor] = []
@@ -398,8 +423,12 @@ class BitRecurrentBlock(nn.Module):
 
         for i in range(n_loops):
             # Inject combined loop-index + timestep signal into h
+            # Normalise by max_loop_iters, not n_loops: with randomize_loops a
+            # given iteration index must carry the same signal whatever the
+            # sampled loop count, or no loop prefix is reusable and depth
+            # extrapolation is meaningless.
             delta = loop_index_inject(
-                h, i, n_loops, t_emb,
+                h, i, self.config.max_loop_iters, t_emb,
                 self.loop_proj, self.loop_proj2, self.config.loop_dim,
             )
             h = h + delta
@@ -451,11 +480,20 @@ class BitRecurrentBlock(nn.Module):
             w_stack = torch.cat(all_w, dim=-1)                               # (B, T, n_loops)
             w_norm  = w_stack / (w_stack.sum(dim=-1, keepdim=True) + 1e-6)  # (B, T, n_loops)
 
-            # Incremental residual blend: h_out = h_out + w_i * (h_i - h_out)
-            # Avoids blurring by applying weighted corrections progressively
+            # Incremental residual blend: h_out = h_out + w_i * (h_i - h_out).
+            # This is a sequential lerp, not sum(w_i * h_i): the effective
+            # weight on h_i is w_i * prod_{j>i}(1 - w_j), so later loops lead.
+            # That bias is the intent (progressive refinement), but the
+            # effective weights sum to 1 - prod(1 - w_j), not to 1 -- roughly
+            # 1.00 at n_loops=1, 0.75 at 2, 0.66 at 8. Since n_loops is
+            # randomised in training and overridable at inference, that would
+            # swing the output magnitude ~34% along the very axis this block
+            # exists to vary, so divide the achieved total back out.
             h_out = torch.zeros_like(h)
             for idx, (w_i, h_i) in enumerate(zip(w_norm.unbind(-1), all_h)):
                 h_out = h_out + w_i.unsqueeze(-1) * (h_i - h_out)
+            total_w = 1.0 - torch.prod(1.0 - w_norm, dim=-1, keepdim=True)
+            h_out = h_out / total_w.clamp_min(1e-6)
         else:
             # ACT disabled — use the final hidden state directly
             h_out = all_h[-1]
@@ -631,7 +669,7 @@ class BitRDTTransformer(nn.Module):
         """Choose depth from corruption level and long-context difficulty."""
         if not self.config.adaptive_loops:
             return self.config.max_loop_iters
-        noise = float(t.detach().max().clamp(0, 1).cpu())
+        noise = float(t.detach().max().clamp(0, 1))  # single sync, adaptive_loops only
         span = self.config.max_loop_iters - self.config.min_loop_iters
         noise_loops = self.config.min_loop_iters + int(math.ceil(noise * span - 1e-8))
         length_loops = self.config.min_loop_iters
@@ -666,8 +704,7 @@ class BitRDTTransformer(nn.Module):
                        prediction, used only when configured.
         Returns:
             Tuple of (logits, aux_loss). logits is (B, T, vocab_total);
-            aux_loss is the sum of MoE load-balance losses and the soft ACT
-            ponder regularisation term.
+            aux_loss is the sum of MoE load-balance losses.
         """
         if n_loops is None:
             if self.training and self.config.randomize_loops:
@@ -717,13 +754,13 @@ class BitRDTTransformer(nn.Module):
         )
         runtime_mask: torch.Tensor = global_attention_mask
         if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
-            selector = float(torch.frac(t.detach().float().sum() * 0.754877666).abs().cpu())
-            if selector < self.config.block_causal_prob:
-                width = self.config.block_causal_max_size - self.config.block_causal_min_size + 1
-                size_selector = float(
-                    torch.frac(t.detach().float().sum() * 0.569840296 + 0.314159265).abs().cpu()
+            # Plain host RNG: the old version hashed t on-device and cost two
+            # GPU syncs per step to recover one coin flip. This is a training
+            # augmentation, not something a checkpoint has to reproduce.
+            if random.random() < self.config.block_causal_prob:
+                block_causal_block_size = random.randint(
+                    self.config.block_causal_min_size, self.config.block_causal_max_size
                 )
-                block_causal_block_size = self.config.block_causal_min_size + int(size_selector * width)
         if block_causal_block_size > 0:
             patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
             global_block_size = max(1, math.ceil(block_causal_block_size / patch_size))
@@ -758,11 +795,11 @@ class BitRDTTransformer(nn.Module):
                 )
             total_aux_loss = total_aux_loss + aux
 
-        # Freeze prelude output as the LTI injection anchor (e).
-        # detach() ensures gradients don't flow back through the LTI B matrix
-        # into the prelude a second time — the prelude already receives gradients
-        # through the normal forward path.
-        e = x.detach()
+        # Prelude output is the LTI injection anchor (e), re-read every loop.
+        # Gradients flow through it by default: that second path is how the
+        # prelude learns to emit a good anchor, not merely a good h_0. It is
+        # not a double-count to be suppressed.
+        e = x.detach() if self.config.detach_recurrent_anchor else x
 
         # --- RecurrentBlock: shared block looped n_loops times ---
         x, rec_aux = self.recurrent(
@@ -825,6 +862,16 @@ class BitRDTTransformer(nn.Module):
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
+# Pre-change values for fields added after checkpoints existed (see
+# utils._LEGACY_MODEL_CONFIG_DEFAULTS). The recurrent anchor used to be
+# unconditionally detached, and h_0 was always deterministic.
+_LEGACY_RDT_CONFIG_DEFAULTS = {
+    "use_sub_norm": False,
+    "detach_recurrent_anchor": True,
+    "recurrent_state_init_std": 0.0,
+}
+
+
 def resolve_rdt_config(ckpt: dict, fallback: Optional[RDTConfig] = None) -> RDTConfig:
     """Reconstruct ``RDTConfig`` from a checkpoint dict.
 
@@ -843,6 +890,12 @@ def resolve_rdt_config(ckpt: dict, fallback: Optional[RDTConfig] = None) -> RDTC
         # Filter out any unknown fields for forward-compatibility
         known = {f.name for f in dc_fields(RDTConfig)}
         filtered = {k: v for k, v in data.items() if k in known}
+        # Back-fill fields added after this checkpoint was written, so its
+        # stored topology and training semantics are reproduced rather than
+        # silently replaced by a newer default. See
+        # utils._LEGACY_MODEL_CONFIG_DEFAULTS for the same treatment upstream.
+        for key, legacy in _LEGACY_RDT_CONFIG_DEFAULTS.items():
+            filtered.setdefault(key, legacy)
         return RDTConfig(**filtered)
     if fallback is not None:
         return fallback

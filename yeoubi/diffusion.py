@@ -157,22 +157,26 @@ class MaskDiffusionLoss(nn.Module):
 
     - ``"uniform"`` (default): plain mean cross-entropy over masked positions.
       Bit-identical to the original loss; ``t`` is ignored.
-    - ``"mdlm"``: the principled continuous-time MDLM NELBO weighting for the
-      cosine schedule ``alpha_bar(t)=cos(pi*t/2)``. Each sample's masked-token
-      cross-entropy is scaled by ``w(t_b)=(pi/2)*cot(pi*t_b/4) =
-      -alpha_bar'(t_b)/(1-alpha_bar(t_b))`` and reduced as a
-      per-batch-normalized token-weighted mean, so the loss scale stays
-      comparable to ``"uniform"`` (a fixed learning rate remains valid) while
-      up-weighting low-noise samples as the NELBO requires. Improves
-      sample-efficiency over the unweighted objective.
+    - ``"mdlm"``: the continuous-time MDLM NELBO weighting for the cosine
+      schedule ``alpha_bar(t)=cos(pi*t/2)``. Each masked token's cross-entropy
+      is scaled by ``w(t_b)=(pi/2)*cot(pi*t_b/4) =
+      -alpha_bar'(t_b)/(1-alpha_bar(t_b))``, summed, and divided by the number
+      of *valid* positions -- the MDLM normalization. Because
+      ``E_t[w(t)*(1-alpha_bar(t))] = 1`` for ``t ~ U(0,1)``, the expected loss
+      magnitude already matches ``"uniform"`` plain-mean CE, so a fixed
+      learning rate stays valid without any extra rescaling.
 
     Args:
         ignore_index: Token ID to ignore in loss (e.g., padding). Default -100.
         weighting: ``"uniform"`` or ``"mdlm"``.
         t_min: Lower clamp for ``t`` in MDLM mode — ``w(t)`` diverges as ``2/t``
                near ``t=0``, so clamping bounds the weight (1e-3 → w ≤ ~2000).
-        normalize_per_batch: In MDLM mode, rescale weights so the batch-mean
-               weight is 1 (keeps loss magnitude comparable to uniform).
+        normalize_per_batch: Legacy. Rescales weights so the batch-mean weight
+               is 1. Discouraged and off by default: it makes the loss scale a
+               function of batch size (mean 0.68 at B=2 vs 0.28 at B=32), which
+               silently changes the effective learning rate when batch_size or
+               grad_accum_steps is retuned. Correct NELBO normalization already
+               gives a uniform-comparable scale.
     """
 
     def __init__(
@@ -180,7 +184,7 @@ class MaskDiffusionLoss(nn.Module):
         ignore_index: int = -100,
         weighting: str = "uniform",
         t_min: float = 1e-3,
-        normalize_per_batch: bool = True,
+        normalize_per_batch: bool = False,
     ):
         super().__init__()
         if weighting not in ("uniform", "mdlm"):
@@ -197,6 +201,7 @@ class MaskDiffusionLoss(nn.Module):
         is_masked: torch.Tensor,
         is_think: torch.Tensor | None = None,
         t: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute masked diffusion loss.
 
@@ -216,6 +221,9 @@ class MaskDiffusionLoss(nn.Module):
             t: Optional (B,) per-sample noise level in [0, 1]. Required for
                ``"mdlm"`` weighting; ignored in ``"uniform"`` mode. If None in
                ``"mdlm"`` mode the loss falls back to the uniform reduction.
+            valid_mask: Optional (B, T) bool tensor marking non-padding
+               positions. Used only in ``"mdlm"`` mode as the NELBO
+               denominator; defaults to all ``B*T`` positions when omitted.
 
         Returns:
             Scalar loss tensor.
@@ -276,7 +284,17 @@ class MaskDiffusionLoss(nn.Module):
 
         w_tok = w.to(ce_flat.dtype).unsqueeze(1).expand(B, T).reshape(-1)  # (B*T,)
 
-        # Token-weighted mean over masked positions (fp32 accumulation).
+        # NELBO normalization is over *valid* positions, not masked ones. MDLM
+        # divides the weighted sum by the sequence/token count, which is a
+        # constant; dividing by N_masked instead makes the denominator a random
+        # variable that co-varies with t, turning the estimator into a biased
+        # ratio with ~13x the relative variance at small batch sizes and making
+        # the loss scale depend on batch size.
+        if valid_mask is not None:
+            den = valid_mask.reshape(-1).float().sum().clamp_min(1.0)
+        else:
+            den = float(B * T)
+
+        # Token-weighted sum over masked positions (fp32 accumulation).
         num = (w_tok.float() * ce_flat.float() * m_flat.float()).sum()
-        den = m_flat.float().sum().clamp_min(1.0)  # N_masked; guards all-unmasked
         return (num / den).to(logits.dtype)

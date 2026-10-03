@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from yeoubi.byte_codec import MASK_TOKEN_ID, VOCAB_SIZE
 from yeoubi.export import export_checkpoint, load_model_from_checkpoint as load_export_model
 from yeoubi.model import BitDiffusionTransformer, ModelConfig
 from yeoubi.quantization import HybridKVCache, KVCache
@@ -24,20 +25,6 @@ from yeoubi.utils import (
 )
 
 
-class DummyTokenizer:
-    def __init__(self, vocab_size: int = 32):
-        self.vocab_size = vocab_size
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        return [1, 2] if text else []
-
-    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
-        return " ".join(str(token) for token in ids)
-
-    def save_pretrained(self, output_dir: str) -> None:
-        Path(output_dir, "tokenizer.json").write_text("{}", encoding="utf-8")
-
-
 class UnsafeCheckpointPayload:
     def __init__(self, value: str = "ok") -> None:
         self.value = value
@@ -45,13 +32,13 @@ class UnsafeCheckpointPayload:
 
 def make_config(**overrides) -> ModelConfig:
     config = dict(
-        vocab_size=32,
+        vocab_size=VOCAB_SIZE,
         hidden_dim=16,
         n_layers=4,
         n_heads=4,
         ffn_dim=32,
         max_seq_len=32,
-        mask_token_id=32,
+        mask_token_id=MASK_TOKEN_ID,
         topk_ratio=0.55,
         t_embed_dim=8,
         kv_cache_bits=3,
@@ -184,7 +171,6 @@ class CompatibilityTests(unittest.TestCase):
             loaded_model, _, loaded_config = load_sample_model(
                 args,
                 device=torch.device("cpu"),
-                tokenizer=DummyTokenizer(vocab_size=config.vocab_size),
             )
 
         self.assertEqual(loaded_config.hidden_dim, config.hidden_dim)
@@ -205,6 +191,38 @@ class CompatibilityTests(unittest.TestCase):
             self.assertTrue((output_dir / "pytorch_model.bin").exists())
             self.assertTrue((output_dir / "model_config.json").exists())
             self.assertTrue((output_dir / "export_metadata.json").exists())
+
+    def test_export_safetensors_handles_tied_embeddings(self) -> None:
+        """The default export format must survive tie_embeddings=True.
+
+        With tying on (the default), embed.weight and unembed.weight are one
+        storage. safetensors' save_file refuses shared tensors outright, so
+        every default-config export raised until this path used save_model.
+        Nothing covered format="safetensors" before -- the other export tests
+        all pass format="pytorch", which is why the failure shipped.
+        """
+        config = make_config(hidden_dim=16, tie_embeddings=True)
+        model = BitDiffusionTransformer(config)
+        self.assertEqual(
+            model.embed.weight.data_ptr(), model.unembed.weight.data_ptr(),
+            "test is meaningless unless the weights really are shared",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir, "tied.pt")
+            output_dir = Path(temp_dir, "exported")
+            torch.save(
+                {"model_state_dict": model.state_dict(), "model_config": asdict(config)},
+                checkpoint_path,
+            )
+            args = make_export_args(
+                str(checkpoint_path), str(output_dir), format="safetensors",
+            )
+
+            export_checkpoint(args)
+
+            self.assertTrue((output_dir / "model.safetensors").exists())
+            self.assertTrue((output_dir / "model_config.json").exists())
 
     def test_legacy_export_loader_uses_cli_fallback(self) -> None:
         config = make_config(hidden_dim=16, use_moe=False)
@@ -232,7 +250,7 @@ class CompatibilityTests(unittest.TestCase):
                 moe_layers=config.moe_layers,
             )
 
-            _, _, loaded_config = load_export_model(args, tokenizer=DummyTokenizer(vocab_size=config.vocab_size))
+            _, _, loaded_config = load_export_model(args)
 
         self.assertEqual(loaded_config.hidden_dim, config.hidden_dim)
         self.assertEqual(loaded_config.n_layers, config.n_layers)
@@ -314,7 +332,8 @@ class CompatibilityTests(unittest.TestCase):
             def eval(self):
                 return self
 
-            def __call__(self, ids, t, kv_cache=None, rope_offset=0):
+            # **kwargs: denoise() forwards self_cond through _model_fwd
+            def __call__(self, ids, t, kv_cache=None, rope_offset=0, **kwargs):
                 batch, seq_len = ids.shape
                 logits = torch.zeros(batch, seq_len, self.config.vocab_size + 1)
                 logits[..., 0] = 1.0
@@ -324,7 +343,6 @@ class CompatibilityTests(unittest.TestCase):
         try:
             results = denoise(
                 model=DummyModel(),
-                tokenizer=DummyTokenizer(vocab_size=8),
                 prompt="",
                 gen_length=4,
                 steps=3,
@@ -353,8 +371,10 @@ class DefaultModelTests(unittest.TestCase):
             cfg.model_type, "rdt",
             "Default model_type should be 'rdt' (BitRDTTransformer is the default model).",
         )
-        self.assertEqual(cfg.N_think, 64)
-        self.assertEqual(cfg.think_prob, 1.0)
+        # Legacy thinking tokens are kept for ablations but off by default;
+        # reasoning is taught through the supervised response canvas instead.
+        self.assertEqual(cfg.N_think, 0)
+        self.assertEqual(cfg.think_prob, 0.0)
 
 
 if __name__ == "__main__":

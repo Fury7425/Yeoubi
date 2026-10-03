@@ -271,13 +271,10 @@ def log_device_info(device: torch.device) -> None:
 def compile_model(model: torch.nn.Module, device: torch.device, dynamic: bool = True):
     """Compile *model* with the backend appropriate for *device*.
 
-    Falls back gracefully (returns the original model) if compilation
-    fails — e.g., on XPU without a compatible Triton build.
+    Compilation is deferred to the first forward pass, so failures surface
+    there rather than here.
 
-    Backend selection:
-      CUDA / ROCm → ``"inductor"`` (default, fastest)
-      XPU         → ``"inductor"`` first, ``"ipex"`` on failure
-      CPU         → ``"inductor"``
+    Uses the default inductor backend on every device.
 
     Args:
         model:   The ``nn.Module`` to compile.
@@ -286,27 +283,14 @@ def compile_model(model: torch.nn.Module, device: torch.device, dynamic: bool = 
                  sequence lengths).
 
     Returns:
-        The compiled model, or the original model if compilation failed.
+        The compiled model wrapper.
     """
-    backends_to_try = ["inductor"]
-    if device.type == "xpu":
-        backends_to_try = ["inductor", "ipex"]
-
-    for backend in backends_to_try:
-        try:
-            compiled = torch.compile(model, dynamic=dynamic, backend=backend)
-            logger.info(
-                "torch.compile succeeded (backend=%s, dynamic=%s). "
-                "First step will be slow while kernels are compiled.",
-                backend, dynamic,
-            )
-            return compiled
-        except Exception as exc:
-            logger.debug("torch.compile backend='%s' failed: %s", backend, exc)
-
-    logger.warning(
-        "torch.compile failed on all backends for device '%s'; "
-        "continuing without compilation (no performance regression, just no speedup).",
-        device,
+    # torch.compile is lazy: it returns a wrapper and only compiles on the
+    # first forward. A backend that cannot build raises there, not here, so
+    # there is nothing to catch and no second backend to fall back to.
+    logger.info(
+        "torch.compile enabled (backend=inductor, dynamic=%s). The first step "
+        "is slow while kernels build; a backend failure surfaces there, not now.",
+        dynamic,
     )
-    return model
+    return torch.compile(model, dynamic=dynamic)

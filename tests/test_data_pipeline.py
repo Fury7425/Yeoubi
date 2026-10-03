@@ -115,5 +115,31 @@ class TestLoaderEOSCompatibility(unittest.TestCase):
             self.assertEqual(example["input_ids"].tolist(), [104, 105, EOS_TOKEN_ID])
 
 
+class TestPiiAndQualityRegressions(unittest.TestCase):
+    """Pins two filters that silently damage or reject good documents."""
+
+    def test_ipv4_redaction_ignores_impossible_octets(self):
+        # A dotted run with a component above 255 is not an address. The old
+        # \d{1,3} pattern still redacted it, which corrupted code corpora.
+        clean, counts = handle_pii("serial 300.400.500.600 ok", "redact")
+        self.assertNotIn("<IP_ADDRESS>", clean)
+        self.assertFalse(counts.get("ipv4"))
+
+        redacted, counts = handle_pii("host 192.168.1.1 down", "redact")
+        self.assertIn("<IP_ADDRESS>", redacted)
+        self.assertEqual(counts["ipv4"], 1)
+
+    def test_repeated_character_run_still_rejected(self):
+        # The run scan only counts runs once they reach the 128 rejection
+        # threshold, so guard both sides of that boundary.
+        padded = "The quick brown fox jumps over the lazy dog. " * 4
+        self.assertTrue(assess_quality(padded).accepted)
+
+        spammed = padded + "x" * 4000
+        verdict = assess_quality(spammed)
+        self.assertFalse(verdict.accepted)
+        self.assertEqual(verdict.reason, "repeated_character_run")
+
+
 if __name__ == "__main__":
     unittest.main()

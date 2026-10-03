@@ -9,7 +9,10 @@ Implements:
 - Absmax INT4 / INT8 activation quantization
 - TopK sparsification with INT8 quantization
 - HybridQuantizer module with STE for training
-- 3-bit / 4-bit KV cache with pack/unpack utilities
+- "3-bit" / 4-bit KV cache with pack/unpack utilities. The "3-bit" scheme
+  quantizes values to 3-bit codes but the byte-aligned 2-values-per-byte
+  packing (see ``_pack_3bit``) actually stores 4 bits/value, not 3 — see
+  ``effective_bits()`` on ``HybridKVCache`` for the true accounting.
 """
 
 from __future__ import annotations
@@ -45,23 +48,43 @@ def absmean_quantize(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return w_q, scale
 
 
-def ste_ternary(w_latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Straight-through ternary quantization.
+def ste_ternary(w_latent: torch.Tensor) -> torch.Tensor:
+    """Straight-through ternary quantization (BitNet b1.58 `weight_quant`).
 
-    Forward: uses quantized weights.
-    Backward: gradients flow to the latent copy.
+    Forward: the dequantized ternary weight ``round(w/s).clamp(-1,1) * s``.
+    Backward: the identity, straight through to the latent copy.
+
+    The *entire* quantizer -- rounding **and** the absmean scale -- sits
+    inside the detached branch. That is not a stylistic choice. ``scale =
+    mean|w|`` is itself a function of every element of ``w_latent``, so
+    leaving it attached (the previous ``w_forward * scale``, with a live
+    ``scale``) adds a second gradient path
+
+        dL/dw += (dL/dw_eff . w_q) * sign(w) / N
+
+    -- a dense rank-1 term that pushes every weight's magnitude in lockstep.
+    Measured on this model's matrix shapes it is ~5x the norm of the true STE
+    gradient and drags the cosine similarity with the correct BitNet update
+    down to ~0.27 (~0.21 after Muon's Newton-Schulz orthogonalization, which
+    does not remove it -- sign(W) is near full rank). Roughly 80% of every
+    update was that artifact, so this must stay detached.
 
     Args:
         w_latent: Full-precision latent weight tensor.
 
     Returns:
-        (w_forward, scale) where w_forward has the quantized value but
-        latent gradients attached.
+        The dequantized ternary weight, with a straight-through gradient to
+        ``w_latent``. Multiply nothing further onto it -- the absmean scale
+        is already folded in.
     """
     w_q, scale = absmean_quantize(w_latent)
-    # STE: attach gradient path to latent while using quantized value
-    w_forward = w_q.detach() + w_latent - w_latent.detach()
-    return w_forward, scale
+    w_dequant = (w_q * scale).detach()
+    # STE: quantized value forward, identity gradient back to the latent.
+    # Written as ``q + (w - w.detach())`` rather than ``w + (q - w).detach()``
+    # so the forward value is bit-exact -- ``w - w.detach()`` is exactly zero,
+    # whereas the other ordering rounds through ``w + q - w`` and lands 1 ULP
+    # off the packed export path.
+    return w_dequant + (w_latent - w_latent.detach())
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +252,12 @@ def _pack_3bit(values: torch.Tensor) -> torch.Tensor:
 
     Layout per byte: [val0 (bits 0-2)] [val1 (bits 3-5)] [unused bits 6-7]
 
+    Byte alignment means bits 6-7 go unused, so despite the name this is NOT
+    a true 3-bit-per-value packing (that would need 8 values per 3 bytes):
+    the actual storage cost is 4 bits/value, the same as ``_pack_4bit``. The
+    "3-bit" name refers to the quantization level count (8 codes), not the
+    on-disk/in-memory bit rate — see ``effective_bits()`` for real accounting.
+
     Args:
         values: Tensor of uint8 values in range [0, 7] with even last dim.
 
@@ -311,7 +340,9 @@ def quantize_kv(tensor: torch.Tensor, bits: int = 3) -> Tuple[torch.Tensor, torc
     if bits not in (3, 4, 8):
         raise ValueError(f"Unsupported bits: {bits}")
     max_val = (1 << bits) - 1
-    half = max_val / 2.0
+    # Integer offset (not max_val/2): a fractional midpoint makes 0.0 round to
+    # half+0.5, so exact zeros dequantize with a systematic positive bias.
+    half = float(max_val // 2)
 
     # Per-head absmax
     amax = tensor.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
@@ -353,7 +384,7 @@ def dequantize_kv(packed: torch.Tensor, scale: torch.Tensor, bits: int = 3,
     if bits not in (3, 4, 8):
         raise ValueError(f"Unsupported bits: {bits}")
     max_val = (1 << bits) - 1
-    half = max_val / 2.0
+    half = float(max_val // 2)
 
     if bits == 8:
         values = packed.float()
@@ -402,8 +433,11 @@ class KVCache:
     """Quantized KV cache for inference.
 
     Stores K and V tensors in low-bit quantized form to save memory.
-    By default uses 3-bit quantization, with the BOS token (position 0)
-    stored at 4-bit precision to preserve outlier features.
+    By default uses "3-bit" quantization (8 quantization levels), with the
+    BOS token (position 0) stored at 4-bit precision to preserve outlier
+    features. Note: the "3-bit" packing is byte-aligned 2-values-per-byte
+    (see ``_pack_3bit``), so it actually costs 4 bits/value in storage, not
+    3 — the level count is 3-bit, the storage rate is not.
 
     Appended chunks are stored independently (no re-quantization on
     append) and concatenated only at read time.
@@ -552,6 +586,11 @@ class HybridKVCache:
     - Early layers ``[0, L//3)`` use absmax 3-bit quantization.
     - Middle layers ``[L//3, 2L//3)`` use TurboQuant 3-bit.
     - Late layers ``[2L//3, L)`` use TurboQuant 4-bit.
+
+    Note: "3-bit" here means 8 quantization levels, not 3 bits of storage —
+    the underlying packing (``_pack_3bit``) is byte-aligned 2-values-per-byte
+    and actually costs 4 bits/value, identical to the "4-bit" scheme's
+    storage rate. Use ``effective_bits()`` for the true bits/value accounting.
 
     Precision exceptions:
     - BOS (position 0) is always kept in FP16.
@@ -835,15 +874,22 @@ class HybridKVCache:
 
         state.total_tokens += 1
 
-    def get(self, layer_idx: int, target_shape: Optional[Tuple[int, ...]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get(
+        self,
+        layer_idx: int,
+        target_shape: Optional[Tuple[int, ...]] = None,
+        device: Optional[torch.device] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieve all K/V for a layer and return tensors in FP32."""
         state = self._layers[layer_idx]
         if state.total_tokens == 0:
             if target_shape is None:
                 raise ValueError("target_shape is required when retrieving an empty cache")
+            # ``device`` matters here: an empty cache has no stored tensor to
+            # inherit it from, and CPU zeros would break a GPU attention call.
             return (
-                torch.zeros(target_shape, dtype=torch.float32),
-                torch.zeros(target_shape, dtype=torch.float32),
+                torch.zeros(target_shape, dtype=torch.float32, device=device),
+                torch.zeros(target_shape, dtype=torch.float32, device=device),
             )
 
         parts_k = [state.bos_k.to(torch.float32)] if state.bos_k is not None else []
@@ -895,6 +941,7 @@ class HybridKVCache:
             return self.get(
                 layer_idx,
                 target_shape=(k.shape[0], k.shape[1], state.total_tokens, k.shape[-1]),
+                device=k.device,
             )
 
         self._ensure_runtime_shape(n_heads=k.shape[1], head_dim=k.shape[-1])
@@ -932,6 +979,7 @@ class HybridKVCache:
         return self.get(
             layer_idx,
             target_shape=(k.shape[0], k.shape[1], state.total_tokens, k.shape[-1]),
+            device=k.device,
         )
 
     def effective_bits(self) -> float:

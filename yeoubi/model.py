@@ -20,6 +20,7 @@ Modules:
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -74,6 +75,8 @@ class ModelConfig:
         rope_theta: Base frequency for RoPE.
         t_embed_dim: Dimension of the noise-level embedding.
         kv_cache_bits: Default KV cache quantization bits for inference.
+                       Note bits=3 is *stored* at 4 bits/value: the packing
+                       is byte-aligned at 2 values per byte, wasting 2 bits.
         kv_cache_bos_bits: KV cache bits for the first sequence position
                            (legacy field name; byte mode has no BOS token).
     """
@@ -100,6 +103,15 @@ class ModelConfig:
     # Normalising queries and keys materially improves attention-logit
     # stability as the number of candidate keys grows.
     qk_norm: bool = False
+    # BitNet's SubLN: normalise the activation entering every ternary
+    # projection. The block's pre-norms already cover the INT4 inputs (q/k/v
+    # and up/gate all read attn_norm / ffn_norm), but o_proj and down_proj
+    # receive raw attention output and the raw SwiGLU product. Those are the
+    # two sites the released b1.58 model normalises (attn_sub_norm /
+    # ffn_sub_norm), and the SwiGLU product in particular is the canonical
+    # outlier-heavy tensor -- per-token absmax spends its range on the outlier
+    # and collapses everything else. False reproduces pre-SubLN checkpoints.
+    use_sub_norm: bool = True
     # During training, optionally replace full bidirectional attention with a
     # block-causal mask matching cached block-diffusion inference.
     block_causal_prob: float = 0.0
@@ -275,8 +287,12 @@ class RotaryEmbedding(nn.Module):
         self.original_max_seq_len = original_max_seq_len or max_seq_len
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Scaling is a property of the config, not of the current batch. Keying
+        # it on sequence length gave the same absolute position different
+        # rotations in short vs long batches, and rebuilt the cache on every flip.
+        self._scaled = scaling_type != "none" and scaling_factor > 1.0
         self._cache_scaled = False
-        self._build_cache(max_seq_len, use_scaled=max_seq_len > self.original_max_seq_len)
+        self._build_cache(max_seq_len, use_scaled=self._scaled)
 
     def _scaled_inv_freq(self) -> torch.Tensor:
         if self.scaling_type == "none" or self.scaling_factor == 1.0:
@@ -301,8 +317,20 @@ class RotaryEmbedding(nn.Module):
                 t = t / self.scaling_factor
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)  # (T, dim)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        cos, sin = emb.cos(), emb.sin()
+        if use_scaled and self.scaling_type == "yarn":
+            # YaRN's attention temperature. The paper softmaxes over
+            # q.k / (t * sqrt(d)) with sqrt(1/t) = 0.1*ln(s) + 1, compensating
+            # for the entropy increase that interpolation causes. Folding the
+            # factor into cos/sin scales |q| and |k| by mscale each, so the
+            # logits scale by mscale^2 = 1/t -- the standard equivalence, and
+            # the only way to apply it without touching the SDPA call. Omitting
+            # it (as this did) leaves the frequency interpolation without the
+            # half of YaRN that makes it work.
+            mscale = 0.1 * math.log(self.scaling_factor) + 1.0
+            cos, sin = cos * mscale, sin * mscale
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
         self._cache_scaled = use_scaled
 
     def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
@@ -317,16 +345,9 @@ class RotaryEmbedding(nn.Module):
         """
         T = x.shape[2]
         required = offset + T
-        use_scaled = (
-            self.scaling_type != "none"
-            and self.scaling_factor > 1.0
-            and required > self.original_max_seq_len
-        )
-        if required > self.cos_cached.shape[0] or use_scaled != self._cache_scaled:
-            self._build_cache(
-                max(required, self.original_max_seq_len if not use_scaled else required),
-                use_scaled=use_scaled,
-            )
+        if required > self.cos_cached.shape[0]:
+            self._build_cache(max(required, self.original_max_seq_len),
+                              use_scaled=self._scaled)
         cos = self.cos_cached[offset : offset + T].unsqueeze(0).unsqueeze(0)
         sin = self.sin_cached[offset : offset + T].unsqueeze(0).unsqueeze(0)
 
@@ -422,10 +443,10 @@ class BitLinear(nn.Module):
         if self.act_quant is not None:
             x = self.act_quant(x)
 
-        # Ternary weight quantization with STE
-        w_forward, scale = ste_ternary(self.latent_weight)
-
-        return F.linear(x, w_forward * scale)
+        # Ternary weight quantization with STE. ste_ternary already folds the
+        # absmean scale into the returned weight (and keeps it out of the
+        # gradient path); do not re-apply it here.
+        return F.linear(x, ste_ternary(self.latent_weight))
 
     # ------------------------------------------------------------------
     # Packed inference path
@@ -764,7 +785,12 @@ class BitAttention(nn.Module):
         self.v_proj = BitLinear(config.hidden_dim, config.n_heads * config.head_dim, act_mode="int4")
         self.q_norm = RMSNorm(config.head_dim) if config.qk_norm else nn.Identity()
         self.k_norm = RMSNorm(config.head_dim) if config.qk_norm else nn.Identity()
-        # Output projection — TopK+INT8 on its input (the attention output)
+        # Output projection — TopK+INT8 on its input (the attention output),
+        # preceded by BitNet's attn_sub_norm (see ModelConfig.use_sub_norm).
+        self.sub_norm = (
+            RMSNorm(config.n_heads * config.head_dim)
+            if config.use_sub_norm else nn.Identity()
+        )
         self.o_proj = BitLinear(config.n_heads * config.head_dim, config.hidden_dim,
                                 act_mode="topk_int8", topk_ratio=config.topk_ratio)
 
@@ -838,7 +864,7 @@ class BitAttention(nn.Module):
         )  # (B, n_heads, T, head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)  # (B, T, hidden_dim)
 
-        return self.o_proj(out)
+        return self.o_proj(self.sub_norm(out))
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +886,11 @@ class BitFFN(nn.Module):
         # Up and gate projections — INT4 on input
         self.up_proj = BitLinear(config.hidden_dim, config.ffn_dim, act_mode="int4")
         self.gate_proj = BitLinear(config.hidden_dim, config.ffn_dim, act_mode="int4")
-        # Down projection — TopK+INT8 on its input (the intermediate activation)
+        # Down projection — TopK+INT8 on its input (the intermediate
+        # activation), preceded by BitNet's ffn_sub_norm.
+        self.sub_norm = (
+            RMSNorm(config.ffn_dim) if config.use_sub_norm else nn.Identity()
+        )
         self.down_proj = BitLinear(config.ffn_dim, config.hidden_dim,
                                    act_mode="topk_int8", topk_ratio=config.topk_ratio)
 
@@ -873,7 +903,7 @@ class BitFFN(nn.Module):
         Returns:
             (B, T, hidden_dim) output.
         """
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(self.sub_norm(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1021,17 @@ class BitMoEFFN(nn.Module):
             self.register_buffer(f"{proj_name}_packed_all", packed_stack, persistent=False)
             self.register_buffer(f"{proj_name}_scale_all", scale_stack, persistent=False)
 
+        # The grouped kernel path bypasses BitFFN.forward, so the per-expert
+        # ffn_sub_norm gain has to be stacked here too or packed and eager
+        # MoE diverge. The rsqrt is per-token and shared; only the gain differs.
+        if self.config.use_sub_norm:
+            self.register_buffer(
+                "sub_norm_weight_all",
+                torch.stack([e.sub_norm.weight.data for e in self.experts], dim=0)
+                .contiguous(),
+                persistent=False,
+            )
+
         self._packed = True
 
     def _load_balance_loss(
@@ -1033,8 +1074,10 @@ class BitMoEFFN(nn.Module):
         # Renormalize top-K probabilities
         topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
 
-        # Capacity constraint: max tokens per expert
-        capacity = int((B * T / N) * self.capacity_factor)
+        # Capacity constraint: max tokens per expert. Floor of 1 — a batch
+        # smaller than n_experts otherwise rounds capacity to 0 and silently
+        # drops every token, returning all zeros.
+        capacity = max(1, int((B * T / N) * self.capacity_factor))
 
         # Flatten batch and sequence for per-token routing
         x_flat = x.reshape(B * T, D)  # (BT, D)
@@ -1121,7 +1164,7 @@ class BitMoEFFN(nn.Module):
         probs = topk_probs_flat.reshape(-1)
 
         # --- Capacity-constrained dropping (vectorized) ---
-        capacity = int((BT / N) * self.capacity_factor)
+        capacity = max(1, int((BT / N) * self.capacity_factor))
         # For each (token, expert) pair, count how many earlier same-expert
         # pairs are in the flattened list — keep only those with rank < capacity.
         # Sort by expert to get per-expert blocks, then use cumsum.
@@ -1178,6 +1221,13 @@ class BitMoEFFN(nn.Module):
         ).to(x.dtype)
 
         mid = F.silu(gate_out) * up_out  # (M_perm, ffn_dim)
+
+        # --- per-expert ffn_sub_norm (mirrors BitFFN.forward) ---
+        if self.config.use_sub_norm:
+            rms = mid.float().pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
+            mid = (mid.float() * rms).to(mid.dtype) * self.sub_norm_weight_all[
+                kept_expert_idx
+            ].to(mid.dtype)
 
         # --- topk_int8 quantize for down_proj input ---
         mid_int, scale_mid = down_quant.quantize_to_int(mid)
@@ -1452,15 +1502,13 @@ class BitDiffusionTransformer(nn.Module):
         )
         runtime_mask: torch.Tensor = global_attention_mask
         if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
-            # Derive the choice deterministically from this batch's diffusion
-            # times without maintaining mutable RNG state.
-            selector = float(torch.frac(t.detach().float().sum() * 0.754877666).abs().cpu())
-            if selector < self.config.block_causal_prob:
-                width = self.config.block_causal_max_size - self.config.block_causal_min_size + 1
-                size_selector = float(
-                    torch.frac(t.detach().float().sum() * 0.569840296 + 0.314159265).abs().cpu()
+            # Plain host RNG: the old version hashed t on-device and cost two
+            # GPU syncs per step to recover one coin flip. This is a training
+            # augmentation, not something a checkpoint has to reproduce.
+            if random.random() < self.config.block_causal_prob:
+                block_causal_block_size = random.randint(
+                    self.config.block_causal_min_size, self.config.block_causal_max_size
                 )
-                block_causal_block_size = self.config.block_causal_min_size + int(size_selector * width)
         if block_causal_block_size > 0:
             patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
             global_block_size = max(1, math.ceil(block_causal_block_size / patch_size))

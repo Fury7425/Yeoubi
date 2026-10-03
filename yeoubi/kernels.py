@@ -15,12 +15,21 @@ Encoding for the 2-bit packed weight format:
 
 Four 2-bit codes are packed into each uint8 byte, lowest-K position in the
 least-significant 2 bits.
+
+CPU inference is NOT low-memory: ``torch._int_mm`` (and the T-MAC LUT path)
+need the weight unpacked to one byte per value, so the CPU fallback below
+keeps a bounded LRU cache of int8 unpacks (4x the packed size) alongside the
+2-bit packed weight. That trades memory for matmul speed on purpose — see
+``_UNPACK_CACHE`` — and only the packed weight itself, not CPU inference as a
+whole, is low-memory. CUDA/ROCm/XPU via Triton decode 2-bit codes on the fly
+in registers and never materialize an unpacked copy.
 """
 
 from __future__ import annotations
 
 import logging
 import weakref
+from collections import OrderedDict
 from typing import Optional, Union
 
 import torch
@@ -547,35 +556,68 @@ def _triton_packed_linear(
 # Pure PyTorch fallback
 # ---------------------------------------------------------------------------
 
-def _probe_int_mm() -> bool:
-    """Detect whether ``torch._int_mm`` is callable on the active CPU build."""
+def _probe_int_mm(device: torch.device) -> bool:
+    """Detect whether ``torch._int_mm`` is callable for tensors on *device*.
+
+    Probed per device, not once at import: the CUDA implementation has shape
+    constraints the CPU one does not, so a CPU-only probe would green-light a
+    call that raises on GPU with no fallback left.
+    """
     if not hasattr(torch, "_int_mm"):
         return False
-    try:
-        a = torch.zeros(8, 32, dtype=torch.int8)
-        b = torch.zeros(32, 8, dtype=torch.int8)
-        torch._int_mm(a, b)
-        return True
-    except Exception:
-        return False
+    key = (device.type, device.index)
+    cached = _INT_MM_AVAILABLE.get(key)
+    if cached is None:
+        try:
+            a = torch.zeros(8, 32, dtype=torch.int8, device=device)
+            b = torch.zeros(32, 8, dtype=torch.int8, device=device)
+            torch._int_mm(a, b)
+            cached = True
+        except Exception:
+            cached = False
+        _INT_MM_AVAILABLE[key] = cached
+    return cached
 
 
-_INT_MM_AVAILABLE: bool = _probe_int_mm()
+_INT_MM_AVAILABLE: dict[tuple, bool] = {}
 
 
 # Keep unpacked weights alive for exactly as long as their packed source. A
 # WeakValueDictionary cannot do that: after a matmul returns, the unpacked
 # tensor has no other strong owner and its cache entry immediately disappears.
+#
+# That strong ref is a deliberate memory-for-speed trade (re-unpacking every
+# forward would be brutally slow), but left unbounded it means CPU packed
+# "inference" actually costs 8 bits/weight (the cached int8 unpack) *plus*
+# the 2-bit packed copy for every distinct packed matrix ever forwarded in
+# the process — worse than just keeping the ternary weights unpacked.
+#
+# Bound it by BYTES, not by entry count. A forward pass touches every layer
+# once in order, so an entry cap smaller than the model's layer count is the
+# pathological case for LRU: each eviction discards exactly the entry needed
+# next and every forward re-unpacks the whole model. An entry cap also fails
+# to bound memory at all, since a down_proj unpack is orders of magnitude
+# larger than an attention projection. The budget below holds the ~1 GB of
+# int8 unpacks a 1B-parameter config needs; a model that exceeds it degrades
+# to re-unpacking rather than to unbounded growth, and says so once.
+_UNPACK_CACHE_MAX_BYTES = 4 * 1024**3
+_unpack_cache_bytes = 0
+_unpack_evicted_logged = False
+
 _UnpackCacheKey = tuple[int, Optional[int], str]
-_UNPACK_CACHE: dict[
-    _UnpackCacheKey,
-    tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor],
-] = {}
+_UNPACK_CACHE: "OrderedDict[_UnpackCacheKey, tuple[weakref.ReferenceType[torch.Tensor], torch.Tensor]]" = OrderedDict()
+
+# Emitted once (not per-unpack) so the memory tradeoff above is visible to
+# anyone reading logs, without spamming a line on every cache miss.
+_unpack_tradeoff_logged = False
 
 
 def _evict_unpacked_weight(key: _UnpackCacheKey) -> None:
     """Remove a cached unpack when its packed source tensor is collected."""
-    _UNPACK_CACHE.pop(key, None)
+    global _unpack_cache_bytes
+    dropped = _UNPACK_CACHE.pop(key, None)
+    if dropped is not None:
+        _unpack_cache_bytes -= dropped[1].numel() * dropped[1].element_size()
 
 
 def _get_cached_unpacked_t(w_packed: torch.Tensor) -> torch.Tensor:
@@ -584,15 +626,30 @@ def _get_cached_unpacked_t(w_packed: torch.Tensor) -> torch.Tensor:
     The unpacked tensor is cached on the ``w_packed`` object via a weakref-keyed
     dictionary so subsequent calls reuse it. Cache key is the tensor's id and
     its device — moving the packed tensor to a new device invalidates the
-    cache entry.
+    cache entry. The cache is an LRU bounded by total bytes (``_UNPACK_CACHE_MAX_BYTES``):
+    each entry is an int8 unpack, 4x the packed tensor's size, so this trades
+    memory for avoiding a re-unpack on every forward — it is not a low-memory
+    path (see the module docstring).
     """
+    global _unpack_tradeoff_logged, _unpack_cache_bytes, _unpack_evicted_logged
     key = (id(w_packed), w_packed.device.index, w_packed.device.type)
     cached = _UNPACK_CACHE.get(key)
     if cached is not None:
         source_ref, unpacked = cached
         if source_ref() is w_packed and unpacked.device == w_packed.device:
+            _UNPACK_CACHE.move_to_end(key)
             return unpacked
         _UNPACK_CACHE.pop(key, None)
+
+    if not _unpack_tradeoff_logged:
+        logger.info(
+            "CPU packed-linear: unpacking 2-bit weights to int8 for matmul speed. "
+            "Unpacked copies are cached (up to %.1f GB, LRU-evicted) at ~8 "
+            "bits/weight alongside the 2-bit packed original — CPU packed "
+            "inference trades memory for speed, it is not low-memory.",
+            _UNPACK_CACHE_MAX_BYTES / 1024**3,
+        )
+        _unpack_tradeoff_logged = True
 
     in_padded = w_packed.shape[1] * 4
     w_int = unpack_ternary_2bit(w_packed, in_padded)
@@ -602,12 +659,28 @@ def _get_cached_unpacked_t(w_packed: torch.Tensor) -> torch.Tensor:
         lambda _ref, cache_key=key: _evict_unpacked_weight(cache_key),
     )
     _UNPACK_CACHE[key] = (source_ref, w_int_t)
+    _UNPACK_CACHE.move_to_end(key)
+    _unpack_cache_bytes += w_int_t.numel() * w_int_t.element_size()
+    while _unpack_cache_bytes > _UNPACK_CACHE_MAX_BYTES and len(_UNPACK_CACHE) > 1:
+        _, (_, evicted) = _UNPACK_CACHE.popitem(last=False)
+        _unpack_cache_bytes -= evicted.numel() * evicted.element_size()
+        if not _unpack_evicted_logged:
+            logger.warning(
+                "Unpacked-weight cache exceeded %.1f GB and is evicting. Every "
+                "forward pass touches each layer once, so eviction here means "
+                "re-unpacking weights every pass. Raise _UNPACK_CACHE_MAX_BYTES "
+                "or run this model on a Triton device.",
+                _UNPACK_CACHE_MAX_BYTES / 1024**3,
+            )
+            _unpack_evicted_logged = True
     return w_int_t
 
 
 def _clear_unpack_cache() -> None:
     """Drop every cached unpacked weight tensor. Test/benchmark use only."""
+    global _unpack_cache_bytes
     _UNPACK_CACHE.clear()
+    _unpack_cache_bytes = 0
 
 
 def _torch_packed_linear(
@@ -627,7 +700,7 @@ def _torch_packed_linear(
     w_int_t = _get_cached_unpacked_t(w_packed)  # (K_padded, N) int8
     x_contig = x_int.contiguous()
 
-    if _INT_MM_AVAILABLE:
+    if _probe_int_mm(x_contig.device):
         y = torch._int_mm(x_contig, w_int_t)
     else:
         y = torch.mm(x_contig.to(torch.int32), w_int_t.to(torch.int32))

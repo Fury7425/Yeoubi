@@ -143,14 +143,16 @@ def export_checkpoint(args: argparse.Namespace) -> None:
         )
     if args.format == "safetensors":
         try:
-            from safetensors.torch import save_file
+            from safetensors.torch import save_model
         except ImportError as exc:
             raise ImportError(
                 "safetensors is not installed. Run `pip install safetensors` "
                 "or `pip install -r requirements.txt` after updating dependencies."
             ) from exc
         output_path = os.path.join(args.output_dir, "model.safetensors")
-        save_file(model.state_dict(), output_path)
+        # save_model, not save_file: tie_embeddings makes embed.weight and
+        # unembed.weight one storage, and save_file rejects shared tensors.
+        save_model(model, output_path)
     else:
         output_path = os.path.join(args.output_dir, "pytorch_model.bin")
         torch.save(model.state_dict(), output_path)
@@ -181,6 +183,13 @@ def export_checkpoint(args: argparse.Namespace) -> None:
     }
     if packed:
         metadata["packed"] = True
+    if args.format == "safetensors" and getattr(config, "tie_embeddings", False):
+        # save_model drops one member of each shared-storage pair, so the file
+        # has no "unembed.weight" key. A consumer doing load_file() +
+        # load_state_dict(strict=True) fails on a missing key that is not
+        # actually missing; safetensors.torch.load_model re-ties it.
+        metadata["tied_weights"] = ["unembed.weight <- embed.weight"]
+        metadata["load_with"] = "safetensors.torch.load_model"
     metadata_path = os.path.join(args.output_dir, "export_metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, sort_keys=True)
@@ -224,7 +233,7 @@ def main() -> None:
     parser.add_argument(
         "--thinking",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable thinking token layout for legacy checkpoints without embedded model_config",
     )
     parser.add_argument("--n_think", type=int, default=64)

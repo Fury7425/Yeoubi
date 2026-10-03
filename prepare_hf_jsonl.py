@@ -43,7 +43,13 @@ MIN_BYTES = 64
 MAX_DOCUMENT_BYTES = 8_000_000
 MAX_CHUNK_LENGTH = 16384
 MAX_CHUNK_OVERLAP = 128
-SHUFFLE_BUCKET_LINES = 500_000
+# Bucket sizing is a BYTE budget, not a line count. A line here is one byte-chunk record
+# reaching 16 KB (SEQ_LENGTH_DIST tops out at 16384), so 500k lines could mean an 8 GB
+# bucket -- and assemble_shuffled reads each bucket fully into RAM to shuffle it.
+SHUFFLE_BUCKET_BYTES = 256 * 1024**2
+# Every bucket is held open for the whole scatter pass. Stay well under the stdio
+# descriptor ceiling (512 on Windows) rather than discovering it on a big corpus.
+MAX_OPEN_BUCKETS = 256
 SEQ_LENGTH_DIST = [
     (128, 3),
     (256, 5),
@@ -340,6 +346,7 @@ def assemble_shuffled(
     for split, final_path in (("train", paths.final_train), ("val", paths.final_val)):
         shards: list[Path] = []
         total_lines = 0
+        total_bytes = 0
         print(f"\nassembling {split} mixture")
         for spec in specs:
             shard = paths.shard_paths(str(spec["slug"]))[0 if split == "train" else 1]
@@ -348,13 +355,22 @@ def assemble_shuffled(
                 continue
             line_count = sum(1 for line in shard.open("r", encoding="utf-8") if line.strip())
             total_lines += line_count
+            total_bytes += shard.stat().st_size
             shards.append(shard)
             print(f"  {spec['slug']:<24} {line_count:>10,} chunks")
         if total_lines == 0:
             print(f"  no {split} chunks found")
             continue
 
-        bucket_count = max(1, math.ceil(total_lines / SHUFFLE_BUCKET_LINES))
+        bucket_count = max(1, math.ceil(total_bytes / SHUFFLE_BUCKET_BYTES))
+        if bucket_count > MAX_OPEN_BUCKETS:
+            bucket_count = MAX_OPEN_BUCKETS
+            print(
+                f"  note: {total_bytes / 1e9:.1f} GB over {bucket_count} buckets "
+                f"(~{total_bytes / bucket_count / 1e9:.1f} GB each); each is loaded "
+                f"into RAM to shuffle. Raise SHUFFLE_BUCKET_BYTES only with the RAM "
+                f"to match, or shuffle in more passes."
+            )
         rng = random.Random(f"{seed}:{split}:assembly")
         with tempfile.TemporaryDirectory(prefix="yeoubi_shuffle_") as temporary_dir:
             temp_root = Path(temporary_dir)

@@ -64,7 +64,7 @@ from .utils import (
     BitStats, ExpertStats, WandBLogger, count_parameters, drain_checkpoint_writer,
     force_utf8_console, load_checkpoint, log_expert_utilization, read_checkpoint,
     resolve_checkpoint_model_config, save_checkpoint, setup_logging,
-    validate_model_config_topology,
+    validate_config_dict_topology, validate_model_config_topology,
 )
 
 # Optional: bitsandbytes 8-bit AdamW (block-wise 8-bit optimizer state).
@@ -185,8 +185,10 @@ class TrainConfig:
     topk_ratio: float = 0.55
     dropout: float = 0.0
     qk_norm: bool = True
-    # The scaling path is dormant inside the original window and activates
-    # only when a batch crosses ``rope_original_max_seq_len``.
+    # BitNet SubLN before o_proj / down_proj (see ModelConfig.use_sub_norm).
+    use_sub_norm: bool = True
+    # Scaling applies at every position once enabled: gating it on batch length
+    # would give one absolute position two different rotations.
     rope_scaling_type: str = "yarn"  # "none" | "linear" | "yarn"
     rope_scaling_factor: float = 4.0
     rope_original_max_seq_len: int = 4096
@@ -262,12 +264,19 @@ class TrainConfig:
     rdt_lora_rank: int = 32
     rdt_loop_dim: int = 64
     rdt_use_act: bool = False
-    rdt_act_ponder_weight: float = 0.01
     rdt_randomize_loops: bool = True
     rdt_adaptive_loops: bool = True
     rdt_loop_specific_norms: bool = True
     rdt_context_adaptive_loops: bool = True
     rdt_context_loop_threshold: int = 4096
+    # See RDTConfig.detach_recurrent_anchor / .recurrent_state_init_std.
+    # Default False lets the recurrent core's per-iteration reads of the
+    # prelude anchor train the prelude, matching the recurrent-depth design.
+    rdt_detach_recurrent_anchor: bool = False
+    # 0.0 keeps the deterministic h_0. Set ~0.02-1.0 to train the core as a
+    # contraction to a fixed point, which is the precondition for the
+    # inference-time depth extrapolation --n_loops advertises.
+    rdt_recurrent_state_init_std: float = 0.0
 
     # Match cached block-diffusion inference during a configurable fraction of
     # training. Zero preserves legacy fully bidirectional training.
@@ -584,6 +593,7 @@ def validate(
     max_batches: int = 50,
     amp_dtype: torch.dtype = torch.bfloat16,
     cfg: TrainConfig | None = None,
+    val_seed: int = 1234,
 ) -> float:
     """Run validation and return average loss.
 
@@ -595,6 +605,13 @@ def validate(
         mask_token_id: Mask token ID.
         device: Device.
         max_batches: Max batches to evaluate.
+        val_seed: Fixed seed for the noise draw. Validation samples t and the
+            mask pattern from a forked RNG re-seeded to this value on every
+            call, so successive evaluations score the *same* corruption of the
+            same batches. Drawing fresh noise each time made the reported
+            val loss dominated by which t happened to come up -- with
+            max_batches=50 and a small batch size the run-to-run spread
+            swamped the training signal, so the curve could not be read.
 
     Returns:
         Average validation loss.
@@ -606,47 +623,56 @@ def validate(
     count = 0
     use_amp = device.type in ("cuda", "xpu")
 
+    # Fork the RNG so re-seeding does not perturb the training stream. CUDA
+    # generators must be listed explicitly; other accelerators fall back to
+    # forking the host RNG only, which still fixes t (mask draws follow it).
+    fork_devices = [device] if device.type == "cuda" else []
+
     try:
-        for i, batch in enumerate(val_loader):
-            if i >= max_batches:
-                break
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
-            B, T = input_ids.shape
+        with torch.random.fork_rng(devices=fork_devices):
+            torch.manual_seed(val_seed)
+            for i, batch in enumerate(val_loader):
+                if i >= max_batches:
+                    break
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
+                B, T = input_ids.shape
 
-            t = torch.rand(B, device=device)
-            if cfg is not None and cfg.training_stage == "correction":
-                t = t * cfg.correction_t_max
-            if cfg is None:
-                masked_ids, is_masked = apply_mask(
-                    input_ids, t, mask_token_id, schedule,
-                    frozen_mask=~attention_mask,
-                )
-            else:
-                masked_ids, is_masked = _prepare_training_state(
-                    batch, input_ids, attention_mask, t, cfg,
-                    mask_token_id, schedule,
-                )
-
-            with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                self_cond = None
-                if getattr(model_core.config, "use_self_cond", False):
-                    previous_logits, _ = model(
-                        masked_ids, t, attention_mask=attention_mask
+                t = torch.rand(B, device=device)
+                if cfg is not None and cfg.training_stage == "correction":
+                    t = t * cfg.correction_t_max
+                if cfg is None:
+                    masked_ids, is_masked = apply_mask(
+                        input_ids, t, mask_token_id, schedule,
+                        frozen_mask=~attention_mask,
                     )
-                    self_cond = self_cond_vector(
-                        previous_logits,
-                        model_core.embed.weight,
-                        model_core.config.vocab_size,
+                else:
+                    masked_ids, is_masked = _prepare_training_state(
+                        batch, input_ids, attention_mask, t, cfg,
+                        mask_token_id, schedule,
                     )
-                logits, _ = model(
-                    masked_ids, t, attention_mask=attention_mask,
-                    self_cond=self_cond,
-                )
-                loss = loss_fn(logits, input_ids, is_masked, t=t)
 
-            total_loss += loss.item()
-            count += 1
+                with autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                    self_cond = None
+                    if getattr(model_core.config, "use_self_cond", False):
+                        previous_logits, _ = model(
+                            masked_ids, t, attention_mask=attention_mask
+                        )
+                        self_cond = self_cond_vector(
+                            previous_logits,
+                            model_core.embed.weight,
+                            model_core.config.vocab_size,
+                        )
+                    logits, _ = model(
+                        masked_ids, t, attention_mask=attention_mask,
+                        self_cond=self_cond,
+                    )
+                    loss = loss_fn(
+                        logits, input_ids, is_masked, t=t, valid_mask=attention_mask,
+                    )
+
+                total_loss += loss.item()
+                count += 1
     finally:
         if was_training:
             model.train()
@@ -692,7 +718,11 @@ def generate_sample(
 
         ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
 
-        t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+        # Uniform in mask probability rather than in t: equal commit fraction per step.
+        # Linear-in-t spacing commits ~23% of the canvas in the first 3 of 20 steps,
+        # when the model has no context to condition on.
+        p_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+        t_steps = CosineSchedule.inverse(p_steps).clamp(0.0, 1.0)
 
         self_cond = None
         for i in range(steps):
@@ -737,7 +767,6 @@ def generate_sample(
 def _build_dataloader(
     paths: list[str],
     cfg: "TrainConfig",
-    mask_token_id: int,
     pad_token_id: int,
 ):
     """Construct a DataLoader, auto-selecting the fast pre-tokenized path.
@@ -791,7 +820,7 @@ def _build_dataloader(
     )
     return make_dataloader(
         paths, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
-        mask_token_id=mask_token_id, pad_token_id=pad_token_id,
+        pad_token_id=pad_token_id,
         post_training=post_training,
         assistant_separator=cfg.assistant_separator,
     )
@@ -813,6 +842,8 @@ def train(cfg: TrainConfig) -> None:
         )
     if cfg.resume_from and cfg.finetune_from:
         raise ValueError("resume_from and finetune_from are mutually exclusive")
+    if cfg.model_type not in {"rdt", "standard"}:
+        raise ValueError(f"model_type must be 'rdt' or 'standard', got {cfg.model_type!r}")
     if not 0.0 <= cfg.self_condition_prob <= 1.0:
         raise ValueError("self_condition_prob must be between 0 and 1")
     if not 0.0 <= cfg.correction_noise_prob <= 1.0:
@@ -895,13 +926,14 @@ def train(cfg: TrainConfig) -> None:
             lora_rank=cfg.rdt_lora_rank,
             loop_dim=cfg.rdt_loop_dim,
             use_act=cfg.rdt_use_act,
-            act_ponder_weight=cfg.rdt_act_ponder_weight,
             randomize_loops=cfg.rdt_randomize_loops,
             adaptive_loops=cfg.rdt_adaptive_loops,
             loop_specific_norms=cfg.rdt_loop_specific_norms,
         )
         base["context_adaptive_loops"] = cfg.rdt_context_adaptive_loops
         base["context_loop_threshold"] = cfg.rdt_context_loop_threshold
+        base["detach_recurrent_anchor"] = cfg.rdt_detach_recurrent_anchor
+        base["recurrent_state_init_std"] = cfg.rdt_recurrent_state_init_std
         rdt_cfg = RDTConfig(**base)
         model = BitRDTTransformer(rdt_cfg).to(device)
         # Keep the plain model_cfg in sync so resume topology validation
@@ -957,12 +989,12 @@ def train(cfg: TrainConfig) -> None:
     logger.info("Training files: %d, Validation files: %d", len(train_paths), len(val_paths))
 
     train_loader = _build_dataloader(
-        train_paths, cfg, mask_token_id, pad_token_id
+        train_paths, cfg, pad_token_id
     )
     val_loader = None
     if val_paths:
         val_loader = _build_dataloader(
-            val_paths, cfg, mask_token_id, pad_token_id
+            val_paths, cfg, pad_token_id
         )
 
     # Loss, optimizer, scheduler
@@ -1001,7 +1033,9 @@ def train(cfg: TrainConfig) -> None:
     # Resume
     global_step = 0
     current_mode = "A8"
-    if cfg.resume_from and os.path.isfile(cfg.resume_from):
+    if cfg.resume_from:
+        if not os.path.isfile(cfg.resume_from):
+            raise FileNotFoundError(f"resume_from checkpoint not found: {cfg.resume_from}")
         resume_ckpt = read_checkpoint(
             cfg.resume_from,
             device="cpu",
@@ -1021,6 +1055,26 @@ def train(cfg: TrainConfig) -> None:
                 resume_model_cfg,
                 context=f"Resume checkpoint {cfg.resume_from}",
             )
+        # ModelConfig topology alone isn't enough for RDT: RDTConfig (a
+        # ModelConfig subclass) carries its own layer/loop/LoRA topology in a
+        # separate "rdt_config" checkpoint key, invisible to the check above.
+        if cfg.model_type == "rdt":
+            if resume_ckpt.get("rdt_config") is None:
+                logger.warning(
+                    "Resume checkpoint %s has no serialized rdt_config; skipping RDT topology validation.",
+                    cfg.resume_from,
+                )
+            else:
+                # Imported here, not at module top, to avoid a train<->rdt
+                # circular import (rdt.py has no reason to import train.py,
+                # but utils.py — imported by both — must not import rdt).
+                from .rdt import resolve_rdt_config
+                checkpoint_rdt_cfg = resolve_rdt_config(resume_ckpt)
+                validate_config_dict_topology(
+                    asdict(rdt_cfg),
+                    asdict(checkpoint_rdt_cfg),
+                    context=f"Resume checkpoint {cfg.resume_from}",
+                )
         info = load_checkpoint(
             cfg.resume_from,
             model,
@@ -1059,9 +1113,12 @@ def train(cfg: TrainConfig) -> None:
     )
     model_core = getattr(model, "_orig_mod", model)
     optimizer.zero_grad(set_to_none=True)
-    running_loss = 0.0
-    running_grad_norm = 0.0
-    running_masked_frac = 0.0
+    # Accumulated on-device and read once per log interval: a per-micro-step
+    # .item() forces a host sync that drains the CUDA pipeline for a number
+    # nothing reads until step % 50 == 0.
+    running_loss = torch.zeros((), device=device)
+    running_grad_norm = torch.zeros((), device=device)
+    running_masked_frac = torch.zeros((), device=device)
     step_in_accum = 0
     epoch = 0
 
@@ -1116,7 +1173,7 @@ def train(cfg: TrainConfig) -> None:
                     schedule=schedule,
                 )
             running_masked_frac += (
-                supervised_mask.float().mean().item() / cfg.grad_accum_steps
+                supervised_mask.detach().float().mean() / cfg.grad_accum_steps
             )
 
             # Forward
@@ -1147,6 +1204,7 @@ def train(cfg: TrainConfig) -> None:
                     supervised_mask,
                     is_think=is_think,
                     t=t,
+                    valid_mask=attention_mask,
                 )
                 # Total loss: diffusion + MoE load balance
                 moe_loss = aux_loss * model_cfg.aux_loss_weight if model_cfg.use_moe else 0.0
@@ -1154,7 +1212,7 @@ def train(cfg: TrainConfig) -> None:
 
             # Backward
             scaler.scale(loss).backward()
-            running_loss += loss.item()
+            running_loss += loss.detach()
             step_in_accum += 1
 
             if step_in_accum < cfg.grad_accum_steps:
@@ -1167,7 +1225,7 @@ def train(cfg: TrainConfig) -> None:
             for inner_opt in optimizer.optimizers:
                 scaler.unscale_(inner_opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-            running_grad_norm += float(grad_norm)
+            running_grad_norm += grad_norm.detach()
             for inner_opt in optimizer.optimizers:
                 scaler.step(inner_opt)
             scaler.update()
@@ -1192,9 +1250,9 @@ def train(cfg: TrainConfig) -> None:
 
             # --- Logging ---
             if global_step % 50 == 0:
-                avg_loss = running_loss / 50
-                avg_grad_norm = running_grad_norm / 50
-                avg_masked_frac = running_masked_frac / 50
+                avg_loss = running_loss.item() / 50
+                avg_grad_norm = running_grad_norm.item() / 50
+                avg_masked_frac = running_masked_frac.item() / 50
                 # Per-optimizer LR (one value when AdamW-only, two with Muon).
                 opt_lrs = [opt.param_groups[0]["lr"] for opt in optimizer.optimizers]
                 lr = opt_lrs[0]  # primary (AdamW) LR for the headline log line.
@@ -1213,9 +1271,9 @@ def train(cfg: TrainConfig) -> None:
                 if len(opt_lrs) > 1:
                     log_data["train/lr_muon"] = opt_lrs[1]
                 wandb_logger.log(log_data, step=global_step)
-                running_loss = 0.0
-                running_grad_norm = 0.0
-                running_masked_frac = 0.0
+                running_loss.zero_()
+                running_grad_norm.zero_()
+                running_masked_frac.zero_()
 
             # --- MoE load balance loss logging (every 100 steps) ---
             if model_cfg.use_moe and global_step % 100 == 0:

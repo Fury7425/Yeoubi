@@ -19,7 +19,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -38,6 +38,7 @@ _MODEL_TOPOLOGY_FIELDS = (
     "rope_scaling_factor",
     "rope_original_max_seq_len",
     "qk_norm",
+    "use_sub_norm",
     "mask_token_id",
     "t_embed_dim",
     "tie_embeddings",
@@ -140,21 +141,40 @@ class BitStats:
         total_zero = 0
         total_pos1 = 0
         total_params = 0
+        # Per-tensor absmean scales. Muon runs the ternary latents with
+        # ``muon_weight_decay = 0.0`` by default, and the STE passes the
+        # gradient through unchanged, so nothing bounds ||latent||. The
+        # ternary *pattern* is scale-invariant (w and c*w quantize
+        # identically), but the dequantized weight is ternary * mean|w|, so
+        # an unbounded mean|w| silently inflates every effective weight and
+        # the residual stream with it. Track it rather than guess a decay:
+        # a scale that climbs steadily across a run is the signal to set
+        # --muon_weight_decay, and a flat one says the default is fine.
+        scales: List[float] = []
 
         for name, param in self.model.named_parameters():
             if "latent_weight" in name or (hasattr(param, '_is_latent') and param._is_latent):
                 from .quantization import absmean_quantize
-                w_q, _ = absmean_quantize(param.data)
+                w_q, scale = absmean_quantize(param.data)
                 numel = w_q.numel()
                 total_neg1 += (w_q == -1).sum().item()
                 total_zero += (w_q == 0).sum().item()
                 total_pos1 += (w_q == 1).sum().item()
                 total_params += numel
+                scales.append(scale.item())
 
         if total_params > 0:
             stats["weight/frac_neg1"] = total_neg1 / total_params
             stats["weight/frac_zero"] = total_zero / total_params
             stats["weight/frac_pos1"] = total_pos1 / total_params
+
+        if scales:
+            # Mean over tensors, not over elements: one exploding matrix is
+            # the failure mode, and an element-weighted mean would hide it
+            # behind the large FFN matrices. ``_max`` names the offender.
+            stats["weight/latent_absmean"] = sum(scales) / len(scales)
+            stats["weight/latent_absmean_max"] = max(scales)
+            stats["weight/latent_absmean_min"] = min(scales)
 
         # --- TopK sparsity and INT4 activation magnitudes ---
         topk_ratios = []
@@ -219,6 +239,17 @@ def read_checkpoint(
     return torch.load(path, map_location=device, weights_only=True)
 
 
+# Fields added after checkpoints were already in circulation. A stored
+# model_config predating a field simply omits the key, and the dataclass default
+# would then describe a model the checkpoint's weights do not contain — e.g.
+# use_sub_norm defaults True, so a pre-SubLN checkpoint would build attn/ffn
+# sub-norms that its state dict has no entries for. Back-fill the pre-change
+# value instead, so old checkpoints keep loading and only new runs opt in.
+_LEGACY_MODEL_CONFIG_DEFAULTS = {
+    "use_sub_norm": False,
+}
+
+
 def resolve_checkpoint_model_config(
     ckpt: Dict[str, Any],
     fallback_factory: Optional[Callable[[], "ModelConfig"]] = None,
@@ -240,6 +271,8 @@ def resolve_checkpoint_model_config(
         from dataclasses import fields as _dc_fields
         _known = {f.name for f in _dc_fields(ModelConfig)}
         config_data = {k: v for k, v in config_data.items() if k in _known}
+        for _key, _legacy in _LEGACY_MODEL_CONFIG_DEFAULTS.items():
+            config_data.setdefault(_key, _legacy)
         return ModelConfig(**config_data), True
 
     if fallback_factory is None:
@@ -272,6 +305,47 @@ def validate_model_config_topology(
     if mismatches:
         details = "; ".join(mismatches)
         raise ValueError(f"{context} model_config does not match the requested topology: {details}")
+
+
+# RDTConfig (yeoubi/rdt.py) subclasses ModelConfig and adds its own topology
+# fields — layer counts per stage, loop count, LoRA rank/dim — that change
+# tensor shapes but are invisible to _MODEL_TOPOLOGY_FIELDS above. Without
+# this, a resume with e.g. a different recurrent_layers passes
+# validate_model_config_topology and then dies deep inside load_state_dict
+# with a raw shape-mismatch error instead of a clear message.
+_RDT_TOPOLOGY_FIELDS = (
+    "prelude_layers",
+    "pre_recurrent_layers",
+    "recurrent_layers",
+    "post_recurrent_layers",
+    "coda_layers",
+    "max_loop_iters",
+    "lora_rank",
+    "loop_dim",
+    "loop_specific_norms",
+)
+
+
+def validate_config_dict_topology(
+    requested: Dict[str, Any],
+    checkpoint: Dict[str, Any],
+    fields: tuple = _RDT_TOPOLOGY_FIELDS,
+    context: str = "checkpoint",
+) -> None:
+    """Raise if two plain config dicts disagree on the given topology fields.
+
+    Dict-based (rather than dataclass-based like validate_model_config_topology)
+    so callers can pass a checkpoint's raw ``rdt_config`` dict directly without
+    reconstructing a full ``RDTConfig`` just to compare it.
+    """
+    mismatches = [
+        f"{field}: requested={requested.get(field)!r}, checkpoint={checkpoint.get(field)!r}"
+        for field in fields
+        if requested.get(field) != checkpoint.get(field)
+    ]
+    if mismatches:
+        details = "; ".join(mismatches)
+        raise ValueError(f"{context} rdt_config does not match the requested topology: {details}")
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +425,10 @@ def save_checkpoint(
     drain_checkpoint_writer()
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    # Unwrap torch.compile first: OptimizedModule.state_dict() prefixes every
+    # key with "_orig_mod.", which no eager-mode loader (sample/export) accepts.
+    model = getattr(model, "_orig_mod", model)
 
     # Clone all tensor state to CPU *synchronously* so training can resume
     # while the background thread serialises to disk.
@@ -485,28 +563,15 @@ def count_parameters(model: nn.Module, config) -> Dict[str, Any]:
 
     total_params = ternary_params + full_precision_params
 
-    # Active parameters per token: base attn + top-K fraction of experts
-    # Simplification: base attention ~= 3/4 * total attention (Q, K, V, O projections)
-    # Per-token expert activation = top_k / n_experts
-    if config.use_moe:
-        active_expert_fraction = config.top_k_experts / config.n_experts
-    else:
-        active_expert_fraction = 1.0
-
     info = {
         "total_parameters": total_params,
         "ternary_parameters": ternary_params,
         "full_precision_parameters": full_precision_params,
-        "expert_activation_fraction": active_expert_fraction,
-        "estimated_active_per_token": int(total_params * active_expert_fraction),
     }
 
     logger.info(
-        "Parameters: total=%d, ternary=%d, full_precision=%d, "
-        "active_per_token=%d (%.1f%% of total)",
+        "Parameters: total=%d, ternary=%d, full_precision=%d",
         total_params, ternary_params, full_precision_params,
-        info["estimated_active_per_token"],
-        100.0 * active_expert_fraction,
     )
 
     return info
@@ -541,8 +606,10 @@ def log_expert_utilization(model: nn.Module, step: int) -> Dict[str, float]:
             # Per-expert load balance
             for e, count in enumerate(token_counts):
                 fraction = float(count / max(total_tokens, 1))
-                metrics[f"moe/expert_{e}_tokens"] = float(count)
-                metrics[f"moe/expert_{e}_fraction"] = fraction
+                # Keyed by layer: without it every MoE layer overwrites the
+                # previous one and only the last layer is ever reported.
+                metrics[f"moe/layer_{moe_layer_idx}_expert_{e}_tokens"] = float(count)
+                metrics[f"moe/layer_{moe_layer_idx}_expert_{e}_fraction"] = fraction
                 max_expert_fraction = max(max_expert_fraction, fraction)
 
             # Dropout rate

@@ -51,7 +51,6 @@ def _small_cfg(**overrides) -> RDTConfig:
         lora_rank=4,
         loop_dim=8,
         use_act=True,
-        act_ponder_weight=0.01,
         randomize_loops=False,  # deterministic by default for tests
     )
     defaults.update(overrides)
@@ -174,7 +173,7 @@ def test_masked_diffusion_backward():
     masked_ids, is_masked = apply_mask(ids, t, cfg.mask_token_id, schedule)
 
     logits, aux_loss = model(masked_ids, t)
-    loss = loss_fn(logits, ids, is_masked) + cfg.act_ponder_weight * aux_loss
+    loss = loss_fn(logits, ids, is_masked) + aux_loss
     loss.backward()
 
     for name, p in model.named_parameters():

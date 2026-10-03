@@ -22,13 +22,46 @@ from .byte_codec import EOS_TOKEN_ID
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
 _EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])")
-_IPV4_RE = re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)")
+# Each octet must be a real 0-255 value (25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d) rather
+# than the previous bare \d{1,3}, which also matched any dotted numeric run --
+# including software version strings like "10.0.19041.1" (Windows build) where
+# a component exceeds 255. This is a conservative, objective tightening: a
+# dotted quad where every component happens to be <=255 (e.g. "Python 1.2.3.4")
+# is still syntactically a valid IPv4 address and still redacted -- no regex
+# can tell that apart from a real IP without false-negative risk on real ones.
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_IPV4_RE = re.compile(rf"(?<!\d)(?:{_IPV4_OCTET}\.){{3}}{_IPV4_OCTET}(?!\d)")
+# Left as-is: numeric literals like "1000-2000-3000" can still false-positive
+# here, but real phone numbers come in enough locale-specific shapes (spaces,
+# dashes, parens, leading +) that any tightening narrow enough to exclude
+# code/date-like triples risks silently dropping real numbers under
+# --pii-policy drop. Not worth that regression without a labeled corpus to
+# validate against, so this stays unchanged.
 _PHONE_RE = re.compile(
     r"(?<!\w)(?:\+\d[\d ()-]{7,}\d|\(\d{2,4}\)[\d -]{5,}\d|\d{2,4}[- ]\d{3,4}[- ]\d{3,4})(?!\w)"
 )
 _SECRET_RE = re.compile(
     r"(?i)(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+\-=]{12,}"
 )
+# Unicode category "Cc" (Other, Control) is exactly the C0 controls (0x00-0x1F),
+# DEL (0x7F), and the C1 controls (0x80-0x9F) -- a fixed 65-code-point set, so
+# this is byte-for-byte equivalent to `unicodedata.category(ch) == "Cc"` but
+# runs as one compiled-regex pass instead of a per-character Python call.
+# \t \n \r are excluded to match assess_quality's existing exemption.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
+# Used to fast-path the printable-character check in assess_quality: stripping
+# the three allowed control characters then asking the whole string
+# str.isprintable() (a C-level call) is equivalent to
+# `all(ch.isprintable() or ch in "\n\r\t" for ch in text)`.
+_ALLOWED_CONTROL_STRIP = {ord("\t"): None, ord("\n"): None, ord("\r"): None}
+# Only runs long enough to matter. The filter below rejects on
+# `longest_run >= 128 and run_ratio > 0.02`, so any run shorter than 128 is
+# indistinguishable from no run at all as far as the decision goes. Matching
+# maximal runs of ANY length (r"(.)\1*") would be correct but slower than
+# Python loop it replaced: on ordinary prose almost every character is its own
+# run, so the engine yields one match object per character. Anchoring at 128
+# means normal text produces zero matches and one C-level scan.
+_LONG_RUN_RE = re.compile(r"(.)\1{127,}", re.DOTALL)
 
 
 def normalize_document(text: str) -> str:
@@ -81,25 +114,33 @@ def assess_quality(
         return QualityAssessment(False, 0.0, "too_large", {"bytes": float(byte_count)})
 
     char_count = max(1, len(text))
-    controls = sum(
-        1 for ch in text
-        if unicodedata.category(ch) == "Cc" and ch not in "\n\r\t"
-    )
+    # Cc (Unicode "Other, Control") is exactly the C0 controls, DEL, and the
+    # C1 controls -- a fixed, enumerable code-point set -- so a compiled regex
+    # reproduces unicodedata.category(ch) == "Cc" at C speed instead of one
+    # Python-level category() call per character.
+    controls = sum(1 for _ in _CONTROL_RE.finditer(text))
     replacements = text.count("\ufffd")
-    printable = sum(ch.isprintable() or ch in "\n\r\t" for ch in text)
+    # str.isprintable() has no per-character Python cost; ask it on the whole
+    # string first (with the three allowed control chars stripped via a C-level
+    # translate) and only fall back to the per-character scan on the rare
+    # document that actually contains disallowed non-printable characters --
+    # the common case (clean text) skips the Python-level loop entirely.
+    if text.translate(_ALLOWED_CONTROL_STRIP).isprintable():
+        printable = char_count
+    else:
+        printable = sum(ch.isprintable() or ch in "\n\r\t" for ch in text)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     unique_line_ratio = len(set(lines)) / max(1, len(lines))
 
-    longest_run = 1
-    current_run = 1
-    previous = None
-    for ch in text:
-        if ch == previous:
-            current_run += 1
-            longest_run = max(longest_run, current_run)
-        else:
-            current_run = 1
-            previous = ch
+    # Longest run of a repeated character, but only counted once it reaches
+    # the 128 rejection threshold; below that it stays at the old loop's
+    # initial value of 1. The accept/reject decision is identical either way
+    # (see _LONG_RUN_RE), so longest_run_ratio in `metrics` is a lower bound
+    # rather than exact for clean documents -- it is diagnostic only, nothing
+    # reads it. Uses match offsets, not group(0), to avoid copying out the run.
+    longest_run = max(
+        (m.end() - m.start() for m in _LONG_RUN_RE.finditer(text)), default=1,
+    )
 
     control_ratio = controls / char_count
     replacement_ratio = replacements / char_count
@@ -157,6 +198,11 @@ def handle_pii(text: str, policy: str) -> tuple[str | None, dict[str, int]]:
 
 
 def _simhash(text: str, *, max_shingles: int = 512) -> int | None:
+    # ponytail: the 64-iteration bit-weight loop below stays pure Python. Its
+    # cost is bounded by max_shingles (512), not by document size, so unlike
+    # assess_quality it does not grow with an 8 MB document -- and any rewrite
+    # must stay bit-identical or every existing dedup.sqlite3 becomes garbage.
+    # Vectorize it only against a differential test on real corpus documents.
     # A bounded sample keeps near-deduplication practical for very large PDFs.
     tokens = _TOKEN_RE.findall(normalize_document(text[:500_000]).casefold())
     if len(tokens) < 40:

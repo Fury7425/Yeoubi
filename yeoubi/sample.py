@@ -197,6 +197,43 @@ def nucleus_sample(
 
 
 @torch.no_grad()
+def _remask_step(
+    ids: torch.Tensor,
+    is_masked: torch.Tensor,
+    schedule: CosineSchedule,
+    t_curr: torch.Tensor,
+    t_next: torch.Tensor,
+    mask_token_id: int,
+    gen: torch.Generator,
+    frozen: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return *ids* with a schedule-correct subset of positions back at MASK.
+
+    The reverse absorbing-state step is *conditional*. Of the positions masked
+    at ``t_curr`` (a fraction ``p(t_curr)`` of the canvas), the schedule wants
+    ``p(t_next)`` of the whole canvas still masked afterwards, so each one is
+    re-masked with probability ``p(t_next) / p(t_curr)``. Drawing against
+    ``p(t_next)`` directly — as all four samplers used to — makes the masked
+    fraction the running *product* of the per-step probabilities: with 20 steps
+    the canvas is fully committed by roughly step 8, every later step is a
+    no-op, and the bytes that were committed went in at high noise.
+
+    Committed and frozen positions are never re-corrupted: absorbing-state
+    training never shows the model a re-masked clean byte.
+
+    p(t_curr) is 1.0 on the first step and strictly positive on every step that
+    can reach here (``t_next`` hits 0 only after the last re-mask), so the
+    clamp is belt-and-braces, not a live branch.
+    """
+    p_curr = schedule.mask_prob(t_curr).clamp(min=1e-6)
+    ratio = schedule.mask_prob(t_next) / p_curr
+    rand = torch.rand(ids.shape, device=ids.device, generator=gen)
+    should_remask = (rand < ratio) & is_masked
+    if frozen is not None:
+        should_remask = should_remask & ~frozen
+    return torch.where(should_remask, mask_token_id, ids)
+
+
 def denoise(
     model: BitDiffusionTransformer,
     prompt: str = "",
@@ -265,8 +302,11 @@ def denoise(
 
     gen = torch.Generator(device=device).manual_seed(seed)
 
-    # Denoising schedule: linearly spaced from t=1 to t=0
-    t_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    # Denoising schedule: uniform in mask probability, not in t. Linear-in-t front-loads
+    # the work — the first 3 of 20 steps would commit ~23% of the canvas while the model
+    # still has almost no context — so invert the cosine to equalize the commit fraction.
+    p_steps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    t_steps = CosineSchedule.inverse(p_steps).clamp(0.0, 1.0)
 
     self_cond = None
     for step_idx in range(steps):
@@ -298,10 +338,10 @@ def denoise(
 
         # Re-mask positions that should still be uncertain at t_next
         if step_idx + 1 < steps:
-            mask_prob_next = schedule.mask_prob(t_next)
-            rand = torch.rand(num_samples, total_len, device=device, generator=gen)
-            should_remask = (rand < mask_prob_next) & ~frozen
-            ids[should_remask] = mask_token_id
+            ids = _remask_step(
+                ids, is_masked, schedule, t_curr, t_next, mask_token_id, gen,
+                frozen=frozen,
+            )
 
         if verbose:
             # Print intermediate result
@@ -458,16 +498,15 @@ class ThinkingDiffusionSampler:
 
         gen = torch.Generator(device=self.device).manual_seed(self.seed)
 
-        cache_layers = (
-            self.model.cache_layers_for_loops(self.n_loops)
-            if hasattr(self.model, "cache_layers_for_loops")
-            else config.n_layers
-        )
-        kv_cache = KVCache(
-            n_layers=cache_layers,
-            default_bits=config.kv_cache_bits,
-            bos_bits=config.kv_cache_bos_bits,
-        )
+        # No KV cache here: this sampler re-processes the full sequence with
+        # a new mask pattern at every step (like `denoise()`), so a cache
+        # would never serve a cached read. Passing one anyway used to cost
+        # real quantization noise on every K/V round-trip for zero benefit,
+        # and it also disabled padding-mask installation in the model
+        # forward (see `install_runtime_attention_mask(..., None)` when
+        # `kv_cache is not None` in model.py) — a second, unrelated
+        # correctness cost. Compare `BlockDiffusionSampler`, where committed
+        # blocks genuinely persist across steps and the cache does real work.
 
         # --- Phase 1: Thinking ---
         total_think_steps = self.max_think_steps if self.adaptive_think else self.think_steps
@@ -486,10 +525,9 @@ class ThinkingDiffusionSampler:
             t_curr = t_steps_think[step_idx]
             t_next = t_steps_think[step_idx + 1]
 
-            kv_cache.reset()
             t_input = t_curr.expand(num_samples)
             logits, _ = _model_fwd(self.model, ids, t_input,
-                                   kv_cache=kv_cache, n_loops=self.n_loops,
+                                   n_loops=self.n_loops,
                                    self_cond=self_cond)
             if getattr(self.model.config, "use_self_cond", False):
                 self_cond = self_cond_vector(
@@ -512,12 +550,10 @@ class ThinkingDiffusionSampler:
 
             # Re-mask thinking positions for next step
             if step_idx + 1 < total_think_steps:
-                mask_prob_next = schedule.mask_prob(t_next)
-                rand = torch.rand(num_samples, self.n_think, device=self.device, generator=gen)
-                should_remask = rand < mask_prob_next
-                think_slice = ids[:, think_start:think_end]
-                think_slice[should_remask] = mask_token_id
-                ids[:, think_start:think_end] = think_slice
+                ids[:, think_start:think_end] = _remask_step(
+                    ids[:, think_start:think_end], think_is_masked, schedule,
+                    t_curr, t_next, mask_token_id, gen,
+                )
 
             if self.verbose:
                 for b in range(num_samples):
@@ -569,10 +605,9 @@ class ThinkingDiffusionSampler:
             t_curr = t_steps_answer[step_idx]
             t_next = t_steps_answer[step_idx + 1]
 
-            kv_cache.reset()
             t_input = t_curr.expand(num_samples)
             logits, _ = _model_fwd(self.model, ids, t_input,
-                                   kv_cache=kv_cache, n_loops=self.n_loops,
+                                   n_loops=self.n_loops,
                                    self_cond=self_cond)
             if getattr(self.model.config, "use_self_cond", False):
                 self_cond = self_cond_vector(
@@ -593,13 +628,10 @@ class ThinkingDiffusionSampler:
 
             # Re-mask answer positions for next step
             if step_idx + 1 < self.answer_steps:
-                mask_prob_next = schedule.mask_prob(t_next)
-                n_answer = total_len - answer_start
-                rand = torch.rand(num_samples, n_answer, device=self.device, generator=gen)
-                should_remask = rand < mask_prob_next
-                answer_slice = ids[:, answer_start:]
-                answer_slice[should_remask] = mask_token_id
-                ids[:, answer_start:] = answer_slice
+                ids[:, answer_start:] = _remask_step(
+                    ids[:, answer_start:], answer_is_masked, schedule,
+                    t_curr, t_next, mask_token_id, gen,
+                )
 
             if self.verbose:
                 for b in range(num_samples):
@@ -733,7 +765,11 @@ class BlockDiffusionSampler:
         mask_token_id = self.model.config.mask_token_id
         B, block_len = block_ids.shape
 
-        t_steps = torch.linspace(1.0, 0.0, n_steps + 1, device=self.device)
+        # Space steps uniformly in mask probability so each step commits an equal
+        # fraction of the block; linear-in-t would commit ~23% of it in the first
+        # 3 of 20 steps, before the block has any of its own context.
+        p_steps = torch.linspace(1.0, 0.0, n_steps + 1, device=self.device)
+        t_steps = CosineSchedule.inverse(p_steps).clamp(0.0, 1.0)
 
         kv_cache.ephemeral = True
         self_cond = None
@@ -754,10 +790,10 @@ class BlockDiffusionSampler:
             is_masked = (block_ids == mask_token_id)
             block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
             if step_idx + 1 < n_steps:
-                mask_prob = schedule.mask_prob(t_next)
-                rand = torch.rand(B, block_len, device=self.device, generator=gen)
-                should_remask = rand < mask_prob
-                block_ids = torch.where(should_remask & is_masked, mask_token_id, block_ids)
+                block_ids = _remask_step(
+                    block_ids, is_masked, schedule, t_curr, t_next,
+                    mask_token_id, gen,
+                )
 
             if self.verbose:
                 n_masked = (block_ids == mask_token_id).sum().item()

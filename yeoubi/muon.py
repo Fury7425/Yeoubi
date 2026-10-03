@@ -68,7 +68,8 @@ def _newton_schulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch
     if transposed:
         X = X.T
 
-    # Spectral-norm normalisation so the iteration converges in [0, sqrt(3)].
+    # Frobenius norm — an upper bound on the spectral norm, so every singular
+    # value starts in [0, 1] and the quintic iteration stays contractive.
     X = X / (X.norm() + eps)
 
     for _ in range(steps):
@@ -95,10 +96,9 @@ class Muon(torch.optim.Optimizer):
         ortho    = newton_schulz5(update_g, ns_steps)       # orthogonalize
         p       <- p * (1 - lr * weight_decay) - lr * scale * ortho
 
-    where ``scale = sqrt(max(out, in) / min(out, in))`` rescales rectangular
-    matrices so the spectral-norm step size is shape-invariant. (This matches
-    the Muon paper's prescription that update spectral norm should not depend
-    on aspect ratio.)
+    where ``scale = sqrt(max(1, out / in))`` rescales tall matrices so the
+    step size does not grow with the output dimension (the modded-nanogpt
+    prescription; wide matrices are left unscaled).
 
     Args:
         params: Iterable of parameters (must be 2D weight matrices).
@@ -229,8 +229,13 @@ def split_params_for_muon(model: torch.nn.Module) -> tuple[List[torch.nn.Paramet
         is_embedding = name.endswith("embed.weight") or ".embed." in name
         is_unembed = name.endswith("unembed.weight") or name.startswith("unembed.")
         is_noise_embed = ".noise_embed." in name or name.startswith("noise_embed.")
+        # byte_codec.subposition is a (patch_size, hidden_dim) position table;
+        # 2D by shape only. Orthogonalizing it is meaningless.
+        is_position_table = name.endswith("subposition")
 
-        if p.ndim == 2 and not (is_embedding or is_unembed or is_noise_embed):
+        if p.ndim == 2 and not (
+            is_embedding or is_unembed or is_noise_embed or is_position_table
+        ):
             muon_params.append(p)
         else:
             adamw_params.append(p)
