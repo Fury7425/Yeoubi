@@ -60,6 +60,23 @@ def _reasoning_response(doc: Dict, *, corrupted: bool = False) -> str:
     return "\n".join(parts)
 
 
+def _epoch_shuffle_seed(dataset) -> int:
+    """Seed for one pass of a dataset's shuffle buffer.
+
+    ``torch.initial_seed()`` is derived from --seed and distinct per worker, so
+    the shuffle is reproducible rather than wall-clock random. It is also
+    constant for a worker's lifetime, and workers are persistent, so every
+    epoch used to replay the identical order. Training loaders opt in to a
+    per-pass offset. Validation must not: validate() relies on scoring the
+    same leading batches on every call.
+    """
+    seed = torch.initial_seed()
+    if dataset.reshuffle_each_epoch:
+        seed += dataset._epoch
+        dataset._epoch += 1
+    return seed
+
+
 class StreamingJsonlDataset(IterableDataset):
     """Lazily streams examples from one or more ``.jsonl`` files.
 
@@ -83,6 +100,7 @@ class StreamingJsonlDataset(IterableDataset):
         max_length: int = 512,
         shuffle_buffer_size: int = 8192,
         min_chunk_size: int = 16,
+        reshuffle_each_epoch: bool = False,
         post_training: bool = False,
         assistant_separator: str = "\nAssistant:\n",
     ):
@@ -91,6 +109,8 @@ class StreamingJsonlDataset(IterableDataset):
         self.max_length = max_length
         self.shuffle_buffer_size = shuffle_buffer_size
         self.min_chunk_size = min_chunk_size
+        self.reshuffle_each_epoch = reshuffle_each_epoch
+        self._epoch = 0
         self.post_training = post_training
         self.assistant_separator = assistant_separator
 
@@ -239,9 +259,7 @@ class StreamingJsonlDataset(IterableDataset):
             return
 
         buf: List[Dict[str, torch.Tensor]] = []
-        # torch.initial_seed() is derived from --seed and is distinct per worker,
-        # so the shuffle is reproducible instead of wall-clock random.
-        rng = random.Random(torch.initial_seed())
+        rng = random.Random(_epoch_shuffle_seed(self))
 
         for example in self._produce_chunks(files):
             buf.append(example)
@@ -305,6 +323,101 @@ def collate_fn(
     return result
 
 
+class LengthBucketedBatches(IterableDataset):
+    """Yield collated batches of similar-length examples from *dataset*.
+
+    Random batching pads every example to the longest in its batch; with
+    lengths spread over 128-16384 bytes, about a third of the positions the
+    model processed were padding. This takes ``window`` consecutive examples
+    from the (already shuffled) stream, sorts them by length, cuts batches,
+    and yields those in random order.
+
+    Each batch also carries ``loss_weight``. Random batching was not neutral:
+    a batch's loss is a per-byte mean, so an example of length ``a`` batched
+    with one of length ``b`` owned ``a / (a + b)`` of it and short documents
+    counted for less than long ones. Batching like with like would silently
+    replace that with equal weight per document. ``loss_weight`` restores the
+    old expectation, ``E_b[B * a / (a + (B - 1) * b)]`` over the window's
+    lengths (exact for B=2, an approximation above it), normalised to mean 1
+    so the loss scale is unchanged. How documents are weighted is a separate
+    decision from removing padding, and this class only makes the latter.
+    """
+
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        batch_size: int,
+        window: int,
+        pad_token_id: int = PAD_TOKEN_ID,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.window = max(window, batch_size)
+        self.pad_token_id = pad_token_id
+        # Training-only wrapper, so batch order reseeds every epoch like the
+        # stream underneath it (see _epoch_shuffle_seed).
+        self.reshuffle_each_epoch = True
+        self._epoch = 0
+
+    def _batches(
+        self, window: List[Dict[str, torch.Tensor]], rng: random.Random
+    ) -> Iterator[Dict[str, torch.Tensor]]:
+        window.sort(key=lambda example: example["input_ids"].shape[0])
+        lengths = torch.tensor(
+            [example["input_ids"].shape[0] for example in window], dtype=torch.float32
+        )
+        size = self.batch_size
+        weights = (
+            size * lengths[:, None] / (lengths[:, None] + (size - 1) * lengths[None, :])
+        ).mean(dim=1)
+        weights = weights / weights.mean()
+
+        starts = list(range(0, len(window), size))
+        rng.shuffle(starts)
+        for start in starts:
+            batch = collate_fn(window[start : start + size], pad_token_id=self.pad_token_id)
+            batch["loss_weight"] = weights[start : start + size].mean()
+            yield batch
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        rng = random.Random(_epoch_shuffle_seed(self) + 1)
+        window: List[Dict[str, torch.Tensor]] = []
+        for example in self.dataset:
+            window.append(example)
+            if len(window) >= self.window:
+                yield from self._batches(window, rng)
+                window = []
+        if window:
+            yield from self._batches(window, rng)
+
+
+def _make_loader(
+    dataset: IterableDataset,
+    batch_size: int,
+    num_workers: int,
+    pad_token_id: int,
+    bucket_window: int,
+) -> DataLoader:
+    """DataLoader construction shared by the JSONL and ``.pt`` datasets."""
+    loader_batch_size: Optional[int] = batch_size
+    collate = lambda b: collate_fn(b, pad_token_id=pad_token_id)  # noqa: E731
+    if bucket_window > 0:
+        # The wrapper yields finished batches, so the DataLoader's own
+        # batching and collation are switched off.
+        dataset = LengthBucketedBatches(dataset, batch_size, bucket_window, pad_token_id)
+        loader_batch_size, collate = None, None
+    return DataLoader(
+        dataset,
+        batch_size=loader_batch_size,
+        num_workers=num_workers,
+        collate_fn=collate,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
+    )
+
+
 def make_dataloader(
     paths: List[str],
     max_length: int = 512,
@@ -312,6 +425,8 @@ def make_dataloader(
     num_workers: int = 2,
     pad_token_id: int = PAD_TOKEN_ID,
     shuffle_buffer_size: int = 8192,
+    reshuffle_each_epoch: bool = False,
+    bucket_window: int = 0,
     post_training: bool = False,
     assistant_separator: str = "\nAssistant:\n",
 ) -> DataLoader:
@@ -332,18 +447,11 @@ def make_dataloader(
         paths=paths,
         max_length=max_length,
         shuffle_buffer_size=shuffle_buffer_size,
+        reshuffle_each_epoch=reshuffle_each_epoch,
         post_training=post_training,
         assistant_separator=assistant_separator,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
-    )
+    return _make_loader(dataset, batch_size, num_workers, pad_token_id, bucket_window)
 
 
 # ---------------------------------------------------------------------------
@@ -370,12 +478,15 @@ class PreTokenizedDataset(IterableDataset):
         max_length: int = 4096,
         shuffle_buffer_size: int = 8192,
         min_chunk_size: int = 16,
+        reshuffle_each_epoch: bool = False,
     ):
         super().__init__()
         self.paths = sorted(paths)
         self.max_length = max_length
         self.shuffle_buffer_size = shuffle_buffer_size
         self.min_chunk_size = min_chunk_size
+        self.reshuffle_each_epoch = reshuffle_each_epoch
+        self._epoch = 0
 
     def _shard_files(self) -> List[str]:
         """Shard shard-files across workers (see StreamingJsonlDataset._shard_files
@@ -430,7 +541,7 @@ class PreTokenizedDataset(IterableDataset):
             return
 
         buf: List[Dict[str, torch.Tensor]] = []
-        rng = random.Random(torch.initial_seed())
+        rng = random.Random(_epoch_shuffle_seed(self))
         for example in self._produce_chunks(files):
             buf.append(example)
             if len(buf) >= self.shuffle_buffer_size:
@@ -448,6 +559,8 @@ def make_pretokenized_dataloader(
     num_workers: int = 4,
     pad_token_id: int = PAD_TOKEN_ID,
     shuffle_buffer_size: int = 8192,
+    reshuffle_each_epoch: bool = False,
+    bucket_window: int = 0,
 ) -> DataLoader:
     """Create a DataLoader from pre-tokenized ``.pt`` shards.
 
@@ -470,16 +583,9 @@ def make_pretokenized_dataloader(
         paths=paths,
         max_length=max_length,
         shuffle_buffer_size=shuffle_buffer_size,
+        reshuffle_each_epoch=reshuffle_each_epoch,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
-    )
+    return _make_loader(dataset, batch_size, num_workers, pad_token_id, bucket_window)
 
 
 def pretokenize_dataset(

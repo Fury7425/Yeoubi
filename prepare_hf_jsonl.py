@@ -12,15 +12,19 @@ See ``docs/DATASET_GUIDE.md`` before starting a large run.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
+import itertools
 import json
 import math
 import os
 import random
+import shutil
+import sqlite3
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Iterable, Iterator, Mapping
 
 from yeoubi.data_pipeline import (
     ContaminationIndex,
@@ -50,6 +54,16 @@ SHUFFLE_BUCKET_BYTES = 256 * 1024**2
 # Every bucket is held open for the whole scatter pass. Stay well under the stdio
 # descriptor ceiling (512 on Windows) rather than discovering it on a big corpus.
 MAX_OPEN_BUCKETS = 256
+# Bucket count must follow the decompressed size, because each bucket is shuffled in RAM.
+# Byte IDs stored as JSON digits compress roughly this much; it only needs to be close.
+GZIP_EXPANSION = 5
+# --gzip-parts output, consumed by the repeated-session Colab cell. Loader position is not
+# checkpointed, so a resume replays at most one part; keep parts small relative to a session.
+COLAB_PART_CHARS = 180 * 1024**2
+COLAB_VAL_LINES = 3000
+# Must match --max_seq_len and --batch_size * --grad_accum_steps in the Colab cell.
+COLAB_MAX_SEQ_LEN = 4096
+COLAB_CHUNKS_PER_STEP = 16
 SEQ_LENGTH_DIST = [
     (128, 3),
     (256, 5),
@@ -65,8 +79,11 @@ SEQ_WEIGHTS = [weight for _, weight in SEQ_LENGTH_DIST]
 
 
 class PipelinePaths:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, compress: bool = False, min_free_bytes: int = 0) -> None:
         self.root = root.resolve()
+        self.compress = compress
+        self.min_free_bytes = min_free_bytes
+        self.colab_dir = self.root / "colab"
         self.train_dir = self.root / "train"
         self.val_dir = self.root / "val"
         self.shard_dir = self.root / "hf_shards"
@@ -79,12 +96,32 @@ class PipelinePaths:
     def ensure(self) -> None:
         for directory in (self.train_dir, self.val_dir, self.shard_dir):
             directory.mkdir(parents=True, exist_ok=True)
+        if self.compress:
+            (self.colab_dir / "parts").mkdir(parents=True, exist_ok=True)
+
+    def check_free_space(self) -> None:
+        free = shutil.disk_usage(self.root).free
+        if free < self.min_free_bytes:
+            raise RuntimeError(
+                f"stopping: {free / 1e9:.1f} GB free on the data drive, below "
+                f"--min-free-gb ({self.min_free_bytes / 1e9:.1f} GB)"
+            )
 
     def shard_paths(self, slug: str) -> tuple[Path, Path]:
+        suffix = ".jsonl.gz" if self.compress else ".jsonl"
         return (
-            self.shard_dir / f"{slug}.train.jsonl",
-            self.shard_dir / f"{slug}.val.jsonl",
+            self.shard_dir / f"{slug}.train{suffix}",
+            self.shard_dir / f"{slug}.val{suffix}",
         )
+
+
+def _open_text(path: Path, mode: str):
+    """Open UTF-8 text, gzipped when ``.gz`` is among the suffixes (``x.gz.tmp`` counts)."""
+    if ".gz" in path.suffixes:
+        # newline="\n": Windows text mode would otherwise store CRLF in every part.
+        # Level 6: the default 9 is much slower for little gain, and data passes through 3x.
+        return gzip.open(path, mode + "t", compresslevel=6, encoding="utf-8", newline="\n")
+    return path.open(mode, encoding="utf-8")
 
 
 def _canonical_hash(value: object) -> str:
@@ -142,7 +179,9 @@ def load_stream(spec: Mapping[str, object]):
         "split": spec.get("split", "train"),
         "streaming": True,
     }
-    for key in ("name", "data_dir", "revision"):
+    # batch_size is parquet-only: without it a whole row group becomes Python objects at
+    # once, the suspected cause of a MemoryError during streaming on a 16 GB machine.
+    for key in ("name", "data_dir", "revision", "batch_size"):
         if spec.get(key) is not None:
             kwargs[key] = spec[key]
     return load_dataset(**kwargs)
@@ -214,14 +253,12 @@ def build_source(
     val_unique_bytes = 0
     pii_totals: Counter[str] = Counter()
 
-    train_tmp = train_path.with_suffix(".tmp")
-    val_tmp = val_path.with_suffix(".tmp")
+    train_tmp = train_path.with_name(train_path.name + ".tmp")
+    val_tmp = val_path.with_name(val_path.name + ".tmp")
     print(f"\n  building {slug} (target {target / 1e9:.2f}B unique UTF-8 bytes)")
 
     try:
-        with train_tmp.open("w", encoding="utf-8") as train_handle, val_tmp.open(
-            "w", encoding="utf-8"
-        ) as val_handle:
+        with _open_text(train_tmp, "w") as train_handle, _open_text(val_tmp, "w") as val_handle:
             for text, row in iter_rows(spec):
                 counters["documents_seen"] += 1
                 text, pii_counts = handle_pii(text, source_pii_policy)
@@ -298,6 +335,7 @@ def build_source(
 
                 if counters["documents_accepted"] % 1000 == 0:
                     dedup.commit()
+                    paths.check_free_space()
                 if counters["documents_accepted"] % 10_000 == 0:
                     print(
                         f"    {slug}: {counters['documents_accepted']:>9,} accepted docs, "
@@ -339,6 +377,49 @@ def build_source(
     return result
 
 
+def _shuffled_lines(bucket_paths: list[Path], rng: random.Random) -> Iterator[str]:
+    for bucket_path in bucket_paths:
+        # readlines, not splitlines: metadata may hold U+2028 and other Unicode breaks.
+        with _open_text(bucket_path, "r") as handle:
+            lines = handle.readlines()
+        bucket_path.unlink()  # free disk before the next output is written
+        rng.shuffle(lines)
+        yield from lines
+
+
+def write_colab_parts(lines: Iterable[str], colab_dir: Path) -> dict[str, int]:
+    """Write training lines as gzip parts plus the ``meta.json`` the Colab cell reads."""
+    parts_dir = colab_dir / "parts"
+    for stale in parts_dir.glob("part_*.jsonl.gz"):
+        stale.unlink()
+    parts = chars = chunks = 0
+    handle = None
+    try:
+        for line in lines:
+            if handle is None:
+                handle = _open_text(parts_dir / f"part_{parts:05d}.jsonl.gz", "w")
+                parts += 1
+            handle.write(line)
+            chars += len(line)
+            # The loader splits long records at max_seq_len. Counting commas is far cheaper
+            # than parsing every record, and the few metadata commas are negligible.
+            chunks += line.count(",") // COLAB_MAX_SEQ_LEN + 1
+            if chars >= COLAB_PART_CHARS:
+                handle.close()
+                handle = None
+                chars = 0
+    finally:
+        if handle is not None:
+            handle.close()
+    meta = {
+        "parts": parts,
+        "steps_per_part": max(1, chunks // parts // COLAB_CHUNKS_PER_STEP),
+        "total_steps": chunks // COLAB_CHUNKS_PER_STEP,
+    }
+    (colab_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return meta
+
+
 def assemble_shuffled(
     specs: list[Mapping[str, object]], paths: PipelinePaths, *, seed: int
 ) -> None:
@@ -353,9 +434,10 @@ def assemble_shuffled(
             if not shard.exists():
                 print(f"  missing {shard.name}; skipping")
                 continue
-            line_count = sum(1 for line in shard.open("r", encoding="utf-8") if line.strip())
+            with _open_text(shard, "r") as handle:
+                line_count = sum(1 for line in handle if line.strip())
             total_lines += line_count
-            total_bytes += shard.stat().st_size
+            total_bytes += shard.stat().st_size * (GZIP_EXPANSION if paths.compress else 1)
             shards.append(shard)
             print(f"  {spec['slug']:<24} {line_count:>10,} chunks")
         if total_lines == 0:
@@ -372,26 +454,46 @@ def assemble_shuffled(
                 f"to match, or shuffle in more passes."
             )
         rng = random.Random(f"{seed}:{split}:assembly")
-        with tempfile.TemporaryDirectory(prefix="yeoubi_shuffle_") as temporary_dir:
+        # Compressed runs exist because disk is tight, so keep buckets beside the data
+        # instead of on the system drive.
+        temp_parent = paths.shard_dir if paths.compress else None
+        bucket_suffix = ".jsonl.gz" if paths.compress else ".jsonl"
+        with tempfile.TemporaryDirectory(prefix="yeoubi_shuffle_", dir=temp_parent) as temporary_dir:
             temp_root = Path(temporary_dir)
-            bucket_paths = [temp_root / f"bucket_{index:06d}.jsonl" for index in range(bucket_count)]
-            bucket_handles = [path.open("w", encoding="utf-8") for path in bucket_paths]
+            bucket_paths = [
+                temp_root / f"bucket_{index:06d}{bucket_suffix}" for index in range(bucket_count)
+            ]
+            bucket_handles = [_open_text(path, "w") for path in bucket_paths]
             try:
                 for shard in shards:
-                    with shard.open("r", encoding="utf-8") as source_handle:
-                        for line in source_handle:
+                    with _open_text(shard, "r") as source_handle:
+                        for line_number, line in enumerate(source_handle):
+                            if line_number % 100_000 == 0:
+                                paths.check_free_space()
                             if line.strip():
                                 bucket_handles[rng.randrange(bucket_count)].write(line)
+                    # Compressed runs trade re-assembly for disk: without this the source
+                    # shards, buckets and parts would all exist at once. A failure after
+                    # this point re-downloads the consumed sources on the next run.
+                    if paths.compress:
+                        shard.unlink()
             finally:
                 for handle in bucket_handles:
                     handle.close()
 
+            lines = _shuffled_lines(bucket_paths, rng)
+            if paths.compress:
+                if split == "train":
+                    meta = write_colab_parts(lines, paths.colab_dir)
+                    print(f"  wrote {meta['parts']} parts to {paths.colab_dir}: {meta}")
+                else:
+                    with _open_text(paths.colab_dir / "val.jsonl.gz", "w") as output:
+                        output.writelines(itertools.islice(lines, COLAB_VAL_LINES))
+                    print(f"  wrote {paths.colab_dir / 'val.jsonl.gz'}")
+                continue
             final_tmp = final_path.with_suffix(".tmp")
             with final_tmp.open("w", encoding="utf-8") as output:
-                for bucket_path in bucket_paths:
-                    lines = bucket_path.read_text(encoding="utf-8").splitlines(keepends=True)
-                    rng.shuffle(lines)
-                    output.writelines(lines)
+                output.writelines(lines)
             os.replace(final_tmp, final_path)
         print(
             f"  wrote {final_path} ({final_path.stat().st_size / 1e9:.2f} GB, "
@@ -454,10 +556,14 @@ def reset_outputs(paths: PipelinePaths) -> None:
     known_files = [paths.state, paths.dedup, paths.final_train, paths.final_val, paths.report]
     known_files.extend(paths.shard_dir.glob("*.train.jsonl"))
     known_files.extend(paths.shard_dir.glob("*.val.jsonl"))
+    known_files.extend(paths.shard_dir.glob("*.jsonl.gz"))
+    known_files.extend((paths.colab_dir / "parts").glob("part_*.jsonl.gz"))
+    known_files.extend([paths.colab_dir / "val.jsonl.gz", paths.colab_dir / "meta.json"])
     known_files.extend(
         [
             paths.dedup.with_name(paths.dedup.name + "-wal"),
             paths.dedup.with_name(paths.dedup.name + "-shm"),
+            paths.dedup.with_name(paths.dedup.name + "-journal"),
         ]
     )
     for path in known_files:
@@ -488,6 +594,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--require-reviewed-licenses", action="store_true")
     parser.add_argument(
+        "--gzip-parts",
+        action="store_true",
+        help="Gzip all intermediates and write <data-root>/colab parts instead of one JSONL",
+    )
+    parser.add_argument(
+        "--hf-token-file",
+        type=Path,
+        help="File holding a Hugging Face access token; a file keeps it out of shell history",
+    )
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=0.0,
+        help="Stop with an error if free space on the data drive falls below this",
+    )
+    parser.add_argument(
         "--rebuild",
         action="store_true",
         help="Discard known generated shards/state and rebuild using this manifest",
@@ -499,6 +621,11 @@ def main() -> None:
     args = parse_args()
     if not 0.0 <= args.val_ratio < 1.0:
         raise ValueError("--val-ratio must be in [0, 1)")
+    if args.hf_token_file:
+        token = args.hf_token_file.read_text(encoding="utf-8").strip()
+        if not token:
+            raise ValueError(f"--hf-token-file is empty: {args.hf_token_file}")
+        os.environ["HF_TOKEN"] = token  # read by huggingface_hub on each request
     manifest = load_manifest(args.manifest)
     all_specs = enabled_sources(manifest)
     if args.source:
@@ -521,7 +648,9 @@ def main() -> None:
                 "license review is still required for: " + ", ".join(map(str, unreviewed))
             )
 
-    paths = PipelinePaths(args.data_root)
+    paths = PipelinePaths(
+        args.data_root, compress=args.gzip_parts, min_free_bytes=int(args.min_free_gb * 1e9)
+    )
     paths.ensure()
     if args.rebuild:
         reset_outputs(paths)
@@ -571,4 +700,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except sqlite3.Error as exc:
+        # The default message hides the extended code that identifies the failing I/O call.
+        print(f"sqlite error code: {getattr(exc, 'sqlite_errorname', 'unknown')}")
+        raise

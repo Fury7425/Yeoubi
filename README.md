@@ -26,7 +26,7 @@ network costs.
 merges, or vocabulary download is required.
 - **Ternary weights:** quantized Transformer matrices use `{-1, 0, +1}` weights.
 - **Hybrid activations:** training transitions from W1.58A8 to a W1.58A4 path with
-INT4 inputs, TopK sparsification, and INT8 intermediates.
+INT4 inputs (BitNet a4.8 absmean scale), TopK sparsification, and INT8 intermediates.
 - **Parallel denoising:** multiple masked positions can be updated during each
 diffusion step.
 - **Recurrent depth:** the default RDT executes one to three recurrent refinement
@@ -45,7 +45,7 @@ simulation with packed 2-bit ternary weights and Triton/CPU kernels.
 | Noise state | Absorbing `[MASK]` byte ID | None |
 | Quantized weights | Ternary `{-1, 0, +1}` | Commonly FP16/BF16 or integer quantized |
 | Activations | A8, then hybrid A4/TopK/INT8 | Commonly FP16/BF16 |
-| KV cache | 3-bit quantized cache; first position at 4-bit | Commonly FP16/BF16 |
+| KV cache | 4-bit quantized cache with a per-token scale | Commonly FP16/BF16 |
 | Default context | 16,384 bytes | Model-dependent |
 | Post-training | Response-only reasoning SFT and optional correction tuning | Instruction/chat SFT and preference tuning |
 | Runtime format | Custom diffusion runtime | Commonly Transformers, vLLM, llama.cpp, etc. |
@@ -391,6 +391,20 @@ recurrence, loop dropout makes shorter loop prefixes useful, and inference may o
 the recurrence count with `sample.py --n_loops`. Set `--model_type standard` for the
 flat `BitDiffusionTransformer`.
 
+Three conditioning and decoding details are on by default for new runs:
+
+- The noise level is multiplied by 1000 before its sinusoidal embedding
+(`--timestep_scale`). Unscaled, `t ∈ [0, 1]` keeps every angle under one radian and
+most channels nearly constant.
+- Each recurrence is identified by a learned loop-index vector
+(`--rdt_learned_loop_embedding`) instead of a sinusoid of the loop fraction.
+- The byte decoder has one SwiGLU feed-forward layer at byte resolution
+(`--byte_decoder_ffn`); without it the decoder is linear. It costs roughly 5% per
+training step.
+
+Looping past the trained maximum with `--n_loops` reuses the last loop's parameters
+and is only meaningful for a model trained with `--rdt_recurrent_state_init_std > 0`.
+
 ### Default model configuration
 
 | Setting | Default |
@@ -407,7 +421,8 @@ flat `BitDiffusionTransformer`.
 | Predictable IDs | 258: 256 bytes, PAD, and EOS |
 | Absorbing mask ID | 258 |
 | Embeddings | Tied by default |
-| KV-cache precision | 3-bit; first position 4-bit |
+| KV-cache precision | 4-bit, one scale per token and head |
+| Noise-embedding scale | 1000 |
 | RDT recurrence | 1–3 loops |
 
 `PAD=256`, `EOS=257`, and `MASK=258`. No BOS token is inserted. A mask may split a
@@ -418,30 +433,68 @@ sequences; the sampler decodes these with replacement characters instead of fail
 
 - The cosine absorbing-state process replaces selected byte positions with MASK.
 - MDLM NELBO weighting is the default; uniform masked cross-entropy is available with
-`--loss_weighting uniform`.
+`--loss_weighting uniform`. The correction stage always uses uniform weighting, because
+it also supervises visible wrong bytes and the NELBO weight is unbounded on those.
+- Noise levels are low-discrepancy: each optimizer step spreads its samples evenly over
+`t ∈ [0, 1)` from one random offset instead of drawing them independently.
+- Half of the training samples (`--span_mask_prob 0.5`) are masked in whole four-byte
+groups instead of byte by byte, so a hidden group cannot be read off its neighbours.
+Validation always uses plain byte masking, so its loss stays comparable across runs.
 - Full-precision latent weights are retained during training and ternarized with a
 straight-through estimator on each forward pass.
 - The first 90% of training uses INT8 activations (W1.58A8).
 - The last 10% uses hybrid INT4 inputs, TopK(55%) sparsification, and INT8
-intermediates (W1.58A4).
-- Block-causal examples are mixed into training to support cached block diffusion.
+intermediates (W1.58A4). INT4 uses the a4.8 absmean scale (`sqrt(7) / mean|x|`, per
+token, clipped to ±7); `--int4_absmean false` restores per-token absmax. Checkpoints
+written before this option keep absmax when loaded.
+- Block-causal examples are mixed into training to support cached block diffusion
+(`--block_causal_prob 0.5`). In those steps the byte codec's local convolutions stop at
+block edges, as they do when the sampler encodes one block at a time.
+- One micro-batch in ten (`--clean_prefix_prob 0.1`) is recast as a single cached
+generation step: one random block is noised, everything before it is clean and
+conditioned at `t = 0`, and everything after it is dropped. This is the state the block
+sampler presents; block-causal masking alone noises every block equally. Only one block
+is supervised in such a step, so keep the fraction small.
+
+### Sampling notes
+
+- `--block` requires `--block_size` to be a multiple of the byte patch size (4). The
+prompt is committed to the KV cache in `block_size` chunks on patch boundaries; up to
+three leftover prompt bytes are carried as fixed bytes at the head of the first block.
+- `--revise_threshold 0.9` lets the sampler overwrite an already committed byte when
+the model is at least that confident in a different one, at noise levels up to
+`--revise_t_max` (default 0.5). It is off by default and needs a checkpoint trained
+with `--training_stage correction`; other checkpoints have untrained outputs at
+visible positions.
+
+### Resuming checkpoints from before these defaults
+
+Sampling and export read the configuration stored in the checkpoint, so older
+checkpoints need nothing. To resume or fine-tune one, pass the values it was trained
+with; a mismatch is reported at startup instead of silently changing the model:
+
+```bash
+python train.py --resume_from checkpoints/old.pt --timestep_scale 1.0 --rdt_learned_loop_embedding false --byte_decoder_ffn false
+```
 
 ### Reference training hyperparameters
 
 | Parameter | Default | Notes |
 |---|---:|---|
-| Steps | 57,500 | 30.1B padded byte positions |
+| Steps | 57,500 | Up to 30.1B byte positions (if every chunk were 16,384 bytes), roughly 7.5B subword-token equivalents |
 | Batch size | 2 | Per device |
-| Gradient accumulation | 16 | 524,288 padded positions per optimizer step |
+| Batching | Length-bucketed | Sorts 128 consecutive examples by length before batching, so almost no position is padding; a per-batch loss weight keeps document weighting as it was under random batching. `--length_bucket_window 0` disables |
+| Gradient accumulation | 16 | Up to 524,288 byte positions per optimizer step |
 | Maximum sequence | 16,384 bytes | 4,096 global patches |
 | AdamW peak LR | `2e-4` | Embeddings, norms, biases, and output head |
 | Muon peak LR | `0.02` | 2D Transformer body matrices |
 | Warmup | 4,000 steps | Linear warmup, then cosine decay |
 | Minimum LR ratio | 0.1 | Cosine floor |
-| Weight decay | 0.05 | AdamW group |
+| Weight decay | 0.05 | AdamW group, matrices only; norm gains and biases are not decayed |
 | Gradient clipping | 1.0 | Global norm |
 | Mixed precision | BF16 | Enabled by default |
-| Gradient checkpointing | Enabled | Reference estimate: ~29.5 GB on A100 40 GB |
+| `torch.compile` | Enabled | Skipped on CPU; frames that fail to compile run eagerly. The compile cost is paid at the start of every session, so pass `--compile_model false` for short or frequently resumed runs |
+| Gradient checkpointing | Enabled | Reference estimate: ~29.5 GB on A100 40 GB. `--gc_every_n_layers 2` halves the recompute for more memory |
 | A4 fraction | 10% | Final 5,750 steps |
 | Loss | MDLM NELBO | Continuous-time weighted masked loss |
 
@@ -622,7 +675,7 @@ than a promise.
 ```text
 yeoubi/
 byte_codec.py UTF-8 byte encoding and fixed special IDs
-data.py JSONL and pre-tokenized streaming loaders
+data.py JSONL and pre-tokenized streaming loaders, length-bucketed batching
 data_pipeline.py dataset processing utilities
 diffusion.py absorbing-mask schedule and loss
 model.py BitLinear, attention, FFN/MoE, flat Transformer

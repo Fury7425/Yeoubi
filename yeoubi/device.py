@@ -286,11 +286,19 @@ def compile_model(model: torch.nn.Module, device: torch.device, dynamic: bool = 
         The compiled model wrapper.
     """
     # torch.compile is lazy: it returns a wrapper and only compiles on the
-    # first forward. A backend that cannot build raises there, not here, so
-    # there is nothing to catch and no second backend to fall back to.
+    # first forward, so a backend that cannot build fails there, not here.
+    # Training compiles by default, so a machine without a working backend
+    # (no C++ toolchain, no Triton) must still train: tell dynamo to run any
+    # frame it cannot compile eagerly instead of raising.
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+    except Exception:  # noqa: BLE001 - best-effort; compile still works without it
+        logger.warning("Could not enable torch.compile eager fallback; a backend "
+                       "failure will raise on the first step.")
     logger.info(
         "torch.compile enabled (backend=inductor, dynamic=%s). The first step "
-        "is slow while kernels build; a backend failure surfaces there, not now.",
+        "is slow while kernels build; frames that fail to compile run eagerly.",
         dynamic,
     )
     return torch.compile(model, dynamic=dynamic)

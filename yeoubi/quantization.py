@@ -107,6 +107,34 @@ def absmax_quantize_int4(x: torch.Tensor) -> torch.Tensor:
     return x_q / scale
 
 
+_SQRT7 = math.sqrt(7.0)
+
+
+def _int4_scale(x: torch.Tensor, absmean: bool) -> torch.Tensor:
+    """Per-token INT4 scale, shared by the simulated and packed paths.
+
+    ``absmean`` is BitNet a4.8's Eq. 7: ``sqrt(7) / mean|x|``. Absmax spends
+    the 15 levels on the single largest of ~2000 features, so a Gaussian
+    token lands in roughly five of them and one outlier coarsens the rest;
+    absmean clips ~3.6% of a Gaussian's tail instead and uses every level
+    (roughly 30% less quantization error on Gaussian input). ``absmax`` remains for
+    checkpoints trained before the switch.
+
+    Two deliberate departures from the paper, both for the packed kernels:
+    the scale is per token (they take one scale per row; the paper does not
+    state a granularity), and the clip stays symmetric at +/-7 rather than
+    [-8, 7], the range those kernels document.
+
+    The mean is taken in fp32: a bf16 reduction over thousands of features
+    is not reliably accurate, and this scale multiplies every value.
+    """
+    if absmean:
+        beta = x.float().abs().mean(dim=-1, keepdim=True).clamp(min=1e-8)
+        return (_SQRT7 / beta).to(x.dtype)
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    return 7.0 / amax
+
+
 def absmax_quantize_int8(x: torch.Tensor) -> torch.Tensor:
     """Per-token absmax quantization to simulated INT8 (±127).
 
@@ -173,6 +201,10 @@ class HybridQuantizer(nn.Module):
         self.mode = mode
         self.topk_ratio = topk_ratio
         self.enabled = enabled
+        # INT4 scale statistic (see _int4_scale). Not a constructor argument:
+        # the model sets it on every quantizer from ModelConfig.int4_absmean,
+        # so a bare BitLinear keeps the legacy absmax behaviour.
+        self.int4_absmean = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply quantization with STE.
@@ -187,7 +219,8 @@ class HybridQuantizer(nn.Module):
             return x
 
         if self.mode == "int4":
-            x_q = absmax_quantize_int4(x)
+            scale = _int4_scale(x, self.int4_absmean)
+            x_q = (x * scale).round().clamp(-7, 7) / scale
         elif self.mode == "int8":
             x_q = absmax_quantize_int8(x)
         elif self.mode == "topk_int8":
@@ -221,8 +254,7 @@ class HybridQuantizer(nn.Module):
             return x.to(torch.int8), scale
 
         if self.mode == "int4":
-            amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-            scale = 7.0 / amax
+            scale = _int4_scale(x, self.int4_absmean)
             x_q = (x * scale).round().clamp(-7, 7).to(torch.int8)
             return x_q, scale.to(torch.float32)
         if self.mode == "int8":
@@ -324,10 +356,14 @@ def _unpack_4bit(packed: torch.Tensor, orig_last_dim: int) -> torch.Tensor:
 
 
 def quantize_kv(tensor: torch.Tensor, bits: int = 3) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a K or V tensor per-head to ``bits``-bit unsigned.
+    """Quantize a K or V tensor per-token to ``bits``-bit unsigned.
 
     The tensor is assumed to have shape (B, n_heads, T, head_dim).
-    Quantization is absmax per-head (i.e. per (B, h) slice).
+    Quantization is absmax per token (i.e. per (B, h, t) row). A per-chunk
+    scale let one outlier token (V is not normalised) collapse every other
+    token in the block onto a few levels; per-token isolates it, at a cost
+    of one float per token per head (~6% over the packed payload at
+    head_dim 128).
 
     Args:
         tensor: Float K or V tensor.
@@ -335,7 +371,7 @@ def quantize_kv(tensor: torch.Tensor, bits: int = 3) -> Tuple[torch.Tensor, torc
 
     Returns:
         (packed, scale) where packed holds bit-packed integers and scale
-        is a float tensor of shape (B, n_heads, 1, 1).
+        is a float tensor of shape (B, n_heads, T, 1).
     """
     if bits not in (3, 4, 8):
         raise ValueError(f"Unsupported bits: {bits}")
@@ -344,8 +380,8 @@ def quantize_kv(tensor: torch.Tensor, bits: int = 3) -> Tuple[torch.Tensor, torc
     # half+0.5, so exact zeros dequantize with a systematic positive bias.
     half = float(max_val // 2)
 
-    # Per-head absmax
-    amax = tensor.abs().amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    # Per-token absmax
+    amax = tensor.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     scale = amax / half
 
     # Map to unsigned range [0, max_val]

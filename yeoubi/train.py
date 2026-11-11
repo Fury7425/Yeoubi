@@ -60,6 +60,7 @@ from .model import BitDiffusionTransformer, ModelConfig, self_cond_vector
 from . import MODEL_NAME
 from .muon import Muon, split_params_for_muon
 from .quantization import KVCache
+from .sample import _remask_step
 from .utils import (
     BitStats, ExpertStats, WandBLogger, count_parameters, drain_checkpoint_writer,
     force_utf8_console, load_checkpoint, log_expert_utilization, read_checkpoint,
@@ -118,9 +119,10 @@ class TrainConfig:
     train_data: str = "data/train/*.jsonl"
     val_data: str = "data/val/*.jsonl"
     output_dir: str = "checkpoints"
-    # 57 500 steps × (8 batch × 16 accum × 4096 seq) ≈ 30.1B tokens.
-    # For a 40B-token run set max_steps=76_294 (40e9 / 524_288).
-    # batch_size=8 keeps 524K tok/step on a 40 GB A100 (~29.5 GB total).
+    # 57 500 steps × (2 batch × 16 accum × 16384 seq) ≈ 30.1B BYTES -- roughly
+    # 7.5B subword-token equivalents at ~4 bytes/token, not 30B tokens.
+    # For a 40B-byte run set max_steps=76_294 (40e9 / 524_288).
+    # 524K bytes/step fits a 40 GB A100 (~29.5 GB total).
     # 4096 context covers all standard benchmarks and beats every published
     # masked diffusion LM. Scale to 8192+ with a multi-GPU cluster.
     max_steps: int = 57500
@@ -187,13 +189,19 @@ class TrainConfig:
     qk_norm: bool = True
     # BitNet SubLN before o_proj / down_proj (see ModelConfig.use_sub_norm).
     use_sub_norm: bool = True
+    # INT4 activation scale: a4.8 absmean (True) or legacy per-token absmax.
+    # See ModelConfig.int4_absmean.
+    int4_absmean: bool = True
     # Scaling applies at every position once enabled: gating it on batch length
     # would give one absolute position two different rotations.
     rope_scaling_type: str = "yarn"  # "none" | "linear" | "yarn"
     rope_scaling_factor: float = 4.0
     rope_original_max_seq_len: int = 4096
     t_embed_dim: int = 256
-    kv_cache_bits: int = 3
+    # See ModelConfig.timestep_scale. Pass 1.0 to resume or fine-tune a
+    # checkpoint trained before the scaled noise embedding.
+    timestep_scale: float = 1000.0
+    kv_cache_bits: int = 4
     kv_cache_bos_bits: int = 4
     # Tie input embedding and unembedding head (see ModelConfig.tie_embeddings).
     tie_embeddings: bool = True
@@ -202,6 +210,10 @@ class TrainConfig:
     use_byte_patches: bool = True
     byte_patch_size: int = 4
     byte_local_kernel: int = 15
+    # Byte-resolution SwiGLU in the patch decoder, which is otherwise linear
+    # (see BytePatchCodec). Costs about 5% per step. Pass false to resume or
+    # fine-tune a checkpoint trained without it.
+    byte_decoder_ffn: bool = True
 
     # Legacy thinking tokens are retained for ablations but disabled for new
     # runs. Reasoning is taught through the supervised response canvas instead.
@@ -223,13 +235,26 @@ class TrainConfig:
     gc_every_n_layers: int = 1
     # Compile the model with torch.compile for GPU kernel fusion (~20-40 %
     # throughput gain on Ampere/Hopper).  Adds a one-time compilation cost
-    # of ~2-5 min on first step.
-    compile_model: bool = False
+    # of ~2-5 min on first step -- paid again by every resumed session, so
+    # turn it off for short ones. Skipped on CPU; frames that fail to compile
+    # run eagerly (see device.compile_model).
+    compile_model: bool = True
     # Offload periodic checkpoint I/O to a background thread so training
     # resumes immediately after the state snapshot (GPU→CPU clone).
     async_checkpoint: bool = True
     # Maximum validation batches per evaluation run (reduce to speed up).
     val_max_batches: int = 50
+    # Batch training examples of similar length together: sort this many
+    # consecutive examples by length before cutting batches, so almost no
+    # position is padding (about a third were). Each batch carries a loss
+    # weight that keeps every document's share of the loss where random
+    # batching had it (see data.LengthBucketedBatches). 0 restores random
+    # batching. JSONL / .pt loaders only; validation is never bucketed.
+    length_bucket_window: int = 128
+    # Fraction of training samples masked in whole byte-patch groups instead
+    # of byte by byte (see diffusion.apply_mask). 0 disables. Validation
+    # always uses plain byte masking so its loss stays comparable.
+    span_mask_prob: float = 0.5
 
     # --- Muon optimizer (DeepSeek V4 style hybrid) ---
     # Muon orthogonalizes the SGD-momentum update of every 2D weight matrix
@@ -267,6 +292,9 @@ class TrainConfig:
     rdt_randomize_loops: bool = True
     rdt_adaptive_loops: bool = True
     rdt_loop_specific_norms: bool = True
+    # Learned loop-index table instead of the near-constant sinusoid (see
+    # RDTConfig.learned_loop_embedding). Pass false to resume older RDT runs.
+    rdt_learned_loop_embedding: bool = True
     rdt_context_adaptive_loops: bool = True
     rdt_context_loop_threshold: int = 4096
     # See RDTConfig.detach_recurrent_anchor / .recurrent_state_init_std.
@@ -283,6 +311,12 @@ class TrainConfig:
     block_causal_prob: float = 0.5
     block_causal_min_size: int = 128
     block_causal_max_size: int = 512
+    # Fraction of training micro-batches recast as one cached block-generation
+    # step: a random block noised against a clean prefix conditioned at t=0.
+    # That is the state BlockDiffusionSampler presents, and block-causal
+    # masking alone never produces it (see _clean_prefix_batch). Each such
+    # step supervises one block only, so keep it small; 0 disables.
+    clean_prefix_prob: float = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +412,21 @@ class _HybridOptimizer:
     def state_dict(self):
         return {"hybrid": [o.state_dict() for o in self.optimizers]}
 
+    @staticmethod
+    def _restore(o: torch.optim.Optimizer, sd) -> None:
+        # Per-parameter state is keyed by position across param groups, so a
+        # checkpoint written under a different group layout (e.g. before the
+        # AdamW decay / no-decay split) cannot be mapped back; torch raises.
+        # Start that optimizer's moments fresh instead of failing the resume.
+        if len(sd["param_groups"]) != len(o.param_groups):
+            logger.warning(
+                "%s param-group layout changed (checkpoint=%d, current=%d); "
+                "skipping its optimizer state restoration.",
+                type(o).__name__, len(sd["param_groups"]), len(o.param_groups),
+            )
+            return
+        o.load_state_dict(sd)
+
     def load_state_dict(self, state) -> None:
         # New format: {"hybrid": [sd_per_optimizer, ...]}
         if isinstance(state, dict) and "hybrid" in state:
@@ -390,12 +439,12 @@ class _HybridOptimizer:
                 )
                 return
             for o, sd in zip(self.optimizers, payload):
-                o.load_state_dict(sd)
+                self._restore(o, sd)
             return
         # Legacy format: a single optimizer's state_dict (pre-Muon checkpoints).
         if isinstance(state, dict) and "param_groups" in state and "state" in state:
             if len(self.optimizers) == 1:
-                self.optimizers[0].load_state_dict(state)
+                self._restore(self.optimizers[0], state)
             else:
                 logger.warning(
                     "Loading legacy single-optimizer checkpoint into hybrid setup; "
@@ -420,6 +469,20 @@ class _HybridScheduler:
     def state_dict(self):
         return {"hybrid": [s.state_dict() for s in self.schedulers]}
 
+    @staticmethod
+    def _restore(s, sd) -> None:
+        s.load_state_dict(sd)
+        groups = s.optimizer.param_groups
+        if len(s.base_lrs) != len(groups):
+            # Checkpoint predates a param-group layout change. base_lrs came
+            # back with the old length and LambdaLR zips against it, so the
+            # extra groups would silently sit at their warmup-start lr of 0
+            # for the rest of the run. Every group shares one base LR, so
+            # rebuild from the optimizer and re-apply the restored step.
+            s.base_lrs = [g["initial_lr"] for g in groups]
+            for g, lam, base in zip(groups, s.lr_lambdas, s.base_lrs):
+                g["lr"] = base * lam(s.last_epoch)
+
     def load_state_dict(self, state) -> None:
         if isinstance(state, dict) and "hybrid" in state:
             payload = state["hybrid"]
@@ -431,10 +494,10 @@ class _HybridScheduler:
                 )
                 return
             for s, sd in zip(self.schedulers, payload):
-                s.load_state_dict(sd)
+                self._restore(s, sd)
             return
         if isinstance(state, dict) and len(self.schedulers) == 1:
-            self.schedulers[0].load_state_dict(state)
+            self._restore(self.schedulers[0], state)
             return
         raise ValueError("Unrecognized scheduler state_dict format")
 
@@ -448,19 +511,29 @@ def _make_adamw(params, cfg: "TrainConfig") -> torch.optim.Optimizer:
     unembedding head, RMSNorm gains, biases) is affected — the Muon group is
     built separately and keeps full-precision momentum. Same hyperparameters
     either way, so checkpoints and LR schedules are unchanged.
+
+    Weight decay applies to matrices only. Decaying 1D tensors pulls RMSNorm
+    gains (and the RDT ``alpha`` / ``A_raw`` / ``iter_gate`` scalars) toward
+    zero rather than toward their identity value, which is never the intent.
     """
+    params = list(params)
+    groups = [
+        {"params": [p for p in params if p.ndim >= 2], "weight_decay": cfg.weight_decay},
+        {"params": [p for p in params if p.ndim < 2], "weight_decay": 0.0},
+    ]
+    groups = [g for g in groups if g["params"]]
     if cfg.use_8bit_adam:
         if _HAS_BNB:
             logger.info("AdamW group: bitsandbytes AdamW8bit (8-bit optimizer state).")
             return bnb.optim.AdamW8bit(
-                params, lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay,
+                groups, lr=cfg.lr, betas=(0.9, 0.95), weight_decay=cfg.weight_decay,
             )
         logger.warning(
             "use_8bit_adam=True but bitsandbytes is not installed; using fp32 "
             "torch.optim.AdamW. `pip install bitsandbytes` (CUDA) to enable."
         )
     return torch.optim.AdamW(
-        params, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        groups, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
     )
 
 
@@ -531,6 +604,75 @@ def _build_optimizer_and_scheduler(
 # Post-training corruption and validation
 # ---------------------------------------------------------------------------
 
+def _clean_prefix_batch(
+    batch: dict, t: torch.Tensor, cfg: TrainConfig,
+) -> Optional[tuple[dict, torch.Tensor, int]]:
+    """Recast a host-side batch as one cached block-generation step.
+
+    Block-causal masking alone noises every block at the same level. The block
+    sampler instead denoises block k against *clean* earlier blocks whose K/V
+    were computed at t=0. This reproduces that state in a single forward: a
+    random block k keeps the sample's t, everything before it is frozen clean
+    and conditioned at t=0, and everything after it is cut off (the sampler
+    has not generated it, and block k could not attend to it anyway).
+
+    Returns ``(batch, t_per_byte, block_bytes)``, the batch truncated to the
+    end of block k with ``frozen_mask`` / ``loss_mask`` narrowed to that block,
+    or None when no block holds a supervisable byte.
+
+    ponytail: one block of loss per sequence, so clean_prefix_prob stays
+    small. BD3-LM-style clean+noisy concatenation supervises every block at
+    twice the length if this proves too thin.
+    """
+    patch = cfg.byte_patch_size if cfg.use_byte_patches else 1
+    block_bytes = int(torch.randint(
+        cfg.block_causal_min_size, cfg.block_causal_max_size + 1, (),
+    ))
+    # Whole patches, so the block grid the model derives matches this one.
+    block_bytes = -(-block_bytes // patch) * patch
+
+    attention = batch["attention_mask"].bool()
+    maskable = attention
+    if batch.get("loss_mask") is not None:
+        maskable = maskable & batch["loss_mask"].bool()
+    if batch.get("frozen_mask") is not None:
+        maskable = maskable & ~batch["frozen_mask"].bool()
+    # Only blocks with something to supervise: in SFT most early blocks are
+    # all prompt, and a step spent on one would train nothing.
+    columns = maskable.any(dim=0).nonzero().squeeze(1)
+    if columns.numel() == 0:
+        return None
+    blocks = torch.unique(columns // block_bytes)
+    start = int(blocks[torch.randint(blocks.numel(), ())]) * block_bytes
+    T = attention.shape[1]
+    end = min(T, start + block_bytes)
+
+    out = {
+        key: value[:, :end]
+        if torch.is_tensor(value) and value.dim() == 2 and value.shape[1] == T
+        else value
+        for key, value in batch.items()
+    }
+    in_block = torch.arange(end, device=attention.device) >= start
+    prefix = ~in_block
+    frozen = out.get("frozen_mask")
+    out["frozen_mask"] = (
+        prefix.expand(attention.shape[0], -1) if frozen is None
+        else frozen.bool() | prefix
+    )
+    loss_mask = out.get("loss_mask")
+    out["loss_mask"] = (
+        out["attention_mask"].bool() if loss_mask is None else loss_mask.bool()
+    ) & in_block
+    if out.get("correction_input_ids") is not None:
+        # A paired mistake left in the prefix would make the "clean" context wrong.
+        out["correction_input_ids"] = torch.where(
+            prefix, out["input_ids"], out["correction_input_ids"],
+        )
+    t_per_byte = t.unsqueeze(1) * in_block.to(device=t.device, dtype=t.dtype)
+    return out, t_per_byte, block_bytes
+
+
 def _prepare_training_state(
     batch: dict,
     input_ids: torch.Tensor,
@@ -539,8 +681,17 @@ def _prepare_training_state(
     cfg: TrainConfig,
     mask_token_id: int,
     schedule: CosineSchedule,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create a noisy input and the exact positions supervised by the loss."""
+    span_prob: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create a noisy input and the exact positions supervised by the loss.
+
+    Returns ``(noisy_ids, supervised, maskable)``. ``maskable`` is every
+    position the stage *could* supervise and is the NELBO denominator: in
+    pretraining it equals ``attention_mask``, in reasoning SFT / correction it
+    excludes the frozen prompt. Dividing by all valid positions there made the
+    loss scale -- and so the effective learning rate -- track each batch's
+    response-to-prompt ratio.
+    """
     device = input_ids.device
     loss_mask = batch.get("loss_mask")
     if loss_mask is None:
@@ -578,9 +729,11 @@ def _prepare_training_state(
 
     noisy_ids, is_masked = apply_mask(
         source_ids, t, mask_token_id, schedule, frozen_mask=frozen_mask,
+        span_size=cfg.byte_patch_size, span_prob=span_prob,
     )
-    supervised = (is_masked | source_ids.ne(input_ids)) & loss_mask & attention_mask
-    return noisy_ids, supervised
+    maskable = loss_mask & attention_mask
+    supervised = (is_masked | source_ids.ne(input_ids)) & maskable
+    return noisy_ids, supervised, maskable
 
 @torch.no_grad()
 def validate(
@@ -621,6 +774,7 @@ def validate(
     model_core = getattr(model, "_orig_mod", model)
     total_loss = 0.0
     count = 0
+    seen = 0
     use_amp = device.type in ("cuda", "xpu")
 
     # Fork the RNG so re-seeding does not perturb the training stream. CUDA
@@ -638,16 +792,24 @@ def validate(
                 attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
                 B, T = input_ids.shape
 
-                t = torch.rand(B, device=device)
+                # Low-discrepancy t: the additive golden-ratio sequence covers
+                # [0, 1) evenly for any number of samples, so the few hundred
+                # scored here no longer under- or over-sample the low-t tail
+                # where the MDLM weight is largest. A fixed grid would need
+                # the batch count in advance and skew whenever the loader ran
+                # short of max_batches.
+                t = ((seen + torch.arange(B, device=device)) * 0.6180339887498949 + 0.5) % 1.0
+                seen += B
                 if cfg is not None and cfg.training_stage == "correction":
                     t = t * cfg.correction_t_max
+                loss_valid_mask = attention_mask
                 if cfg is None:
                     masked_ids, is_masked = apply_mask(
                         input_ids, t, mask_token_id, schedule,
                         frozen_mask=~attention_mask,
                     )
                 else:
-                    masked_ids, is_masked = _prepare_training_state(
+                    masked_ids, is_masked, loss_valid_mask = _prepare_training_state(
                         batch, input_ids, attention_mask, t, cfg,
                         mask_token_id, schedule,
                     )
@@ -667,8 +829,10 @@ def validate(
                         masked_ids, t, attention_mask=attention_mask,
                         self_cond=self_cond,
                     )
+                    # Clean-vocab logits only, as in training (see train()).
                     loss = loss_fn(
-                        logits, input_ids, is_masked, t=t, valid_mask=attention_mask,
+                        logits[..., :model_core.config.vocab_size], input_ids,
+                        is_masked, t=t, valid_mask=loss_valid_mask,
                     )
 
                 total_loss += loss.item()
@@ -747,10 +911,14 @@ def generate_sample(
             is_masked = (ids == mask_token_id)
             ids = torch.where(is_masked, sampled, ids)
             if i + 1 < steps:
-                mask_prob_next = schedule.mask_prob(t_next)
-                rand = torch.rand(1, seq_len, device=device, generator=gen)
-                should_remask = rand < mask_prob_next
-                ids = torch.where(should_remask & is_masked, mask_token_id, ids)
+                # Shared with the real samplers so the monitor cannot drift
+                # from them again: it kept re-masking against p(t_next) alone
+                # after they moved to p(t_next) / p(t_curr), committing most
+                # of the canvas in the first few steps and under-selling the
+                # model in every logged sample.
+                ids = _remask_step(
+                    ids, is_masked, schedule, t_curr, t_next, mask_token_id, gen,
+                )
 
         # Invalid/incomplete UTF-8 is rendered as U+FFFD instead of raising.
         text = decode_byte_ids(ids[0].tolist(), errors="replace")
@@ -768,6 +936,8 @@ def _build_dataloader(
     paths: list[str],
     cfg: "TrainConfig",
     pad_token_id: int,
+    reshuffle_each_epoch: bool = False,
+    bucket_window: int = 0,
 ):
     """Construct a DataLoader, auto-selecting the fast pre-tokenized path.
 
@@ -807,6 +977,8 @@ def _build_dataloader(
         return make_pretokenized_dataloader(
             paths, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
             pad_token_id=pad_token_id,
+            reshuffle_each_epoch=reshuffle_each_epoch,
+            bucket_window=bucket_window,
         )
     if ".pt" in suffixes and len(suffixes) > 1:
         raise ValueError(
@@ -821,6 +993,8 @@ def _build_dataloader(
     return make_dataloader(
         paths, cfg.max_seq_len, cfg.batch_size, cfg.num_workers,
         pad_token_id=pad_token_id,
+        reshuffle_each_epoch=reshuffle_each_epoch,
+        bucket_window=bucket_window,
         post_training=post_training,
         assistant_separator=cfg.assistant_separator,
     )
@@ -850,6 +1024,10 @@ def train(cfg: TrainConfig) -> None:
         raise ValueError("correction_noise_prob must be between 0 and 1")
     if not 0.0 < cfg.correction_t_max <= 1.0:
         raise ValueError("correction_t_max must be in (0, 1]")
+    if not 0.0 <= cfg.span_mask_prob <= 1.0:
+        raise ValueError("span_mask_prob must be between 0 and 1")
+    if cfg.length_bucket_window < 0:
+        raise ValueError("length_bucket_window must be >= 0")
 
     # Device
     device = resolve_device(cfg.device)
@@ -884,6 +1062,10 @@ def train(cfg: TrainConfig) -> None:
         rope_scaling_factor=cfg.rope_scaling_factor,
         rope_original_max_seq_len=cfg.rope_original_max_seq_len,
         qk_norm=cfg.qk_norm,
+        # use_sub_norm was declared on TrainConfig but never forwarded, so
+        # `--use_sub_norm false` was silently ignored.
+        use_sub_norm=cfg.use_sub_norm,
+        int4_absmean=cfg.int4_absmean,
         block_causal_prob=cfg.block_causal_prob,
         block_causal_min_size=cfg.block_causal_min_size,
         block_causal_max_size=cfg.block_causal_max_size,
@@ -891,6 +1073,7 @@ def train(cfg: TrainConfig) -> None:
         topk_ratio=cfg.topk_ratio,
         dropout=cfg.dropout,
         t_embed_dim=cfg.t_embed_dim,
+        timestep_scale=cfg.timestep_scale,
         kv_cache_bits=cfg.kv_cache_bits,
         kv_cache_bos_bits=cfg.kv_cache_bos_bits,
         tie_embeddings=cfg.tie_embeddings,
@@ -898,6 +1081,7 @@ def train(cfg: TrainConfig) -> None:
         use_byte_patches=cfg.use_byte_patches,
         byte_patch_size=cfg.byte_patch_size,
         byte_local_kernel=cfg.byte_local_kernel,
+        byte_decoder_ffn=cfg.byte_decoder_ffn,
         N_think=cfg.N_think,
         think_prob=cfg.think_prob,
         use_moe=cfg.use_moe,
@@ -929,6 +1113,7 @@ def train(cfg: TrainConfig) -> None:
             randomize_loops=cfg.rdt_randomize_loops,
             adaptive_loops=cfg.rdt_adaptive_loops,
             loop_specific_norms=cfg.rdt_loop_specific_norms,
+            learned_loop_embedding=cfg.rdt_learned_loop_embedding,
         )
         base["context_adaptive_loops"] = cfg.rdt_context_adaptive_loops
         base["context_loop_threshold"] = cfg.rdt_context_loop_threshold
@@ -958,6 +1143,16 @@ def train(cfg: TrainConfig) -> None:
             device="cpu",
             trust_checkpoint=cfg.trust_checkpoint,
         )
+        # No tensor depends on timestep_scale, so load_state_dict cannot catch
+        # a mismatch; the noise embedding would just be fed a scale it was
+        # never fit to. A stored config without the key predates it (1.0).
+        stored_scale = (checkpoint.get("model_config") or {}).get("timestep_scale", 1.0)
+        if stored_scale != model_cfg.timestep_scale:
+            raise ValueError(
+                f"Fine-tuning checkpoint was trained with timestep_scale={stored_scale}, "
+                f"but this run uses {model_cfg.timestep_scale}. "
+                f"Pass --timestep_scale {stored_scale}."
+            )
         incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         allowed_new_keys = {"self_cond_proj.weight"}
         missing = set(incompatible.missing_keys) - allowed_new_keys
@@ -978,7 +1173,9 @@ def train(cfg: TrainConfig) -> None:
     logger.info("Parameter breakdown: %s", param_info)
 
     # Optional torch.compile — large one-time cost, significant steady-state gain
-    if cfg.compile_model:
+    # On by default. Skipped on CPU: those runs are smoke tests, and the
+    # compile would cost far more than the handful of steps it speeds up.
+    if cfg.compile_model and device.type != "cpu":
         model = _compile_model(model, device, dynamic=True)
 
     # Data
@@ -988,8 +1185,11 @@ def train(cfg: TrainConfig) -> None:
         raise FileNotFoundError(f"No training files found matching: {cfg.train_data}")
     logger.info("Training files: %d, Validation files: %d", len(train_paths), len(val_paths))
 
+    # Train only: the validation loader must keep one fixed order (see
+    # data._epoch_shuffle_seed). litdata reshuffles per epoch on its own.
     train_loader = _build_dataloader(
-        train_paths, cfg, pad_token_id
+        train_paths, cfg, pad_token_id, reshuffle_each_epoch=True,
+        bucket_window=cfg.length_bucket_window,
     )
     val_loader = None
     if val_paths:
@@ -998,8 +1198,17 @@ def train(cfg: TrainConfig) -> None:
         )
 
     # Loss, optimizer, scheduler
-    loss_fn = MaskDiffusionLoss(weighting=cfg.loss_weighting, t_min=cfg.loss_t_min)
-    logger.info("Loss weighting: %s (t_min=%.1e)", cfg.loss_weighting, cfg.loss_t_min)
+    # Correction also supervises *visible* wrong bytes. The MDLM weight ~2/t is
+    # self-bounding only for masked positions, whose count shrinks with t^2;
+    # on visible ones it reaches ~2000 at t_min, so the lowest-noise tenth of
+    # samples carried about two thirds of the weight. Plain mean CE is the
+    # bounded choice there.
+    loss_weighting = cfg.loss_weighting
+    if cfg.training_stage == "correction" and loss_weighting != "uniform":
+        logger.info("Correction stage: overriding loss_weighting=%s with uniform.", loss_weighting)
+        loss_weighting = "uniform"
+    loss_fn = MaskDiffusionLoss(weighting=loss_weighting, t_min=cfg.loss_t_min)
+    logger.info("Loss weighting: %s (t_min=%.1e)", loss_weighting, cfg.loss_t_min)
     schedule = CosineSchedule()
     act_schedule = ActivationSchedule(cfg.max_steps, cfg.a4_warmup_fraction)
     logger.info("Activation schedule: %s", act_schedule)
@@ -1128,13 +1337,27 @@ def train(cfg: TrainConfig) -> None:
             if global_step >= cfg.max_steps:
                 break
 
+            # Read on the host, before the copy: asking the device would cost
+            # a sync on every micro-step.
+            unpadded = bool(batch["attention_mask"].all())
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)  # (B, T) bool
             B, T = input_ids.shape
 
+            # Low-discrepancy t (as in MDLM): one random offset per optimizer
+            # step, with that step's B * grad_accum_steps samples spread
+            # evenly over [0, 1). Independent draws left each update's mix of
+            # noise levels to chance, and under the ~2/t loss weight a step
+            # that happened to draw low t looked nothing like one that did not.
+            if step_in_accum == 0:
+                t_offset = torch.rand((), device=device)
+            t = (
+                t_offset
+                + (step_in_accum * B + torch.arange(B, device=device))
+                / (B * cfg.grad_accum_steps)
+            ) % 1.0
             # Correction fine-tuning concentrates on partially corrupted states;
             # ordinary pre-training and reasoning SFT retain the full noise range.
-            t = torch.rand(B, device=device)
             if cfg.training_stage == "correction":
                 t = t * cfg.correction_t_max
 
@@ -1146,6 +1369,23 @@ def train(cfg: TrainConfig) -> None:
                 think_schedule is not None
                 and torch.rand(1).item() < model_cfg.think_prob
             )
+
+            # --- Clean-prefix block step (see _clean_prefix_batch) ---
+            t_model = t
+            block_bytes = 0
+            if (
+                cfg.clean_prefix_prob > 0.0
+                and not use_thinking
+                and torch.rand(1).item() < cfg.clean_prefix_prob
+            ):
+                recast = _clean_prefix_batch(batch, t, cfg)
+                if recast is not None:
+                    batch, t_model, block_bytes = recast
+                    unpadded = bool(batch["attention_mask"].all())
+                    input_ids = batch["input_ids"].to(device)
+                    attention_mask = batch["attention_mask"].to(device)
+                    B, T = input_ids.shape
+
             if use_thinking:
                 # Prepend N_think think tokens to the sequence
                 think_prefix = think_schedule.make_think_prefix(B, device)
@@ -1156,6 +1396,7 @@ def train(cfg: TrainConfig) -> None:
                 think_attn = torch.ones(B, model_cfg.N_think, dtype=torch.bool, device=device)
                 attention_mask = torch.cat([think_attn, attention_mask], dim=1)
 
+            loss_valid_mask = attention_mask
             if use_thinking:
                 # Legacy augmentation remains available for checkpoint-compatible
                 # experiments, but is bypassed by all post-training stages.
@@ -1163,7 +1404,7 @@ def train(cfg: TrainConfig) -> None:
                     input_ids, t, mask_token_id, schedule, frozen_mask=~attention_mask,
                 )
             else:
-                model_input_ids, supervised_mask = _prepare_training_state(
+                model_input_ids, supervised_mask, loss_valid_mask = _prepare_training_state(
                     batch=batch,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -1171,6 +1412,7 @@ def train(cfg: TrainConfig) -> None:
                     cfg=cfg,
                     mask_token_id=mask_token_id,
                     schedule=schedule,
+                    span_prob=cfg.span_mask_prob,
                 )
             running_masked_frac += (
                 supervised_mask.detach().float().mean() / cfg.grad_accum_steps
@@ -1183,8 +1425,10 @@ def train(cfg: TrainConfig) -> None:
                     with torch.no_grad():
                         previous_logits, _ = model(
                             model_input_ids,
-                            t,
+                            t_model,
                             attention_mask=attention_mask,
+                            unpadded=unpadded,
+                            block_causal_block_size=block_bytes,
                         )
                         self_cond = self_cond_vector(
                             previous_logits,
@@ -1192,20 +1436,33 @@ def train(cfg: TrainConfig) -> None:
                             model_cfg.vocab_size,
                         )
 
+                # block_bytes is 0 outside clean-prefix steps, which leaves the
+                # model's own block-causal coin flip in charge.
                 logits, aux_loss = model(
                     model_input_ids,
-                    t,
+                    t_model,
                     self_cond=self_cond,
                     attention_mask=attention_mask,
+                    unpadded=unpadded,
+                    block_causal_block_size=block_bytes,
                 )
+                # Normalise over the clean vocabulary only. MASK (and legacy
+                # THINK) are never targets and every sampler slices them off
+                # before its softmax, so including them here trained a
+                # different distribution from the one that gets sampled.
                 diffusion_loss = loss_fn(
-                    logits,
+                    logits[..., :model_cfg.vocab_size],
                     input_ids,
                     supervised_mask,
                     is_think=is_think,
                     t=t,
-                    valid_mask=attention_mask,
+                    valid_mask=loss_valid_mask,
                 )
+                # Length-bucketed batches carry the weight that keeps each
+                # document's share of the loss where random batching had it.
+                batch_weight = batch.get("loss_weight")
+                if batch_weight is not None:
+                    diffusion_loss = diffusion_loss * batch_weight.to(device)
                 # Total loss: diffusion + MoE load balance
                 moe_loss = aux_loss * model_cfg.aux_loss_weight if model_cfg.use_moe else 0.0
                 loss = (diffusion_loss + moe_loss) / cfg.grad_accum_steps

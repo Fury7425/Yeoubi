@@ -47,6 +47,10 @@ def _build_model_config(args: argparse.Namespace) -> ModelConfig:
 
     return ModelConfig(
         vocab_size=VOCAB_SIZE,
+        # Only reached for checkpoints with no embedded config, all of which
+        # predate the absmean INT4 scale.
+        int4_absmean=False,
+        timestep_scale=1.0,  # likewise: they predate the scaled embedding
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -228,7 +232,7 @@ def main() -> None:
     parser.add_argument("--topk_ratio", type=float, default=0.55)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--t_embed_dim", type=int, default=256)
-    parser.add_argument("--kv_cache_bits", type=int, default=3)
+    parser.add_argument("--kv_cache_bits", type=int, default=4)
     parser.add_argument("--kv_cache_bos_bits", type=int, default=4)
     parser.add_argument(
         "--thinking",

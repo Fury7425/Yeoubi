@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -112,13 +112,28 @@ class ModelConfig:
     # outlier-heavy tensor -- per-token absmax spends its range on the outlier
     # and collapses everything else. False reproduces pre-SubLN checkpoints.
     use_sub_norm: bool = True
+    # INT4 activation scale: BitNet a4.8's absmean (True) or the original
+    # per-token absmax (False). See quantization._int4_scale. Only the A4
+    # stage and A4 inference read it. Not topology -- no tensor changes shape
+    # -- but a checkpoint must be sampled with the scale it was trained on,
+    # so pre-change checkpoints back-fill False.
+    int4_absmean: bool = True
     # During training, optionally replace full bidirectional attention with a
     # block-causal mask matching cached block-diffusion inference.
     block_causal_prob: float = 0.0
     block_causal_min_size: int = 128
     block_causal_max_size: int = 512
     t_embed_dim: int = 256
-    kv_cache_bits: int = 3
+    # Multiplier on t before the sinusoidal noise embedding. With t in [0, 1]
+    # and frequencies in [1e-4, 1] every angle stays under 1 rad: no channel
+    # completes a period and about five in six sit within 0.1 of a constant,
+    # so the MLP had to amplify a nearly flat input. 1000 is the standard
+    # diffusion scaling (angles from 0.1 to 1000 rad). No tensor changes
+    # shape, but the embedding MLP is fit to one scale, so pre-change
+    # checkpoints back-fill 1.0.
+    timestep_scale: float = 1000.0
+    # 4, not 3: "3-bit" packs 2 values/byte, so same storage with half the levels.
+    kv_cache_bits: int = 4
     kv_cache_bos_bits: int = 4
 
     # Tie the input embedding and the unembedding (output) head so they share
@@ -155,6 +170,10 @@ class ModelConfig:
     use_byte_patches: bool = False
     byte_patch_size: int = 4
     byte_local_kernel: int = 15
+    # One SwiGLU FFN at byte resolution in the patch decoder (see
+    # BytePatchCodec). Adds parameters, so False keeps existing checkpoint
+    # topology; new runs enable it explicitly.
+    byte_decoder_ffn: bool = False
 
     # --- Recurrent-Depth Transformer (OpenMythos integration) ---
     use_rdt: bool = False  # discriminator for checkpoint topology validation
@@ -199,6 +218,8 @@ class ModelConfig:
             raise ValueError(f"ffn_dim must be positive, got {self.ffn_dim}")
         if self.t_embed_dim < 2:
             raise ValueError(f"t_embed_dim must be at least 2, got {self.t_embed_dim}")
+        if self.timestep_scale <= 0:
+            raise ValueError(f"timestep_scale must be positive, got {self.timestep_scale}")
         if self.byte_patch_size < 1:
             raise ValueError(
                 f"byte_patch_size must be at least 1, got {self.byte_patch_size}"
@@ -565,13 +586,17 @@ class NoiseEmbedding(nn.Module):
 
     Args:
         embed_dim: Output embedding dimension.
+        scale: Multiplier on t before the sinusoids (see
+               ``ModelConfig.timestep_scale``). A bare module keeps the
+               legacy 1.0; the models pass the configured value.
     """
 
-    def __init__(self, embed_dim: int = 256):
+    def __init__(self, embed_dim: int = 256, scale: float = 1.0):
         super().__init__()
         if embed_dim < 2:
             raise ValueError(f"embed_dim must be at least 2, got {embed_dim}")
         self.embed_dim = embed_dim
+        self.scale = scale
         half = embed_dim // 2
         freqs = torch.exp(
             -math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half
@@ -592,7 +617,7 @@ class NoiseEmbedding(nn.Module):
         Returns:
             (B, embed_dim) embedding tensor.
         """
-        args = t.unsqueeze(-1).float() * self.freqs.unsqueeze(0)
+        args = (t.unsqueeze(-1).float() * self.scale) * self.freqs
         emb = torch.cat([args.sin(), args.cos()], dim=-1)
         if self.embed_dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
@@ -654,27 +679,61 @@ class BytePatchCodec(nn.Module):
             groups=config.hidden_dim,
             bias=False,
         )
+        # Without this the whole byte decoder is linear (expand, skip, depthwise
+        # conv, norms): the global latent has to hold all patch_size byte
+        # distributions in linearly separable form. One SwiGLU at byte
+        # resolution is the cheapest nonlinearity; ffn_dim = hidden_dim
+        # because it runs on patch_size x the global positions, which makes it
+        # cost about 0.75 of one global block (a 4x FFN would cost ~3).
+        self.decoder_ffn = None
+        if config.byte_decoder_ffn:
+            self.decoder_ffn_norm = RMSNorm(config.hidden_dim)
+            self.decoder_ffn = BitFFN(replace(config, ffn_dim=config.hidden_dim))
         self.output_norm = RMSNorm(config.hidden_dim)
 
     @staticmethod
-    def _local_residual(x: torch.Tensor, norm: nn.Module, conv: nn.Conv1d) -> torch.Tensor:
-        local = norm(x).transpose(1, 2)
-        local = conv(local).transpose(1, 2)
+    def _local_residual(
+        x: torch.Tensor, norm: nn.Module, conv: nn.Conv1d, block_bytes: int = 0,
+    ) -> torch.Tensor:
+        local = norm(x)
+        B, T, D = local.shape
+        split = 0 < block_bytes < T
+        if split:
+            # Block-causal training: run the conv per block so it stops at
+            # block edges, exactly as in cached generation where each block is
+            # encoded alone against the conv's zero padding. Run across the
+            # whole canvas it reads neighbours the sampler never has, and
+            # carries later-block bytes back past the causal attention mask.
+            # Tail padding is zeros, which is what the conv pads with anyway.
+            pad = (-T) % block_bytes
+            if pad:
+                local = F.pad(local, (0, 0, 0, pad))
+            local = local.reshape(-1, block_bytes, D)
+        local = conv(local.transpose(1, 2)).transpose(1, 2)
+        if split:
+            local = local.reshape(B, -1, D)[:, :T]
         return x + local
 
     def encode(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        block_bytes: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Return ``(patch_latents, local_skip, original_length)``."""
+        """Return ``(patch_latents, local_skip, original_length)``.
+
+        ``block_bytes`` > 0 confines the local conv to blocks of that many
+        bytes (a multiple of ``patch_size``); see ``_local_residual``.
+        """
         B, T, D = x.shape
         if D != self.hidden_dim:
             raise ValueError(f"Expected hidden dim {self.hidden_dim}, got {D}")
 
         subpos = torch.arange(T, device=x.device) % self.patch_size
         x = x + self.subposition[subpos].to(x.dtype).unsqueeze(0)
-        local_skip = self._local_residual(x, self.encoder_norm, self.encoder_local)
+        local_skip = self._local_residual(
+            x, self.encoder_norm, self.encoder_local, block_bytes,
+        )
         if attention_mask is not None:
             local_skip = local_skip * attention_mask.unsqueeze(-1).to(local_skip.dtype)
 
@@ -695,6 +754,7 @@ class BytePatchCodec(nn.Module):
         local_skip: torch.Tensor,
         original_length: int,
         attention_mask: Optional[torch.Tensor] = None,
+        block_bytes: int = 0,
     ) -> torch.Tensor:
         """Expand global patch states to byte positions and restore local detail."""
         B, _, D = patches.shape
@@ -708,9 +768,13 @@ class BytePatchCodec(nn.Module):
         x = (expanded + local_skip) * (2.0 ** -0.5)
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1).to(x.dtype)
-        x = self._local_residual(x, self.decoder_norm, self.decoder_local)
+        x = self._local_residual(x, self.decoder_norm, self.decoder_local, block_bytes)
         if attention_mask is not None:
             x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        if self.decoder_ffn is not None:
+            x = x + self.decoder_ffn(self.decoder_ffn_norm(x))
+            if attention_mask is not None:
+                x = x * attention_mask.unsqueeze(-1).to(x.dtype)
         return self.output_norm(x)
 
 
@@ -746,6 +810,13 @@ def block_causal_attention_mask(
     allowed = blocks[None, :] <= blocks[:, None]
     valid = valid_mask.to(torch.bool)
     return allowed.unsqueeze(0).expand(B, -1, -1) & valid[:, :, None] & valid[:, None, :]
+
+
+def apply_int4_scale(module: nn.Module, absmean: bool) -> None:
+    """Select the INT4 activation scale on every quantizer in a model."""
+    for child in module.modules():
+        if isinstance(child, HybridQuantizer):
+            child.int4_absmean = absmean
 
 
 def install_runtime_attention_mask(module: nn.Module, mask: Optional[torch.Tensor]) -> None:
@@ -1303,7 +1374,9 @@ class BitBlock(nn.Module):
         """
         # Pre-norm + noise injection
         h = self.attn_norm(x)
-        h = h + self.t_proj(t_emb).unsqueeze(1)  # additive bias from t
+        t_bias = self.t_proj(t_emb)  # additive bias from t
+        # (B, D) for one noise level per sample, (B, T, D) for per-position.
+        h = h + (t_bias if t_bias.dim() == 3 else t_bias.unsqueeze(1))
         cache_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
         h = self.drop(self.attn(h, kv_cache=kv_cache, layer_idx=cache_idx, rope_offset=rope_offset))
         x = x + h
@@ -1351,7 +1424,7 @@ class BitDiffusionTransformer(nn.Module):
         self.embed_drop = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
         # Noise level embedding
-        self.noise_embed = NoiseEmbedding(config.t_embed_dim)
+        self.noise_embed = NoiseEmbedding(config.t_embed_dim, config.timestep_scale)
 
         if config.use_byte_patches:
             self.byte_codec = BytePatchCodec(config)
@@ -1374,6 +1447,7 @@ class BitDiffusionTransformer(nn.Module):
 
         # Save original activation modes for stage switching
         self._save_original_modes()
+        apply_int4_scale(self, config.int4_absmean)
 
         self.apply(self._init_weights)
         self._scale_residual_init(config.n_layers)
@@ -1447,12 +1521,16 @@ class BitDiffusionTransformer(nn.Module):
         self_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         block_causal_block_size: int = 0,
+        unpadded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
             input_ids: (B, T) token IDs (may contain mask tokens).
-            t: (B,) noise levels per sample.
+            t: (B,) noise levels per sample, or (B, T) per byte for
+               clean-prefix block training (constant inside each patch).
+            unpadded: Caller's promise that no position is padding, so plain
+                      bidirectional attention may run with no mask at all.
             kv_cache: Optional KVCache for inference.
             rope_offset: Position offset for RoPE (used in block diffusion
                          to give correct absolute positions when forwarding
@@ -1481,6 +1559,23 @@ class BitDiffusionTransformer(nn.Module):
             x = x + self.self_cond_proj(self_cond) * attention_mask.unsqueeze(-1).to(x.dtype)
         x = self.embed_drop(x)
 
+        patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
+        if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
+            # Plain host RNG: the old version hashed t on-device and cost two
+            # GPU syncs per step to recover one coin flip. This is a training
+            # augmentation, not something a checkpoint has to reproduce.
+            if random.random() < self.config.block_causal_prob:
+                block_causal_block_size = random.randint(
+                    self.config.block_causal_min_size, self.config.block_causal_max_size
+                )
+        # Settled before the codec runs: its local convs have to stop at the
+        # same block edges the attention mask enforces.
+        global_block_size = (
+            max(1, math.ceil(block_causal_block_size / patch_size))
+            if block_causal_block_size > 0 else 0
+        )
+        block_bytes = global_block_size * patch_size
+
         local_skip = None
         original_length = x.shape[1]
         global_rope_offset = rope_offset
@@ -1494,30 +1589,27 @@ class BitDiffusionTransformer(nn.Module):
                 if kv_cache is not None
                 else rope_offset // self.config.byte_patch_size
             )
-            x, local_skip, original_length = self.byte_codec.encode(x, attention_mask)
+            x, local_skip, original_length = self.byte_codec.encode(
+                x, attention_mask, block_bytes,
+            )
 
-        global_attention_mask = patch_attention_mask(
-            attention_mask,
-            self.config.byte_patch_size if self.config.use_byte_patches else 1,
-        )
-        runtime_mask: torch.Tensor = global_attention_mask
-        if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
-            # Plain host RNG: the old version hashed t on-device and cost two
-            # GPU syncs per step to recover one coin flip. This is a training
-            # augmentation, not something a checkpoint has to reproduce.
-            if random.random() < self.config.block_causal_prob:
-                block_causal_block_size = random.randint(
-                    self.config.block_causal_min_size, self.config.block_causal_max_size
-                )
-        if block_causal_block_size > 0:
-            patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
-            global_block_size = max(1, math.ceil(block_causal_block_size / patch_size))
+        global_attention_mask = patch_attention_mask(attention_mask, patch_size)
+        # An all-True key mask is mathematically a no-op, but handing SDPA any
+        # mask rules out its mask-free kernels. Only the caller can know the
+        # batch is unpadded without a device sync, hence the flag.
+        runtime_mask: Optional[torch.Tensor] = None if unpadded else global_attention_mask
+        if global_block_size > 0:
             runtime_mask = block_causal_attention_mask(global_attention_mask, global_block_size)
         # Cached generation builds a longer key sequence than the current
         # byte mask describes; its committed cache contains no padding.
         install_runtime_attention_mask(self, runtime_mask if kv_cache is None else None)
 
-        t_emb = self.noise_embed(t)  # (B, t_embed_dim)
+        if t.dim() == 2:
+            # Per-byte noise levels (clean-prefix block training); the global
+            # stack is conditioned per patch. Callers keep t constant inside
+            # a patch, so the first byte speaks for it.
+            t = t[:, ::patch_size]
+        t_emb = self.noise_embed(t)  # (B, t_embed_dim) or (B, P, t_embed_dim)
 
         total_aux_loss = x.new_zeros(())
         use_ckpt = self.config.gradient_checkpointing and self.training
@@ -1535,7 +1627,9 @@ class BitDiffusionTransformer(nn.Module):
 
         x = self.final_norm(x)
         if self.config.use_byte_patches:
-            x = self.byte_codec.decode(x, local_skip, original_length, attention_mask)
+            x = self.byte_codec.decode(
+                x, local_skip, original_length, attention_mask, block_bytes,
+            )
         x = x * attention_mask.unsqueeze(-1).to(x.dtype)
         logits = self.unembed(x)
         return logits, total_aux_loss

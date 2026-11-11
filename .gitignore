@@ -55,6 +55,7 @@ data/train/
 data/val/
 data/hf_shards/
 data/tmp/
+data/colab/
 
 # OS files
 .DS_Store

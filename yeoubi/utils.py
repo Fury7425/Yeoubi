@@ -41,6 +41,9 @@ _MODEL_TOPOLOGY_FIELDS = (
     "use_sub_norm",
     "mask_token_id",
     "t_embed_dim",
+    # Not a shape, but resuming at another scale silently breaks the noise
+    # embedding, so it gets the same clear resume-time error.
+    "timestep_scale",
     "tie_embeddings",
     "use_self_cond",
     "N_think",
@@ -53,6 +56,7 @@ _MODEL_TOPOLOGY_FIELDS = (
     "use_byte_patches",
     "byte_patch_size",
     "byte_local_kernel",
+    "byte_decoder_ffn",
 )
 
 
@@ -245,8 +249,18 @@ def read_checkpoint(
 # use_sub_norm defaults True, so a pre-SubLN checkpoint would build attn/ffn
 # sub-norms that its state dict has no entries for. Back-fill the pre-change
 # value instead, so old checkpoints keep loading and only new runs opt in.
+#
+# int4_absmean: checkpoints written before the a4.8 absmean scale learned
+# their A4 stage against per-token absmax; sampling them with absmean would
+# feed every INT4 layer a differently scaled input.
+#
+# timestep_scale: the noise-embedding MLP of an older checkpoint was fit to
+# unscaled t; feeding it t * 1000 would hand every block a conditioning vector
+# it never saw.
 _LEGACY_MODEL_CONFIG_DEFAULTS = {
     "use_sub_norm": False,
+    "int4_absmean": False,
+    "timestep_scale": 1.0,
 }
 
 
@@ -323,6 +337,7 @@ _RDT_TOPOLOGY_FIELDS = (
     "lora_rank",
     "loop_dim",
     "loop_specific_norms",
+    "learned_loop_embedding",
 )
 
 

@@ -41,7 +41,12 @@ from .model import (
     NoiseEmbedding,
     RMSNorm,
 )
-from .model import block_causal_attention_mask, install_runtime_attention_mask, patch_attention_mask
+from .model import (
+    apply_int4_scale,
+    block_causal_attention_mask,
+    install_runtime_attention_mask,
+    patch_attention_mask,
+)
 from .byte_codec import PAD_TOKEN_ID
 from .quantization import KVCache
 
@@ -86,6 +91,13 @@ class RDTConfig(ModelConfig):
     adaptive_loops: bool = False
     min_loop_iters: int = 1
     loop_specific_norms: bool = False
+    # Learned per-iteration vector instead of the sinusoid of
+    # loop_idx / (max_loop_iters - 1). That fraction never exceeds 1, so
+    # against frequencies in [1e-4, 1] the sinusoid is close to the same
+    # (sin~0, cos~1) vector for every loop; a table with max_loop_iters rows
+    # says "which loop" directly. False keeps legacy checkpoint topology; new
+    # runs enable it explicitly.
+    learned_loop_embedding: bool = False
     # Long inputs receive at least one additional refinement visit per
     # doubling beyond this byte length, even at low diffusion noise.
     context_adaptive_loops: bool = False
@@ -267,6 +279,7 @@ def loop_index_inject(
     loop_proj: nn.Linear,
     loop_proj2: nn.Linear,
     loop_dim: int = 64,
+    loop_embed: Optional[nn.Embedding] = None,
 ) -> torch.Tensor:
     """Compute the loop-index + timestep conditioning delta.
 
@@ -295,24 +308,31 @@ def loop_index_inject(
     device = x.device
     dtype = x.dtype
 
-    # Sinusoidal encoding of the loop fraction
-    half = loop_dim // 2
-    frac = loop_idx / max(max_loop_iters - 1, 1)  # [0, 1]
-    freqs = torch.arange(half, device=device, dtype=torch.float32) / half
-    freqs = torch.exp(-math.log(10000.0) * freqs)
-    angle = frac * freqs  # (half,)
-    loop_signal = torch.cat([angle.sin(), angle.cos()], dim=0)  # (loop_dim,)
-    loop_signal = loop_signal.to(dtype)
+    if loop_embed is not None:
+        # Learned table (RDTConfig.learned_loop_embedding). Clamp the index for
+        # depth extrapolation, like the per-loop alpha and LoRA gate.
+        idx = min(loop_idx, loop_embed.num_embeddings - 1)
+        loop_signal = loop_embed.weight[idx].to(dtype)  # (loop_dim,)
+    else:
+        # Legacy sinusoidal encoding of the loop fraction
+        half = loop_dim // 2
+        frac = loop_idx / max(max_loop_iters - 1, 1)  # [0, 1]
+        freqs = torch.arange(half, device=device, dtype=torch.float32) / half
+        freqs = torch.exp(-math.log(10000.0) * freqs)
+        angle = frac * freqs  # (half,)
+        loop_signal = torch.cat([angle.sin(), angle.cos()], dim=0)  # (loop_dim,)
+        loop_signal = loop_signal.to(dtype)
 
     # Timestep-conditioned scale/bias: (B, loop_dim)
     t_scale = loop_proj(t_emb)   # (B, loop_dim)
     t_bias  = loop_proj2(t_emb)  # (B, loop_dim)
 
-    # Combined: (B, loop_dim)
-    combined = loop_signal.unsqueeze(0) * t_scale + t_bias
+    # Combined: (B, loop_dim), or (B, T, loop_dim) with per-position t_emb
+    combined = loop_signal * t_scale + t_bias
 
     # Expand to (B, T, loop_dim) and zero-pad to (B, T, D)
-    combined = combined.unsqueeze(1).expand(B, T, loop_dim)
+    if combined.dim() == 2:
+        combined = combined.unsqueeze(1).expand(B, T, loop_dim)
     delta = torch.zeros(B, T, D, device=device, dtype=dtype)
     delta[..., :loop_dim] = combined
     return delta
@@ -371,6 +391,8 @@ class BitRecurrentBlock(nn.Module):
         # for stable conditioning; not ternary).
         self.loop_proj  = nn.Linear(config.t_embed_dim, config.loop_dim, bias=False)
         self.loop_proj2 = nn.Linear(config.t_embed_dim, config.loop_dim, bias=True)
+        if config.learned_loop_embedding:
+            self.loop_embed = nn.Embedding(config.max_loop_iters, config.loop_dim)
 
         if config.loop_specific_norms:
             self.loop_norms = nn.ModuleList([
@@ -420,6 +442,9 @@ class BitRecurrentBlock(nn.Module):
         all_w: list[torch.Tensor] = []
 
         use_ckpt = self.config.gradient_checkpointing and self.training
+        # Checkpoint every Nth *virtual* layer (each recurrent visit counts),
+        # matching BitDiffusionTransformer. RDT used to ignore this knob.
+        gc_n = max(1, self.config.gc_every_n_layers)
 
         for i in range(n_loops):
             # Inject combined loop-index + timestep signal into h
@@ -430,6 +455,7 @@ class BitRecurrentBlock(nn.Module):
             delta = loop_index_inject(
                 h, i, self.config.max_loop_iters, t_emb,
                 self.loop_proj, self.loop_proj2, self.config.loop_dim,
+                loop_embed=getattr(self, "loop_embed", None),
             )
             h = h + delta
 
@@ -446,7 +472,7 @@ class BitRecurrentBlock(nn.Module):
                     + i * self.config.recurrent_layers
                     + block_offset
                 )
-                if use_ckpt:
+                if use_ckpt and cache_idx % gc_n == 0:
                     block_out, aux = grad_checkpoint(
                         block, block_out, t_emb, kv_cache, rope_offset, cache_idx,
                         use_reentrant=False,
@@ -539,7 +565,7 @@ class BitRDTTransformer(nn.Module):
 
         self.embed = nn.Embedding(vocab_total, config.hidden_dim)
         self.embed_drop = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
-        self.noise_embed = NoiseEmbedding(config.t_embed_dim)
+        self.noise_embed = NoiseEmbedding(config.t_embed_dim, config.timestep_scale)
 
         if config.use_byte_patches:
             self.byte_codec = BytePatchCodec(config)
@@ -588,6 +614,7 @@ class BitRDTTransformer(nn.Module):
         self.unembed = nn.Linear(config.hidden_dim, vocab_total, bias=False)
 
         self._save_original_modes()
+        apply_int4_scale(self, config.int4_absmean)
         self.apply(self._init_weights)
         # Scale for parameter visits rather than physical storage depth.
         n_residual = (
@@ -601,6 +628,12 @@ class BitRDTTransformer(nn.Module):
 
         if config.use_self_cond:
             nn.init.zeros_(self.self_cond_proj.weight)
+
+        if config.learned_loop_embedding:
+            # Unit scale, like the sinusoid it replaces: the generic 0.02
+            # embedding init above would start the multiplicative loop x
+            # timestep path about 50x weaker.
+            nn.init.normal_(self.recurrent.loop_embed.weight, std=1.0)
 
         # Tie input embedding and unembedding head (see ModelConfig.tie_embeddings).
         # Both `embed.weight` and `unembed.weight` keys are still serialized,
@@ -688,12 +721,14 @@ class BitRDTTransformer(nn.Module):
         self_cond: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         block_causal_block_size: int = 0,
+        unpadded: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
             input_ids: (B, T) token IDs (may contain mask tokens).
-            t: (B,) noise levels in [0, 1].
+            t: (B,) noise levels in [0, 1], or (B, T) per byte for
+               clean-prefix block training (constant inside each patch).
             kv_cache: Optional KVCache for inference (block diffusion).
             rope_offset: Position offset for RoPE (block diffusion).
             n_loops: Override the number of recurrence iterations. If None,
@@ -735,7 +770,28 @@ class BitRDTTransformer(nn.Module):
                 )
             x = x + self.self_cond_proj(self_cond) * attention_mask.unsqueeze(-1).to(x.dtype)
         x = self.embed_drop(x)
-        t_emb = self.noise_embed(t)
+        patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
+        if t.dim() == 2:
+            # Per-byte noise levels (clean-prefix block training); see
+            # BitDiffusionTransformer.forward.
+            t = t[:, ::patch_size]
+        t_emb = self.noise_embed(t)  # (B, t_embed_dim) or (B, P, t_embed_dim)
+
+        if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
+            # Plain host RNG: the old version hashed t on-device and cost two
+            # GPU syncs per step to recover one coin flip. This is a training
+            # augmentation, not something a checkpoint has to reproduce.
+            if random.random() < self.config.block_causal_prob:
+                block_causal_block_size = random.randint(
+                    self.config.block_causal_min_size, self.config.block_causal_max_size
+                )
+        # Settled before the codec runs: its local convs have to stop at the
+        # same block edges the attention mask enforces.
+        global_block_size = (
+            max(1, math.ceil(block_causal_block_size / patch_size))
+            if block_causal_block_size > 0 else 0
+        )
+        block_bytes = global_block_size * patch_size
 
         local_skip = None
         original_length = x.shape[1]
@@ -746,34 +802,28 @@ class BitRDTTransformer(nn.Module):
                 if kv_cache is not None
                 else rope_offset // self.config.byte_patch_size
             )
-            x, local_skip, original_length = self.byte_codec.encode(x, attention_mask)
+            x, local_skip, original_length = self.byte_codec.encode(
+                x, attention_mask, block_bytes,
+            )
 
-        global_attention_mask = patch_attention_mask(
-            attention_mask,
-            self.config.byte_patch_size if self.config.use_byte_patches else 1,
-        )
-        runtime_mask: torch.Tensor = global_attention_mask
-        if block_causal_block_size <= 0 and self.training and self.config.block_causal_prob > 0.0:
-            # Plain host RNG: the old version hashed t on-device and cost two
-            # GPU syncs per step to recover one coin flip. This is a training
-            # augmentation, not something a checkpoint has to reproduce.
-            if random.random() < self.config.block_causal_prob:
-                block_causal_block_size = random.randint(
-                    self.config.block_causal_min_size, self.config.block_causal_max_size
-                )
-        if block_causal_block_size > 0:
-            patch_size = self.config.byte_patch_size if self.config.use_byte_patches else 1
-            global_block_size = max(1, math.ceil(block_causal_block_size / patch_size))
+        global_attention_mask = patch_attention_mask(attention_mask, patch_size)
+        # See BitDiffusionTransformer.forward: no mask at all when the caller
+        # vouches for an unpadded batch and the step is plain bidirectional.
+        runtime_mask: Optional[torch.Tensor] = None if unpadded else global_attention_mask
+        if global_block_size > 0:
             runtime_mask = block_causal_attention_mask(global_attention_mask, global_block_size)
         install_runtime_attention_mask(self, runtime_mask if kv_cache is None else None)
 
         total_aux_loss = x.new_zeros(())
 
         use_ckpt = self.config.gradient_checkpointing and self.training
+        # Checkpoint every Nth *virtual* layer (each recurrent visit counts),
+        # matching BitDiffusionTransformer. RDT used to ignore this knob.
+        gc_n = max(1, self.config.gc_every_n_layers)
 
         # --- Prelude: standard BitBlocks, run once ---
         for block in self.prelude:
-            if use_ckpt:
+            if use_ckpt and block.layer_idx % gc_n == 0:
                 x, aux = grad_checkpoint(
                     block, x, t_emb, kv_cache, global_rope_offset, use_reentrant=False
                 )
@@ -785,7 +835,7 @@ class BitRDTTransformer(nn.Module):
 
         # --- Unique semantic bridge before recurrence ---
         for block in self.pre_recurrent:
-            if use_ckpt:
+            if use_ckpt and block.layer_idx % gc_n == 0:
                 x, aux = grad_checkpoint(
                     block, x, t_emb, kv_cache, global_rope_offset, use_reentrant=False
                 )
@@ -815,7 +865,7 @@ class BitRDTTransformer(nn.Module):
         )
         for bridge_idx, block in enumerate(self.post_recurrent):
             cache_idx = runtime_post_cache_start + bridge_idx
-            if use_ckpt:
+            if use_ckpt and cache_idx % gc_n == 0:
                 x, aux = grad_checkpoint(
                     block, x, t_emb, kv_cache, global_rope_offset, cache_idx,
                     use_reentrant=False,
@@ -831,7 +881,7 @@ class BitRDTTransformer(nn.Module):
         runtime_coda_cache_start = runtime_post_cache_start + self.config.post_recurrent_layers
         for coda_idx, block in enumerate(self.coda):
             cache_idx = runtime_coda_cache_start + coda_idx
-            if use_ckpt:
+            if use_ckpt and cache_idx % gc_n == 0:
                 x, aux = grad_checkpoint(
                     block, x, t_emb, kv_cache, global_rope_offset, cache_idx,
                     use_reentrant=False,
@@ -845,7 +895,9 @@ class BitRDTTransformer(nn.Module):
 
         x = self.final_norm(x)
         if self.config.use_byte_patches:
-            x = self.byte_codec.decode(x, local_skip, original_length, attention_mask)
+            x = self.byte_codec.decode(
+                x, local_skip, original_length, attention_mask, block_bytes,
+            )
         x = x * attention_mask.unsqueeze(-1).to(x.dtype)
         logits = self.unembed(x)
         return logits, total_aux_loss
@@ -867,6 +919,8 @@ class BitRDTTransformer(nn.Module):
 # unconditionally detached, and h_0 was always deterministic.
 _LEGACY_RDT_CONFIG_DEFAULTS = {
     "use_sub_norm": False,
+    "int4_absmean": False,
+    "timestep_scale": 1.0,
     "detach_recurrent_anchor": True,
     "recurrent_state_init_std": 0.0,
 }

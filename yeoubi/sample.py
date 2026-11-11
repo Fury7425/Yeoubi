@@ -85,6 +85,10 @@ def _build_model_config(args: argparse.Namespace) -> ModelConfig:
     n_think = args.n_think if args.thinking else 0
     return ModelConfig(
         vocab_size=VOCAB_SIZE,
+        # Only reached for checkpoints with no embedded config, all of which
+        # predate the absmean INT4 scale.
+        int4_absmean=False,
+        timestep_scale=1.0,  # likewise: they predate the scaled embedding
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
@@ -234,6 +238,42 @@ def _remask_step(
     return torch.where(should_remask, mask_token_id, ids)
 
 
+@torch.no_grad()
+def _revise_step(
+    ids: torch.Tensor,
+    logits: torch.Tensor,
+    is_masked: torch.Tensor,
+    vocab_size: int,
+    tau: float,
+    frozen: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Overwrite visible bytes the model confidently disagrees with.
+
+    Samplers otherwise only write MASK positions and ``_remask_step`` never
+    re-masks a committed byte, so an early mistake is permanent. The
+    ``correction`` training stage teaches exactly this repair: input byte
+    visible but wrong, target the clean byte. Overwriting in place reproduces
+    that input/target pair; re-masking would instead ask the absorbing-state
+    task, which never shows a re-masked clean byte.
+
+    Only ``~is_masked`` positions qualify: the logits were computed from the
+    canvas at the start of this step, so a decision is only meaningful for a
+    byte that was visible in that input — bytes sampled this step are not
+    revised in the same step. Frozen positions (prompt) are never touched.
+
+    Opt-in only: a checkpoint that never ran the correction stage has
+    unsupervised logits at visible positions (the loss covers masked ones
+    only), and correction training used ``t <= correction_t_max``, so callers
+    gate this on a low noise level. Raw logits, no temperature or top-p: this
+    is a confidence test, not a draw.
+    """
+    p, best = logits[..., :vocab_size].float().softmax(-1).max(-1)
+    revise = ~is_masked & (best != ids) & (p > tau)
+    if frozen is not None:
+        revise = revise & ~frozen
+    return torch.where(revise, best, ids)
+
+
 def denoise(
     model: BitDiffusionTransformer,
     prompt: str = "",
@@ -246,6 +286,8 @@ def denoise(
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
     n_loops: Optional[int] = None,
+    revise_threshold: float = 0.0,
+    revise_t_max: float = 0.5,
 ) -> list[str]:
     """Generate text via iterative diffusion denoising.
 
@@ -271,10 +313,15 @@ def denoise(
         verbose: Print intermediate sequences after each step.
         seed: Random seed.
         device: Torch device.
+        revise_threshold: Confidence above which a visible byte is overwritten
+            by the model's top byte (0.0 = off). See :func:`_revise_step`.
+        revise_t_max: Only revise on steps with ``t_curr <= revise_t_max``.
 
     Returns:
         List of generated text strings.
     """
+    if not 0.0 <= revise_threshold < 1.0:
+        raise ValueError(f"revise_threshold={revise_threshold} must be in [0.0, 1.0)")
     model.eval()
     schedule = CosineSchedule()
     mask_token_id = model.config.mask_token_id
@@ -335,6 +382,9 @@ def denoise(
             flat_probs = probs.view(-1, probs.shape[-1])
             sampled = torch.multinomial(flat_probs, 1, generator=gen).view(num_samples, total_len)
             ids = torch.where(is_masked, sampled, ids)
+
+        if revise_threshold > 0 and t_curr <= revise_t_max:
+            ids = _revise_step(ids, logits, is_masked, vocab_size, revise_threshold, frozen=frozen)
 
         # Re-mask positions that should still be uncertain at t_next
         if step_idx + 1 < steps:
@@ -703,7 +753,11 @@ class BlockDiffusionSampler:
         auto_length: bool = False,
         max_length: int = 2048,
         n_loops: Optional[int] = None,
+        revise_threshold: float = 0.0,
+        revise_t_max: float = 0.5,
     ):
+        if not 0.0 <= revise_threshold < 1.0:
+            raise ValueError(f"revise_threshold={revise_threshold} must be in [0.0, 1.0)")
         self.model = model
         self.block_size = block_size
         self.steps = steps
@@ -717,7 +771,22 @@ class BlockDiffusionSampler:
         self.auto_length = auto_length
         self.max_length = max_length
         self.n_loops = n_loops
+        self.revise_threshold = revise_threshold
+        self.revise_t_max = revise_t_max
         self.eos_token_id: Optional[int] = EOS_TOKEN_ID
+
+        # Every committed chunk must start on a patch boundary, or the codec's
+        # chunk-relative sub-positions drift from the patch grid seen in training.
+        cfg = model.config
+        self.patch_size = cfg.byte_patch_size if getattr(cfg, "use_byte_patches", False) else 1
+        if block_size % self.patch_size != 0:
+            raise ValueError(
+                f"block_size={block_size} must be a multiple of byte_patch_size={self.patch_size}"
+            )
+        if think_tokens > 0 and think_tokens % self.patch_size != 0:
+            raise ValueError(
+                f"think_tokens={think_tokens} must be a multiple of byte_patch_size={self.patch_size}"
+            )
 
     def _sample_masked(
         self,
@@ -744,6 +813,7 @@ class BlockDiffusionSampler:
         rope_offset: int,
         n_steps: int,
         gen: torch.Generator,
+        frozen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the diffusion denoising schedule on a single block.
 
@@ -757,6 +827,8 @@ class BlockDiffusionSampler:
             rope_offset: Absolute position offset for this block.
             n_steps: Number of denoising steps.
             gen: Random generator.
+            frozen: Optional (B, block_len) bool mask of positions that must
+                never be revised (carried prompt bytes).
 
         Returns:
             (B, block_len) denoised token IDs.
@@ -789,6 +861,11 @@ class BlockDiffusionSampler:
 
             is_masked = (block_ids == mask_token_id)
             block_ids = self._sample_masked(logits, is_masked, block_ids, gen)
+            if self.revise_threshold > 0 and t_curr <= self.revise_t_max:
+                block_ids = _revise_step(
+                    block_ids, logits, is_masked, self.model.config.vocab_size,
+                    self.revise_threshold, frozen=frozen,
+                )
             if step_idx + 1 < n_steps:
                 block_ids = _remask_step(
                     block_ids, is_masked, schedule, t_curr, t_next,
@@ -881,26 +958,47 @@ class BlockDiffusionSampler:
             bos_bits=config.kv_cache_bos_bits,
         )
 
-        # Commit prompt to cache at t=0 (if present)
-        if prefix_len > 0:
-            prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
+        # Commit only the patch-aligned part of the prompt. A partial patch
+        # committed here would sit mid-sequence (training only ever pads the
+        # final patch) and shift the patch grid of every later block, so the
+        # 0..patch-1 leftover bytes ride as fixed literals at the head of the
+        # first content block instead. The legacy thinking path keeps the
+        # old full-prompt commit.
+        commit_len = prefix_len
+        if self.think_tokens == 0:
+            commit_len = prefix_len // self.patch_size * self.patch_size
+        carry = prompt_ids[commit_len:]
+        if commit_len > 0:
+            prompt_tensor = torch.tensor(prompt_ids[:commit_len], dtype=torch.long, device=self.device)
             prompt_batch = prompt_tensor.unsqueeze(0).expand(num_samples, -1)
-            self._commit_block(prompt_batch, kv_cache, rope_offset=0)
+            # In block_size chunks, not one piece: block-causal training only
+            # shows blocks of bounded size whose local convs stop at the block
+            # edge, so a long prompt committed whole is a state the model was
+            # never trained on. block_size is a patch multiple, so every chunk
+            # but the last stays on the patch grid.
+            for start in range(0, commit_len, self.block_size):
+                self._commit_block(
+                    prompt_batch[:, start:start + self.block_size], kv_cache,
+                    rope_offset=start,
+                )
 
-        # Divide generation into blocks (capped at effective_max)
-        n_blocks = max(1, (effective_max + self.block_size - 1) // self.block_size)
+        # Divide generation into blocks (capped at effective_max); the carry
+        # occupies canvas space in the first block, hence the extra bytes.
+        n_blocks = max(1, (effective_max + len(carry) + self.block_size - 1) // self.block_size)
         all_generated: list[list[int]] = [[] for _ in range(num_samples)]
         block_texts: list[list[str]] = [[] for _ in range(num_samples)]
-        current_offset = prefix_len
+        current_offset = commit_len
         eos_hit = [False] * num_samples
 
         block_times: list[float] = []
 
         for block_idx in range(n_blocks):
+            n_carry = len(carry) if block_idx == 0 else 0
             remaining = effective_max - len(all_generated[0])
-            this_block_size = min(self.block_size, remaining)
-            if this_block_size <= 0:
+            n_new = min(self.block_size - n_carry, remaining)
+            if n_new <= 0:
                 break
+            this_block_size = n_new + n_carry
 
             block_t0 = time.perf_counter()
 
@@ -933,9 +1031,17 @@ class BlockDiffusionSampler:
                 (num_samples, this_block_size), mask_token_id,
                 dtype=torch.long, device=self.device,
             )
+            if n_carry:
+                # Non-MASK positions are never resampled, so these stay fixed.
+                block_ids[:, :n_carry] = torch.tensor(carry, dtype=torch.long, device=self.device)
+            carry_frozen = None
+            if n_carry:
+                # Carried bytes are prompt, not model output: never revise them.
+                carry_frozen = torch.zeros_like(block_ids, dtype=torch.bool)
+                carry_frozen[:, :n_carry] = True
             block_ids = self._denoise_block(
                 block_ids, kv_cache, rope_offset=current_offset,
-                n_steps=self.steps, gen=gen,
+                n_steps=self.steps, gen=gen, frozen=carry_frozen,
             )
 
             # Commit content block to cache
@@ -946,7 +1052,7 @@ class BlockDiffusionSampler:
             for b in range(num_samples):
                 if eos_hit[b]:
                     continue
-                block_token_list = block_ids[b].tolist()
+                block_token_list = block_ids[b, n_carry:].tolist()
 
                 # Auto-length: check for EOS in this block and truncate there
                 if self.auto_length and self.eos_token_id is not None:
@@ -971,7 +1077,7 @@ class BlockDiffusionSampler:
             if self.verbose:
                 # Log sample 0 as representative
                 if block_texts[0]:
-                    tok_per_s = this_block_size / max(block_elapsed, 1e-6)
+                    tok_per_s = n_new / max(block_elapsed, 1e-6)
                     logger.info(
                         "  committed[0]: %s  [%.2f s, %.0f tok/s]",
                         block_texts[0][-1][:160], block_elapsed, tok_per_s,
@@ -1030,7 +1136,7 @@ def main() -> None:
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--topk_ratio", type=float, default=0.55)
     parser.add_argument("--t_embed_dim", type=int, default=256)
-    parser.add_argument("--kv_cache_bits", type=int, default=3)
+    parser.add_argument("--kv_cache_bits", type=int, default=4)
     parser.add_argument("--kv_cache_bos_bits", type=int, default=4)
 
     # Thinking token args
@@ -1074,6 +1180,16 @@ def main() -> None:
         "--n_loops", type=int, default=None,
         help="Recurrence iterations for BitRDTTransformer (None = use checkpoint default). "
              "Set higher than trained max_loop_iters for inference-time depth extrapolation.",
+    )
+    # Self-correction args (full denoiser and --block)
+    parser.add_argument(
+        "--revise_threshold", type=float, default=0.0,
+        help="Overwrite a visible byte when the model's top byte differs with prob > this "
+             "(0.0 = off). Needs a checkpoint trained with --training_stage correction; try 0.9.",
+    )
+    parser.add_argument(
+        "--revise_t_max", type=float, default=0.5,
+        help="Only revise on steps with t <= this (match the training correction_t_max).",
     )
 
     # MoE args
@@ -1126,6 +1242,8 @@ def main() -> None:
             seed=args.seed,
             device=device,
             n_loops=args.n_loops,
+            revise_threshold=args.revise_threshold,
+            revise_t_max=args.revise_t_max,
         )
         t0 = time.perf_counter()
         results = sampler.generate(
@@ -1210,6 +1328,8 @@ def main() -> None:
             seed=args.seed,
             device=device,
             n_loops=args.n_loops,
+            revise_threshold=args.revise_threshold,
+            revise_t_max=args.revise_t_max,
         )
         wall_s = time.perf_counter() - t0
         n_tokens = args.num_samples * args.length

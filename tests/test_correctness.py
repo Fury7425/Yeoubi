@@ -313,6 +313,49 @@ class TestBlockSamplerMultiSample(unittest.TestCase):
                 self.assertIn("text", r)
                 self.assertIn("blocks", r)
 
+    def test_unaligned_prompt_carry_is_not_returned(self):
+        """A 5-byte prompt with 4-byte patches carries 1 byte into the first
+        block; it must stay fixed in the canvas and never reach the output."""
+        from yeoubi.sample import BlockDiffusionSampler
+
+        config = _small_config(vocab_size=258, mask_token_id=258, use_byte_patches=True)
+        model = BitDiffusionTransformer(config)
+        model.eval()
+        sampler = BlockDiffusionSampler(
+            model=model, block_size=8, steps=2, device=torch.device("cpu"),
+        )
+
+        canvases = []
+
+        def fake_denoise(block_ids, kv_cache, rope_offset, n_steps, gen, frozen=None):
+            canvases.append(block_ids.clone())
+            return torch.where(block_ids == config.mask_token_id, torch.zeros_like(block_ids), block_ids)
+
+        sampler._denoise_block = fake_denoise
+        r = sampler.generate(prompt="hello", gen_length=8)[0]
+
+        self.assertEqual(r["n_tokens"], 8)
+        self.assertEqual(r["text"], "\x00" * 8)
+        self.assertEqual(canvases[0][0, 0].item(), ord("o"))
+
+    def test_revise_step_only_overwrites_confident_visible_unfrozen(self):
+        """Revision replaces a visible byte only when the model confidently
+        prefers another one, and never touches frozen or masked positions."""
+        from yeoubi.sample import _revise_step
+
+        ids = torch.tensor([[1, 2, 3, 4]])
+        logits = torch.full((1, 4, 6), -20.0)
+        logits[0, 0, 0] = 20.0   # visible, confident different byte -> replace
+        logits[0, 1, 0] = 20.0   # confident different byte, but frozen
+        logits[0, 2, 0] = 20.0   # confident different byte, but masked
+        logits[0, 3, :5] = 0.0   # visible, uniform over 5 bytes -> p=0.2
+        logits[0, :, 5] = 50.0   # extra special column, must be sliced off
+        is_masked = torch.tensor([[False, False, True, False]])
+        frozen = torch.tensor([[False, True, False, False]])
+
+        out = _revise_step(ids, logits, is_masked, vocab_size=5, tau=0.9, frozen=frozen)
+        self.assertEqual(out.tolist(), [[0, 2, 3, 4]])
+
 
 # ---------------------------------------------------------------------------
 # 4. StreamingJsonlDataset — preserves per-document length (no rolling buffer)
@@ -490,6 +533,22 @@ class TestKVQuantizationZeroPoint(unittest.TestCase):
                 torch.equal(zeros, torch.zeros_like(zeros)),
                 f"{bits}-bit KV cache biased zero to {zeros.abs().max().item()}",
             )
+
+    def test_outlier_token_does_not_crush_neighbours(self):
+        from yeoubi.quantization import dequantize_kv, quantize_kv
+
+        torch.manual_seed(0)
+        # Bounded (not randn) so the half-level error bound is deterministic.
+        tensor = (torch.rand(1, 2, 8, 16) * 2 - 1) * 0.1
+        tensor[:, :, 3, :] *= 1000.0  # one outlier token
+        packed, scale = quantize_kv(tensor, bits=4)
+        out = dequantize_kv(packed, scale, bits=4, orig_last_dim=16)
+        keep = torch.ones(8, dtype=torch.bool)
+        keep[3] = False
+        err = (out - tensor)[:, :, keep, :].abs().max().item()
+        # Per-chunk scale (~14/level) rounded every neighbour to 0, error ~0.1;
+        # per-token keeps it within half a level (<= 0.1/14).
+        self.assertLess(err, 0.02)
 
 
 class TestDenoiseNeverUnmasksTwice(unittest.TestCase):
@@ -881,6 +940,392 @@ class TestLatentScaleIsTracked(unittest.TestCase):
         # Ternary pattern is scale-invariant: only the scale moved.
         self.assertAlmostEqual(after["weight/frac_zero"],
                                before["weight/frac_zero"], places=6)
+
+
+class TestTrainingMonitorTracksMaskSchedule(unittest.TestCase):
+    """generate_sample() must share the samplers' conditional re-mask.
+
+    It kept drawing against p(t_next) after the real samplers moved to
+    p(t_next)/p(t_curr), so every logged sample was committed at high noise.
+    """
+
+    def test_masked_fraction_follows_schedule(self):
+        from yeoubi.train import generate_sample
+
+        mask_id, vocab, length, steps = 258, 258, 4096, 10
+        committed = []
+
+        class StubModel:
+            training = False
+            config = SimpleNamespace(
+                mask_token_id=mask_id, vocab_size=vocab, use_self_cond=False,
+            )
+
+            def eval(self):
+                return self
+
+            def __call__(self, ids, t, **kwargs):
+                committed.append(int((ids != mask_id).sum()))
+                return torch.zeros(*ids.shape, vocab + 1), torch.zeros(())
+
+        generate_sample(StubModel(), mask_id, torch.device("cpu"),
+                        seq_len=length, steps=steps, temperature=1.0)
+
+        self.assertEqual(len(committed), steps)
+        for k, count in enumerate(committed):
+            # Uniform-in-mask-probability spacing: k/steps committed at step k.
+            # The old draw sat at 85% by step 5 instead of 50%.
+            self.assertLess(
+                abs(count - length * k / steps), 0.10 * length,
+                f"step {k}: {count} committed, schedule wants ~{length * k // steps}",
+            )
+
+
+class TestAdamWDecayGroups(unittest.TestCase):
+    """Weight decay belongs on matrices, never on norm gains or biases."""
+
+    def test_only_matrices_decay(self):
+        import yeoubi.train as train_mod
+
+        model = BitDiffusionTransformer(_small_config())
+        opt = train_mod._make_adamw(model.parameters(), train_mod.TrainConfig())
+
+        self.assertEqual(len(opt.param_groups), 2)
+        for group in opt.param_groups:
+            is_matrix = {p.ndim >= 2 for p in group["params"]}
+            self.assertEqual(len(is_matrix), 1, "group mixes 1D and 2D tensors")
+            self.assertEqual(group["weight_decay"] > 0, is_matrix.pop())
+
+    def test_resume_from_single_group_checkpoint_keeps_every_lr_live(self):
+        """A pre-split checkpoint has one AdamW group. Loading it must neither
+        raise nor strand the new no-decay group at its warmup-start lr of 0."""
+        import yeoubi.train as train_mod
+
+        cfg = train_mod.TrainConfig(use_muon=False, warmup_steps=2, max_steps=10)
+        model = BitDiffusionTransformer(_small_config())
+
+        old_opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+        old_sched = torch.optim.lr_scheduler.LambdaLR(old_opt, lambda step: 1.0)
+        old_opt.step()
+        old_sched.step()
+
+        opt, sched = train_mod._build_optimizer_and_scheduler(model, cfg)
+        opt.load_state_dict(old_opt.state_dict())
+        sched.load_state_dict(old_sched.state_dict())
+
+        lrs = [g["lr"] for g in opt.param_groups]
+        self.assertEqual(len(lrs), 2)
+        # Restored step 1 of a 2-step warmup: half of peak, on both groups.
+        for lr in lrs:
+            self.assertAlmostEqual(lr, cfg.lr * 0.5)
+
+
+class TestSftLossDenominator(unittest.TestCase):
+    """The frozen prompt can never be supervised, so it must not dilute the
+    NELBO denominator (the loss scale would then follow the prompt length)."""
+
+    def test_maskable_excludes_frozen_prompt(self):
+        import yeoubi.train as train_mod
+
+        cfg = train_mod.TrainConfig(training_stage="reasoning_sft")
+        ids = torch.arange(8).unsqueeze(0)
+        attention = torch.ones(1, 8, dtype=torch.bool)
+        prompt = torch.tensor([[True] * 5 + [False] * 3])
+        batch = {"frozen_mask": prompt, "loss_mask": ~prompt}
+
+        # t=1 masks every non-frozen position.
+        noisy, supervised, maskable = train_mod._prepare_training_state(
+            batch, ids, attention, torch.tensor([1.0]), cfg, 32, CosineSchedule(),
+        )
+
+        self.assertEqual(maskable.tolist(), (~prompt).tolist())
+        self.assertEqual(supervised.tolist(), (~prompt).tolist())
+        self.assertTrue(torch.equal(noisy[prompt], ids[prompt]))
+
+
+class TestRDTHonoursGcEveryN(unittest.TestCase):
+    """gc_every_n_layers used to be read only by the flat model."""
+
+    def test_checkpoints_every_nth_virtual_layer(self):
+        import yeoubi.rdt as rdt_mod
+        from yeoubi.rdt import BitRDTTransformer, RDTConfig
+
+        def build(every_n: int):
+            torch.manual_seed(0)
+            return BitRDTTransformer(RDTConfig(
+                hidden_dim=32, n_heads=4, ffn_dim=64, max_seq_len=32,
+                prelude_layers=2, pre_recurrent_layers=0, recurrent_layers=1,
+                post_recurrent_layers=0, coda_layers=2, max_loop_iters=2,
+                loop_dim=8, use_byte_patches=False, use_rdt=True,
+                gradient_checkpointing=True, gc_every_n_layers=every_n,
+            )).train()
+
+        ids, t = torch.randint(0, 255, (2, 8)), torch.rand(2)
+        calls: list[int] = []
+        real = rdt_mod.grad_checkpoint
+
+        def counting(fn, *args, **kwargs):
+            calls.append(1)
+            return real(fn, *args, **kwargs)
+
+        rdt_mod.grad_checkpoint = counting
+        try:
+            results = {}
+            for every_n in (1, 2):
+                calls.clear()
+                logits, _ = build(every_n)(ids, t, n_loops=2)
+                results[every_n] = (len(calls), logits.detach())
+        finally:
+            rdt_mod.grad_checkpoint = real
+
+        # Virtual layers: 2 prelude + 2 loop visits + 2 coda.
+        self.assertEqual(results[1][0], 6)
+        self.assertEqual(results[2][0], 3)
+        # Checkpointing trades memory for recompute; it must not move logits.
+        self.assertTrue(torch.allclose(results[1][1], results[2][1]))
+
+
+class TestEpochReshuffle(unittest.TestCase):
+    """Training reshuffles per epoch; validation keeps one fixed order."""
+
+    def test_only_opted_in_datasets_change_order_between_passes(self):
+        import json
+        import tempfile
+        from yeoubi.data import StreamingJsonlDataset
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as f:
+            for i in range(64):
+                f.write(json.dumps({"text": f"document number {i:03d}"}) + "\n")
+            path = f.name
+
+        def two_passes(**kw):
+            ds = StreamingJsonlDataset(
+                paths=[path], max_length=64, shuffle_buffer_size=16,
+                min_chunk_size=1, **kw,
+            )
+            return [[ex["input_ids"].tolist() for ex in ds] for _ in range(2)]
+
+        fixed = two_passes()
+        self.assertEqual(fixed[0], fixed[1], "validation order must not move")
+
+        moving = two_passes(reshuffle_each_epoch=True)
+        self.assertNotEqual(moving[0], moving[1], "epoch 2 replayed epoch 1")
+        self.assertEqual(sorted(moving[0]), sorted(moving[1]),
+                         "reshuffling must not drop or duplicate documents")
+
+
+class TestLengthBucketedBatches(unittest.TestCase):
+    """Bucketing removes padding without changing how documents are weighted."""
+
+    def test_batches_are_length_matched_and_keep_random_pairing_weights(self):
+        from yeoubi.data import LengthBucketedBatches
+
+        examples = [
+            {"input_ids": torch.zeros(n, dtype=torch.long)}
+            for n in (64, 8, 128, 16, 8, 128, 64, 16)
+        ]
+        batches = list(LengthBucketedBatches(examples, batch_size=2, window=8))
+
+        self.assertEqual(len(batches), 4)
+        self.assertEqual(sum(b["input_ids"].shape[0] for b in batches), 8)
+        for batch in batches:
+            self.assertTrue(batch["attention_mask"].all(), "bucketed batch still padded")
+
+        by_length = sorted(batches, key=lambda b: b["input_ids"].shape[1])
+        weights = [b["loss_weight"].item() for b in by_length]
+        # Random pairing gave a length-a document E_b[2a / (a + b)] of a
+        # batch. For a=8 against {8, 8, 16, 16, 64, 64, 128, 128}: 0.5016.
+        self.assertAlmostEqual(weights[0], 0.501634, places=4)
+        self.assertEqual(weights, sorted(weights), "longer documents must weigh more")
+        self.assertAlmostEqual(sum(weights) / len(weights), 1.0, places=5)
+
+
+class TestSpanMasking(unittest.TestCase):
+    def test_spans_mask_whole_groups_at_the_same_rate(self):
+        torch.manual_seed(0)
+        ids = torch.zeros(64, 4096, dtype=torch.long)
+        t = torch.full((64,), 0.5)
+        schedule = CosineSchedule()
+
+        def whole_groups(masked):
+            groups = masked.view(64, -1, 4)
+            return (groups.all(-1) | ~groups.any(-1)).all().item()
+
+        _, spans = apply_mask(ids, t, 258, schedule, span_size=4, span_prob=1.0)
+        self.assertTrue(whole_groups(spans))
+        # Same marginal mask probability per byte as plain masking.
+        self.assertAlmostEqual(
+            spans.float().mean().item(), float(schedule.mask_prob(t[0])), delta=0.02,
+        )
+
+        _, plain = apply_mask(ids, t, 258, schedule)
+        self.assertFalse(whole_groups(plain), "default must stay byte-level")
+
+
+class TestUnpaddedSkipsAttentionMask(unittest.TestCase):
+    def test_mask_dropped_only_when_caller_vouches(self):
+        model = BitDiffusionTransformer(_small_config()).eval()
+        ids, t = torch.randint(0, 32, (2, 8)), torch.rand(2)
+        attn = model.blocks[0].attn
+
+        with torch.no_grad():
+            model(ids, t)
+            self.assertIsNotNone(attn._runtime_attention_mask)
+            model(ids, t, unpadded=True)
+            self.assertIsNone(attn._runtime_attention_mask)
+            # Block-causal steps need their pairwise mask regardless.
+            model(ids, t, unpadded=True, block_causal_block_size=4)
+            self.assertEqual(attn._runtime_attention_mask.ndim, 3)
+
+
+class TestInt4AbsmeanScale(unittest.TestCase):
+    """BitNet a4.8 Eq. 7 scale, kept consistent with the packed path."""
+
+    def test_absmean_has_less_error_and_matches_integer_path(self):
+        from yeoubi.quantization import HybridQuantizer
+
+        torch.manual_seed(0)
+        x = torch.randn(64, 2048)
+        absmax, absmean = HybridQuantizer("int4"), HybridQuantizer("int4")
+        absmean.int4_absmean = True
+
+        def error(quantizer):
+            return (quantizer(x) - x).pow(2).mean().item()
+
+        # ~0.7x on Gaussian input; 0.9 leaves room for sampling noise.
+        self.assertLess(error(absmean), 0.9 * error(absmax))
+
+        x_int, scale = absmean.quantize_to_int(x)
+        self.assertLessEqual(x_int.abs().max().item(), 7)
+        self.assertTrue(torch.allclose(scale, 7 ** 0.5 / x.abs().mean(-1, keepdim=True)))
+        # Simulated and packed paths must dequantize to the same values.
+        self.assertTrue(torch.allclose(x_int.float() / scale, absmean(x)))
+
+    def test_model_follows_config_and_legacy_checkpoints_keep_absmax(self):
+        from dataclasses import asdict
+        from yeoubi.quantization import HybridQuantizer
+        from yeoubi.utils import resolve_checkpoint_model_config
+
+        for flag in (True, False):
+            model = BitDiffusionTransformer(_small_config(int4_absmean=flag))
+            flags = {m.int4_absmean for m in model.modules()
+                     if isinstance(m, HybridQuantizer)}
+            self.assertEqual(flags, {flag})
+
+        stored = asdict(_small_config())
+        stored.pop("int4_absmean")
+        cfg, _ = resolve_checkpoint_model_config({"model_config": stored})
+        self.assertFalse(cfg.int4_absmean, "pre-absmean checkpoint must keep absmax")
+
+
+class TestConditioningSignals(unittest.TestCase):
+    """Noise level and loop index must reach the model as usable signals."""
+
+    def test_timestep_scale_spreads_noise_levels(self):
+        from yeoubi.model import NoiseEmbedding
+        from yeoubi.utils import resolve_checkpoint_model_config
+
+        t = torch.tensor([0.30, 0.31])
+
+        def sinusoid_gap(scale):
+            emb = NoiseEmbedding(64, scale)
+            args = (t.unsqueeze(-1) * emb.scale) * emb.freqs
+            feats = torch.cat([args.sin(), args.cos()], dim=-1)
+            return (feats[0] - feats[1]).abs().max().item()
+
+        # Unscaled, neighbouring noise levels are almost the same input.
+        self.assertLess(sinusoid_gap(1.0), 0.02)
+        self.assertGreater(sinusoid_gap(1000.0), 0.5)
+
+        model = BitDiffusionTransformer(_small_config())
+        self.assertEqual(model.noise_embed.scale, 1000.0)
+
+        stored = asdict(_small_config())
+        stored.pop("timestep_scale")
+        cfg, _ = resolve_checkpoint_model_config({"model_config": stored})
+        self.assertEqual(cfg.timestep_scale, 1.0, "old checkpoint must keep unscaled t")
+
+    def test_learned_loop_embedding_distinguishes_loops(self):
+        from yeoubi.rdt import BitRDTTransformer, RDTConfig, loop_index_inject
+
+        base = asdict(_small_config())
+        base.update(prelude_layers=1, recurrent_layers=1, coda_layers=1,
+                    max_loop_iters=3, loop_dim=4)
+        self.assertFalse(hasattr(BitRDTTransformer(RDTConfig(**base)).recurrent, "loop_embed"),
+                         "legacy topology must not gain a parameter")
+
+        rec = BitRDTTransformer(RDTConfig(**base, learned_loop_embedding=True)).recurrent
+        x = torch.zeros(1, 2, base["hidden_dim"])
+        t_emb = torch.ones(1, base["t_embed_dim"])
+        deltas = [
+            loop_index_inject(x, i, 3, t_emb, rec.loop_proj, rec.loop_proj2, 4,
+                              loop_embed=rec.loop_embed)
+            for i in (0, 1, 2, 5)
+        ]
+        self.assertFalse(torch.allclose(deltas[0], deltas[1]))
+        # Depth extrapolation clamps to the last trained row.
+        self.assertTrue(torch.equal(deltas[2], deltas[3]))
+
+
+class TestCleanPrefixBlockTraining(unittest.TestCase):
+    """A clean-prefix training forward must compute, for the prefix, what the
+    block sampler's commit pass computes: nothing from the noisy block may
+    leak back through attention, the codec convs, or the noise conditioning."""
+
+    def test_prefix_logits_ignore_the_noisy_block(self):
+        from yeoubi.rdt import BitRDTTransformer, RDTConfig
+
+        cfg = _small_config(use_byte_patches=True, byte_local_kernel=3,
+                            byte_decoder_ffn=True)
+        rdt = asdict(cfg)
+        rdt.update(prelude_layers=1, recurrent_layers=1, coda_layers=1,
+                   max_loop_iters=2, loop_dim=4, learned_loop_embedding=True)
+
+        torch.manual_seed(0)
+        ids = torch.randint(0, 32, (2, 16))
+        t = torch.tensor([0.7, 0.4])
+        per_byte = torch.cat([torch.zeros(2, 8), t[:, None].expand(2, 8)], dim=1)
+
+        for model in (BitDiffusionTransformer(cfg), BitRDTTransformer(RDTConfig(**rdt))):
+            model.eval()
+            with torch.no_grad():
+                full, _ = model(ids, per_byte, block_causal_block_size=8)
+                alone, _ = model(ids[:, :8], torch.zeros(2))
+            self.assertTrue(
+                torch.allclose(full[:, :8], alone, atol=1e-5),
+                f"{type(model).__name__}: prefix saw the noisy block",
+            )
+
+    def test_clean_prefix_batch_isolates_one_block(self):
+        import yeoubi.train as train_mod
+
+        cfg = train_mod.TrainConfig(block_causal_min_size=8, block_causal_max_size=8)
+        prompt = torch.zeros(2, 32, dtype=torch.bool)
+        prompt[:, :16] = True
+        batch = {
+            "input_ids": torch.arange(64).reshape(2, 32),
+            "attention_mask": torch.ones(2, 32, dtype=torch.bool),
+            "frozen_mask": prompt,
+            "loss_mask": ~prompt,
+            "loss_weight": torch.tensor(1.0),
+        }
+        t = torch.tensor([0.3, 0.9])
+
+        out, t_per_byte, block_bytes = train_mod._clean_prefix_batch(batch, t, cfg)
+        end = out["input_ids"].shape[1]
+        start = end - 8
+
+        self.assertEqual(block_bytes, 8)
+        self.assertIn(start, (16, 24), "an all-prompt block has nothing to supervise")
+        self.assertTrue(out["frozen_mask"][:, :start].all())
+        self.assertFalse(out["frozen_mask"][:, start:].any())
+        self.assertFalse(out["loss_mask"][:, :start].any())
+        self.assertTrue(out["loss_mask"][:, start:].all())
+        self.assertTrue(torch.equal(t_per_byte[:, :start], torch.zeros(2, start)))
+        self.assertTrue(torch.equal(t_per_byte[:, start:], t[:, None].expand(2, 8)))
+        self.assertEqual(batch["input_ids"].shape[1], 32, "caller's batch must be untouched")
 
 
 if __name__ == "__main__":

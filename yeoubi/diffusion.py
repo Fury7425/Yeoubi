@@ -61,10 +61,20 @@ def apply_mask(
     mask_token_id: int,
     schedule: CosineSchedule,
     frozen_mask: torch.Tensor | None = None,
+    span_size: int = 1,
+    span_prob: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply absorbing-state masking to a batch of token sequences.
 
     Each sample in the batch uses its own noise level t, sampled per-sample.
+
+    With ``span_prob > 0`` a sample is, with that probability, masked in
+    whole ``span_size``-byte groups instead of byte by byte. Independent byte
+    masking leaves most masked bytes recoverable from neighbours inside the
+    same word (and the same byte patch), so the global stack gets little to
+    do at low and mid noise; a fully hidden group has to come from context.
+    Each byte's marginal mask probability is still ``mask_prob(t)``, so the
+    masked fraction and the loss weighting are unchanged in expectation.
 
     Args:
         token_ids: (B, T) tensor of original token IDs.
@@ -87,6 +97,14 @@ def apply_mask(
     # multi-byte character can be masked while adjacent bytes remain visible.
     # Intermediate/generated sequences can therefore be invalid UTF-8.
     rand = torch.rand(B, T, device=token_ids.device)
+    if span_size > 1 and span_prob > 0.0:
+        # ponytail: spans are fixed-width and grid-aligned (the byte patch).
+        # Variable-length spans are the upgrade if this proves too easy.
+        n_spans = -(-T // span_size)
+        span_rand = torch.rand(B, n_spans, device=token_ids.device)
+        span_rand = span_rand.repeat_interleave(span_size, dim=1)[:, :T]
+        use_span = torch.rand(B, 1, device=token_ids.device) < span_prob
+        rand = torch.where(use_span, span_rand, rand)
     is_masked = rand < mask_prob.unsqueeze(1)  # (B, T)
 
     if frozen_mask is not None:
