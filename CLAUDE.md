@@ -30,6 +30,8 @@ python -m pytest -q tests/test_kernels.py -k pack_unpack          # unittest-sty
 
 Tests mix `unittest.TestCase` classes and bare pytest functions; run everything through
 pytest. Kernel/MoE tests self-skip when the required backend is unavailable.
+`tests/test_gzip_parts.py` is torch-free and can run as `python tests/test_gzip_parts.py`
+on a machine without torch.
 
 ```bash
 # Data: build the curated byte mixture (see docs/DATASET_GUIDE.md first)
@@ -133,6 +135,18 @@ EOS=257 — validated) or a `text` fallback; post-training records need `prompt`
 boundaries. `prepare_hf_jsonl.py` deduplicates, splits, and assigns provenance at
 **document** level before chunking, so quotas are unique accepted bytes, not emitted
 positions.
+
+Colab path (disk-constrained): `prepare_hf_jsonl.py --gzip-parts` gzips every
+intermediate, deletes source shards as they are consumed, and writes
+`<data-root>/colab/parts/part_*.jsonl.gz` + `val.jsonl.gz` + `meta.json` (parts,
+steps_per_part, total_steps) instead of the single train/val JSONL. Parts are small
+because a resumed run has no saved loader position — the Colab cell picks a part from the
+checkpoint step. `scripts/pack_for_colab.py` produces the same layout from an
+already-built plain JSONL. `configs/colab_mix.json` is the matching ~10B-byte English
+mixture. `train.py`'s loader does **not** read `.gz` itself (suffix dispatch only knows
+`.pt`/`.jsonl`); parts must be decompressed before training. Related flags:
+`--min-free-gb` (abort on low disk), `--hf-token-file` (keeps the token out of shell
+history).
 
 ### Devices
 

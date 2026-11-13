@@ -218,19 +218,25 @@ class HybridQuantizer(nn.Module):
         if not self.enabled:
             return x
 
+        # Scale math runs in fp32. In fp16 the 1e-8 clamp rounds to 0 and
+        # 127 / amax overflows to inf once a token's amax falls below ~0.002, so
+        # its zero entries became 0 * inf = NaN. torch.compile upcast these ops
+        # implicitly, which hid the bug until a T4 run went eager (loss=nan on
+        # the first logged step after resuming at 2500).
+        xf = x.float()
         if self.mode == "int4":
-            scale = _int4_scale(x, self.int4_absmean)
-            x_q = (x * scale).round().clamp(-7, 7) / scale
+            scale = _int4_scale(xf, self.int4_absmean)
+            x_q = (xf * scale).round().clamp(-7, 7) / scale
         elif self.mode == "int8":
-            x_q = absmax_quantize_int8(x)
+            x_q = absmax_quantize_int8(xf)
         elif self.mode == "topk_int8":
-            x_q = topk_sparsify(x, self.topk_ratio)
+            x_q = topk_sparsify(xf, self.topk_ratio)
             x_q = absmax_quantize_int8(x_q)
         else:
             return x
 
         # STE: forward uses quantized, backward flows to original
-        return x_q.detach() + x - x.detach()
+        return x_q.to(x.dtype).detach() + x - x.detach()
 
     def quantize_to_int(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize-only: return raw INT tensor + per-token scale (no dequant).

@@ -51,11 +51,7 @@ logs/
 *.onnx
 
 # Generated datasets and temp prep output
-data/train/
-data/val/
-data/hf_shards/
-data/tmp/
-data/colab/
+data/
 
 # OS files
 .DS_Store

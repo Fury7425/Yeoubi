@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "description": "Narrow 10B-unique-byte English educational mixture for small models. Verify every dataset card and license before training.",
+  "sources": [
+    {
+      "slug": "fineweb_edu",
+      "batch_size": 1000,
+      "path": "HuggingFaceFW/fineweb-edu",
+      "name": "sample-100BT",
+      "split": "train",
+      "text_field": "text",
+      "target_unique_bytes": 5000000000,
+      "category": "educational_web",
+      "language": "en",
+      "quality_tier": "dataset_filtered",
+      "license": "ODC-By-1.0",
+      "synthetic": false
+    },
+    {
+      "slug": "cosmopedia",
+      "batch_size": 1000,
+      "path": "HuggingFaceTB/cosmopedia",
+      "name": "web_samples_v1",
+      "split": "train",
+      "text_field": "text",
+      "target_unique_bytes": 3000000000,
+      "category": "synthetic_educational",
+      "language": "en",
+      "quality_tier": "synthetic_curated",
+      "license": "Apache-2.0",
+      "synthetic": true
+    },
+    {
+      "slug": "wikipedia_en",
+      "batch_size": 1000,
+      "path": "wikimedia/wikipedia",
+      "name": "20231101.en",
+      "split": "train",
+      "text_field": "text",
+      "target_unique_bytes": 2000000000,
+      "category": "encyclopedia",
+      "language": "en",
+      "quality_tier": "reference",
+      "license": "CC-BY-SA-3.0/GFDL",
+      "synthetic": false
+    }
+  ]
+}
