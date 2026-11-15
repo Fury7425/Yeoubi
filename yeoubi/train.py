@@ -251,10 +251,6 @@ class TrainConfig:
     # batching had it (see data.LengthBucketedBatches). 0 restores random
     # batching. JSONL / .pt loaders only; validation is never bucketed.
     length_bucket_window: int = 128
-    # Fraction of training samples masked in whole byte-patch groups instead
-    # of byte by byte (see diffusion.apply_mask). 0 disables. Validation
-    # always uses plain byte masking so its loss stays comparable.
-    span_mask_prob: float = 0.5
 
     # --- Muon optimizer (DeepSeek V4 style hybrid) ---
     # Muon orthogonalizes the SGD-momentum update of every 2D weight matrix
@@ -681,7 +677,6 @@ def _prepare_training_state(
     cfg: TrainConfig,
     mask_token_id: int,
     schedule: CosineSchedule,
-    span_prob: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create a noisy input and the exact positions supervised by the loss.
 
@@ -729,7 +724,6 @@ def _prepare_training_state(
 
     noisy_ids, is_masked = apply_mask(
         source_ids, t, mask_token_id, schedule, frozen_mask=frozen_mask,
-        span_size=cfg.byte_patch_size, span_prob=span_prob,
     )
     maskable = loss_mask & attention_mask
     supervised = (is_masked | source_ids.ne(input_ids)) & maskable
@@ -1024,8 +1018,6 @@ def train(cfg: TrainConfig) -> None:
         raise ValueError("correction_noise_prob must be between 0 and 1")
     if not 0.0 < cfg.correction_t_max <= 1.0:
         raise ValueError("correction_t_max must be in (0, 1]")
-    if not 0.0 <= cfg.span_mask_prob <= 1.0:
-        raise ValueError("span_mask_prob must be between 0 and 1")
     if cfg.length_bucket_window < 0:
         raise ValueError("length_bucket_window must be >= 0")
 
@@ -1412,7 +1404,6 @@ def train(cfg: TrainConfig) -> None:
                     cfg=cfg,
                     mask_token_id=mask_token_id,
                     schedule=schedule,
-                    span_prob=cfg.span_mask_prob,
                 )
             running_masked_frac += (
                 supervised_mask.detach().float().mean() / cfg.grad_accum_steps

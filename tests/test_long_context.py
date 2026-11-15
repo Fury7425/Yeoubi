@@ -34,6 +34,14 @@ class LongContextMaskTests(unittest.TestCase):
         self.assertTrue(mask[4, 0])
         self.assertTrue(mask[4, 5])
 
+    def test_block_causal_mask_leaves_no_query_without_a_key(self):
+        # A query row with every key masked is NaN under SDPA on PyTorch
+        # builds without safe softmax, and the NaN spreads to valid positions.
+        valid = torch.tensor([[True, True, True, False, False, False]])
+        mask = block_causal_attention_mask(valid, block_size=2)[0]
+        self.assertTrue(mask.any(dim=-1).all())
+        self.assertFalse(mask[:, 3:].any())  # padding is still never a key
+
     @staticmethod
     def _padding_model():
         torch.manual_seed(0)

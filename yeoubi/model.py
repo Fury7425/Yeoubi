@@ -800,7 +800,13 @@ def block_causal_attention_mask(
 
     The returned boolean tensor has shape ``(B, T, T)`` and uses PyTorch SDPA
     semantics (True means the query/key pair is allowed). Padding is excluded
-    on both the query and key axes.
+    on the key axis only. Masking it on the query axis as well left padded
+    queries with no key at all, and softmax over an all-masked row is NaN on
+    PyTorch builds without SDPA's safe softmax (the supported floor is 2.2);
+    that NaN lands in the padded position's K/V and ``0 * NaN`` then poisons
+    every valid query in the next layer. A padded query's output is discarded
+    anyway (it is never a key, and the byte path zeroes it), which is also
+    how the plain key-padding mask has always treated it.
     """
     if block_size < 1:
         raise ValueError("block_size must be >= 1")
@@ -809,7 +815,7 @@ def block_causal_attention_mask(
     blocks = torch.div(positions, block_size, rounding_mode="floor")
     allowed = blocks[None, :] <= blocks[:, None]
     valid = valid_mask.to(torch.bool)
-    return allowed.unsqueeze(0).expand(B, -1, -1) & valid[:, :, None] & valid[:, None, :]
+    return allowed.unsqueeze(0).expand(B, -1, -1) & valid[:, None, :]
 
 
 def apply_int4_scale(module: nn.Module, absmean: bool) -> None:

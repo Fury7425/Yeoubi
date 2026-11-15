@@ -634,6 +634,81 @@ class TestDenoiseTracksMaskSchedule(unittest.TestCase):
             )
 
 
+class TestConfidenceRemask(unittest.TestCase):
+    """--remask confidence re-masks the schedule's count, least confident first."""
+
+    def test_remasks_least_confident_and_spares_frozen(self):
+        from yeoubi.sample import _remask_step
+
+        mask_id, vocab, length = 8, 8, 9
+        ids = torch.zeros(1, length, dtype=torch.long)  # every position drew byte 0
+        is_masked = torch.ones(1, length, dtype=torch.bool)
+        frozen = torch.zeros(1, length, dtype=torch.bool)
+        frozen[0, 0] = True
+        logits = torch.zeros(1, length, vocab)
+        logits[0, :, 0] = torch.arange(length, dtype=torch.float)  # confidence rises with position
+
+        out = _remask_step(
+            ids, is_masked, CosineSchedule(),
+            CosineSchedule.inverse(torch.tensor(1.0)),
+            CosineSchedule.inverse(torch.tensor(0.5)),
+            mask_id, torch.Generator().manual_seed(0),
+            frozen=frozen, logits=logits,
+        )
+        # Half of the 8 eligible positions go back to MASK: the 4 least
+        # confident. Position 0 is the least confident of all but frozen.
+        self.assertEqual(out[0].tolist(), [0, 8, 8, 8, 8, 0, 0, 0, 0])
+
+
+class TestRemdmRemask(unittest.TestCase):
+    """--remask remdm re-masks committed bytes at the schedule's masked fraction."""
+
+    def test_committed_bytes_remask_and_marginal_holds(self):
+        from yeoubi.sample import _remask_step
+
+        mask_id, n, n_frozen = 8, 40_000, 1_000
+        ids = torch.zeros(1, n, dtype=torch.long)
+        is_masked = torch.zeros(1, n, dtype=torch.bool)
+        is_masked[0, : n // 2] = True  # p_curr = 0.5
+        frozen = torch.zeros(1, n, dtype=torch.bool)
+        frozen[0, -n_frozen:] = True
+        args = (
+            ids, is_masked, CosineSchedule(),
+            CosineSchedule.inverse(torch.tensor(0.5)),
+            CosineSchedule.inverse(torch.tensor(0.25)),
+            mask_id,
+        )
+
+        out = _remask_step(
+            *args, torch.Generator().manual_seed(0), frozen=frozen, eta=0.1,
+        ).eq(mask_id)
+        # sigma = min(0.1, 0.25 / 0.5) = 0.1 of the committed half goes back,
+        # and the masked half keeps (0.25 - 0.1 * 0.5) / 0.5 = 0.4, so the
+        # canvas as a whole is still p_next = 0.25 masked.
+        self.assertAlmostEqual(out[0, n // 2 : -n_frozen].float().mean().item(), 0.1, delta=0.02)
+        self.assertAlmostEqual(out[0, : n // 2].float().mean().item(), 0.4, delta=0.02)
+        self.assertFalse(out[0, -n_frozen:].any(), "frozen bytes must never be re-masked")
+
+        # eta = 0 is the plain step: committed bytes are left alone.
+        plain = _remask_step(*args, torch.Generator().manual_seed(0)).eq(mask_id)
+        self.assertFalse(plain[0, n // 2 :].any())
+        self.assertAlmostEqual(plain[0, : n // 2].float().mean().item(), 0.5, delta=0.02)
+
+
+class TestMdlmLossStaysFp32(unittest.TestCase):
+    def test_loss_is_fp32_for_low_precision_logits(self):
+        # An fp16 loss tensor turns GradScaler's 65536 into an inf gradient.
+        # bf16 under CPU autocast stands in for fp16 on CUDA: same code path.
+        logits = torch.randn(2, 8, 32).to(torch.bfloat16)
+        targets = torch.randint(0, 32, (2, 8))
+        t = torch.tensor([0.3, 0.7])
+        loss_fn = MaskDiffusionLoss(weighting="mdlm")
+        for is_masked in (torch.ones(2, 8, dtype=torch.bool), torch.zeros(2, 8, dtype=torch.bool)):
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                loss = loss_fn(logits, targets, is_masked, t=t)
+            self.assertEqual(loss.dtype, torch.float32)
+
+
 class TestValidationIsDeterministic(unittest.TestCase):
     """validate() must score the same corruption on every call.
 
@@ -1140,28 +1215,6 @@ class TestLengthBucketedBatches(unittest.TestCase):
         self.assertAlmostEqual(weights[0], 0.501634, places=4)
         self.assertEqual(weights, sorted(weights), "longer documents must weigh more")
         self.assertAlmostEqual(sum(weights) / len(weights), 1.0, places=5)
-
-
-class TestSpanMasking(unittest.TestCase):
-    def test_spans_mask_whole_groups_at_the_same_rate(self):
-        torch.manual_seed(0)
-        ids = torch.zeros(64, 4096, dtype=torch.long)
-        t = torch.full((64,), 0.5)
-        schedule = CosineSchedule()
-
-        def whole_groups(masked):
-            groups = masked.view(64, -1, 4)
-            return (groups.all(-1) | ~groups.any(-1)).all().item()
-
-        _, spans = apply_mask(ids, t, 258, schedule, span_size=4, span_prob=1.0)
-        self.assertTrue(whole_groups(spans))
-        # Same marginal mask probability per byte as plain masking.
-        self.assertAlmostEqual(
-            spans.float().mean().item(), float(schedule.mask_prob(t[0])), delta=0.02,
-        )
-
-        _, plain = apply_mask(ids, t, 258, schedule)
-        self.assertFalse(whole_groups(plain), "default must stay byte-level")
 
 
 class TestUnpaddedSkipsAttentionMask(unittest.TestCase):

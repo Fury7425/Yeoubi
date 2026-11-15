@@ -48,6 +48,7 @@ def _model_fwd(
 logger = logging.getLogger("yeoubi")
 
 _MOE_LAYER_CHOICES = ("all", "alternate", "alternate_even", "top_half")
+_REMASK_CHOICES = ("random", "confidence", "remdm")
 
 
 def _validate_byte_config(config: ModelConfig) -> None:
@@ -210,6 +211,8 @@ def _remask_step(
     mask_token_id: int,
     gen: torch.Generator,
     frozen: Optional[torch.Tensor] = None,
+    logits: Optional[torch.Tensor] = None,
+    eta: float = 0.0,
 ) -> torch.Tensor:
     """Return *ids* with a schedule-correct subset of positions back at MASK.
 
@@ -222,17 +225,55 @@ def _remask_step(
     the canvas is fully committed by roughly step 8, every later step is a
     no-op, and the bytes that were committed went in at high noise.
 
-    Committed and frozen positions are never re-corrupted: absorbing-state
-    training never shows the model a re-masked clean byte.
+    Frozen positions are never re-corrupted, and with ``eta == 0`` neither are
+    committed ones.
+
+    ``eta > 0`` (``--remask remdm``) is ReMDM-cap (Wang et al. 2025, Eq. 6-7,
+    with alpha = 1 - p): a committed byte goes back to MASK with probability
+    ``sigma = min(eta, p(t_next) / (1 - p(t_curr)))`` so a later step can
+    re-predict it with more context, and the bytes masked at ``t_curr`` stay
+    masked with ``(p(t_next) - sigma * (1 - p(t_curr))) / p(t_curr)`` instead,
+    which leaves the masked fraction at ``p(t_next)``. The bound on sigma is
+    what keeps that second probability non-negative. Needs no retraining: the
+    model only ever sees MASK there, as in training.
 
     p(t_curr) is 1.0 on the first step and strictly positive on every step that
     can reach here (``t_next`` hits 0 only after the last re-mask), so the
     clamp is belt-and-braces, not a live branch.
+
+    With ``logits`` (clean-vocab logits for this step, ``--remask confidence``)
+    the choice is no longer random: the same fraction is re-masked, but it is
+    the bytes the model was least sure of, so the confident ones commit first
+    (low-confidence remasking, as in MaskGIT and LLaDA). Independent draws at
+    random positions are what garble a word whose bytes are sampled in the
+    same step; this defers the uncertain ones until their neighbours exist.
+    Opt-in: it leaves the remaining masks clustered on hard spans, a pattern
+    uniform-random training masks rarely produce, and it costs diversity.
     """
+    if not 0.0 <= eta <= 1.0:
+        raise ValueError(f"eta={eta} must be in [0.0, 1.0]")
     p_curr = schedule.mask_prob(t_curr).clamp(min=1e-6)
-    ratio = schedule.mask_prob(t_next) / p_curr
+    p_next = schedule.mask_prob(t_next)
+    # eta == 0 gives sigma == 0 and ratio == p_next / p_curr, the plain step.
+    # The clamp only matters on the first step, where nothing is committed yet.
+    committed = 1.0 - p_curr
+    sigma = (p_next / committed.clamp(min=1e-6)).clamp(max=eta)
+    ratio = (p_next - sigma * committed) / p_curr
+    if logits is not None:
+        eligible = is_masked if frozen is None else is_masked & ~frozen
+        # Raw probability of the byte just written: a confidence test, not a
+        # draw, so no temperature or top-p (as in _revise_step).
+        conf = logits.float().softmax(-1).gather(
+            -1, ids.clamp(max=logits.shape[-1] - 1).unsqueeze(-1),
+        ).squeeze(-1)
+        # Ineligible positions sort last and n_remask never exceeds the
+        # eligible count (ratio <= 1), so they are never picked.
+        conf = conf.masked_fill(~eligible, float("inf"))
+        n_remask = (eligible.sum(-1, keepdim=True) * ratio).round().long()
+        rank = conf.argsort(-1).argsort(-1)  # 0 = least confident, per row
+        return torch.where(rank < n_remask, mask_token_id, ids)
     rand = torch.rand(ids.shape, device=ids.device, generator=gen)
-    should_remask = (rand < ratio) & is_masked
+    should_remask = torch.where(is_masked, rand < ratio, rand < sigma)
     if frozen is not None:
         should_remask = should_remask & ~frozen
     return torch.where(should_remask, mask_token_id, ids)
@@ -288,6 +329,8 @@ def denoise(
     n_loops: Optional[int] = None,
     revise_threshold: float = 0.0,
     revise_t_max: float = 0.5,
+    remask: str = "random",
+    remdm_eta: float = 0.04,
 ) -> list[str]:
     """Generate text via iterative diffusion denoising.
 
@@ -316,12 +359,19 @@ def denoise(
         revise_threshold: Confidence above which a visible byte is overwritten
             by the model's top byte (0.0 = off). See :func:`_revise_step`.
         revise_t_max: Only revise on steps with ``t_curr <= revise_t_max``.
+        remask: ``"random"`` (schedule-exact), ``"confidence"`` (re-mask
+            the least confident bytes) or ``"remdm"`` (also re-mask committed
+            bytes). See :func:`_remask_step`.
+        remdm_eta: Cap on the per-step probability that a committed byte is
+            re-masked under ``remask="remdm"``; ignored otherwise.
 
     Returns:
         List of generated text strings.
     """
     if not 0.0 <= revise_threshold < 1.0:
         raise ValueError(f"revise_threshold={revise_threshold} must be in [0.0, 1.0)")
+    if remask not in _REMASK_CHOICES:
+        raise ValueError(f"remask must be one of {_REMASK_CHOICES}, got {remask!r}")
     model.eval()
     schedule = CosineSchedule()
     mask_token_id = model.config.mask_token_id
@@ -391,6 +441,8 @@ def denoise(
             ids = _remask_step(
                 ids, is_masked, schedule, t_curr, t_next, mask_token_id, gen,
                 frozen=frozen,
+                logits=logits[..., :vocab_size] if remask == "confidence" else None,
+                eta=remdm_eta if remask == "remdm" else 0.0,
             )
 
         if verbose:
@@ -755,9 +807,17 @@ class BlockDiffusionSampler:
         n_loops: Optional[int] = None,
         revise_threshold: float = 0.0,
         revise_t_max: float = 0.5,
+        remask: str = "random",
+        remdm_eta: float = 0.04,
     ):
         if not 0.0 <= revise_threshold < 1.0:
             raise ValueError(f"revise_threshold={revise_threshold} must be in [0.0, 1.0)")
+        if remask not in _REMASK_CHOICES:
+            raise ValueError(f"remask must be one of {_REMASK_CHOICES}, got {remask!r}")
+        self.remask = remask
+        # Only the block being denoised can be re-masked: committed blocks
+        # are already in the KV cache.
+        self.remdm_eta = remdm_eta if remask == "remdm" else 0.0
         self.model = model
         self.block_size = block_size
         self.steps = steps
@@ -870,6 +930,14 @@ class BlockDiffusionSampler:
                 block_ids = _remask_step(
                     block_ids, is_masked, schedule, t_curr, t_next,
                     mask_token_id, gen,
+                    # Carried prompt bytes are committed but must not be
+                    # re-masked by remdm; the other modes never touch them.
+                    frozen=frozen,
+                    logits=(
+                        logits[..., :self.model.config.vocab_size]
+                        if self.remask == "confidence" else None
+                    ),
+                    eta=self.remdm_eta,
                 )
 
             if self.verbose:
@@ -1191,6 +1259,20 @@ def main() -> None:
         "--revise_t_max", type=float, default=0.5,
         help="Only revise on steps with t <= this (match the training correction_t_max).",
     )
+    parser.add_argument(
+        "--remask", type=str, default="random", choices=_REMASK_CHOICES,
+        help="Which bytes stay masked after each step: 'random' follows the schedule "
+             "exactly; 'confidence' keeps the least confident ones masked so confident "
+             "bytes commit first; 'remdm' also sends committed bytes back to MASK so "
+             "later steps can redo them (full denoiser and --block). None needs retraining.",
+    )
+    parser.add_argument(
+        "--remdm_eta", type=float, default=0.04,
+        # 0.04 is the ReMDM paper's setting for fewer steps than positions, on
+        # subword tokens; it has not been tuned for bytes.
+        help="With --remask remdm: cap on the chance per step that a committed byte is "
+             "re-masked. Higher revises more but needs more --steps to settle.",
+    )
 
     # MoE args
     parser.add_argument("--use_moe", action="store_true", help="Enable MoE FFN layers")
@@ -1244,6 +1326,8 @@ def main() -> None:
             n_loops=args.n_loops,
             revise_threshold=args.revise_threshold,
             revise_t_max=args.revise_t_max,
+            remask=args.remask,
+            remdm_eta=args.remdm_eta,
         )
         t0 = time.perf_counter()
         results = sampler.generate(
@@ -1330,6 +1414,8 @@ def main() -> None:
             n_loops=args.n_loops,
             revise_threshold=args.revise_threshold,
             revise_t_max=args.revise_t_max,
+            remask=args.remask,
+            remdm_eta=args.remdm_eta,
         )
         wall_s = time.perf_counter() - t0
         n_tokens = args.num_samples * args.length

@@ -437,9 +437,10 @@ sequences; the sampler decodes these with replacement characters instead of fail
 it also supervises visible wrong bytes and the NELBO weight is unbounded on those.
 - Noise levels are low-discrepancy: each optimizer step spreads its samples evenly over
 `t ∈ [0, 1)` from one random offset instead of drawing them independently.
-- Half of the training samples (`--span_mask_prob 0.5`) are masked in whole four-byte
-groups instead of byte by byte, so a hidden group cannot be read off its neighbours.
-Validation always uses plain byte masking, so its loss stays comparable across runs.
+- Bytes are masked independently. Masking whole four-byte groups (`--span_mask_prob`)
+was removed after [The Efficiency Gap in Byte Modeling](https://arxiv.org/abs/2605.12928)
+reported that span masking degrades byte-level masked diffusion; the flag no longer
+exists.
 - Full-precision latent weights are retained during training and ternarized with a
 straight-through estimator on each forward pass.
 - The first 90% of training uses INT8 activations (W1.58A8).
@@ -466,6 +467,20 @@ the model is at least that confident in a different one, at noise levels up to
 `--revise_t_max` (default 0.5). It is off by default and needs a checkpoint trained
 with `--training_stage correction`; other checkpoints have untrained outputs at
 visible positions.
+- `--remask confidence` keeps the least confident bytes masked after each step instead
+of a random subset, so confident bytes commit first (low-confidence remasking, as in
+MaskGIT and LLaDA). The number re-masked per step is unchanged. It is off by default:
+the masks it leaves behind cluster on hard spans, which uniform-random training masks
+rarely produce, and it reduces sample diversity. Works with the full denoiser and
+`--block`; needs no retraining.
+- `--remask remdm` also sends already committed bytes back to MASK, each with
+probability at most `--remdm_eta` (default 0.04) per step, so a later step can redo an
+early mistake with more context
+([ReMDM](https://arxiv.org/abs/2503.00307), max-capped schedule). The masked fraction
+per step is unchanged. It needs no retraining and pays off mainly at higher `--steps`.
+With `--block` only the block being denoised is re-masked; committed blocks are fixed
+in the KV cache. The default cap comes from subword-token experiments and is untuned
+for bytes.
 
 ### Resuming checkpoints from before these defaults
 
