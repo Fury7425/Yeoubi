@@ -137,6 +137,8 @@ class CompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint_path = Path(temp_dir, "checkpoint.pt")
             save_checkpoint(str(checkpoint_path), model, optimizer, scheduler, step=7, activation_mode="A4")
+            # Written via a temp file and renamed: nothing else may be left behind.
+            self.assertEqual([p.name for p in Path(temp_dir).iterdir()], ["checkpoint.pt"])
 
             checkpoint = read_checkpoint(str(checkpoint_path))
             loaded_config = ModelConfig(**checkpoint["model_config"])

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import pickle
 import random
 import tempfile
 import unittest
 from pathlib import Path
 
 from yeoubi.byte_codec import EOS_TOKEN_ID
-from yeoubi.data import StreamingJsonlDataset
+from yeoubi.data import StreamingJsonlDataset, make_dataloader
 from yeoubi.data_pipeline import (
     ContaminationIndex,
     DedupIndex,
@@ -19,6 +20,14 @@ from yeoubi.data_pipeline import (
     document_id,
     handle_pii,
 )
+
+
+class TestLoaderPickles(unittest.TestCase):
+    def test_collate_survives_spawn_pickling(self):
+        # Windows starts DataLoader workers by spawn and hands them the collate
+        # function by pickle. Validation is never bucketed, so it uses this one.
+        loader = make_dataloader(["unused.jsonl"], num_workers=0)
+        pickle.dumps(loader.collate_fn)
 
 
 class TestDocumentSplitting(unittest.TestCase):

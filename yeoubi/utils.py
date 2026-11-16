@@ -402,7 +402,13 @@ def _clone_state_dict(obj: Any) -> Any:
 
 
 def _write_checkpoint_file(path: str, ckpt: Dict, step: int) -> None:
-    torch.save(ckpt, path)
+    # Written beside the target and renamed over it, so a file named *.pt is
+    # always complete. torch.save in place left a truncated checkpoint when the
+    # process was killed mid-write (host OOM is likeliest exactly here), and the
+    # Colab cell's final sync uploaded it as the newest one to resume from.
+    tmp_path = path + ".tmp"
+    torch.save(ckpt, tmp_path)
+    os.replace(tmp_path, path)
     logger.info("Checkpoint saved to %s (step %d)", path, step)
 
 

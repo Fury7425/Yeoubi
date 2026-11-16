@@ -14,6 +14,7 @@ fast-path where UTF-8 byte IDs have been materialized to .pt shards.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -401,7 +402,9 @@ def _make_loader(
 ) -> DataLoader:
     """DataLoader construction shared by the JSONL and ``.pt`` datasets."""
     loader_batch_size: Optional[int] = batch_size
-    collate = lambda b: collate_fn(b, pad_token_id=pad_token_id)  # noqa: E731
+    # A partial, not a lambda: Windows starts workers by spawn and pickles the
+    # collate function, which a local lambda cannot survive.
+    collate = functools.partial(collate_fn, pad_token_id=pad_token_id)
     if bucket_window > 0:
         # The wrapper yields finished batches, so the DataLoader's own
         # batching and collation are switched off.
@@ -774,6 +777,6 @@ def make_litdata_dataloader(
         dataset,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_token_id),
+        collate_fn=functools.partial(collate_fn, pad_token_id=pad_token_id),
         pin_memory=True,
     )

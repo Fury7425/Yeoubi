@@ -1321,6 +1321,8 @@ def train(cfg: TrainConfig) -> None:
     running_grad_norm = torch.zeros((), device=device)
     running_masked_frac = torch.zeros((), device=device)
     step_in_accum = 0
+    # Optimizer steps dropped for non-finite gradients since the last log line.
+    skipped_steps = 0
     epoch = 0
 
     while global_step < cfg.max_steps:
@@ -1474,8 +1476,20 @@ def train(cfg: TrainConfig) -> None:
                 scaler.unscale_(inner_opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
             running_grad_norm += grad_norm.detach()
-            for inner_opt in optimizer.optimizers:
-                scaler.step(inner_opt)
+            # GradScaler records inf per optimizer, but the clip above spans
+            # both: one NaN gradient makes the total norm NaN and the clip
+            # then multiplies every gradient by it, including those of an
+            # optimizer the scaler recorded as clean, which would step anyway
+            # and write NaN into its weights and momentum for good. Off
+            # CUDA-fp16 there is no scaler at all. Drop the whole update
+            # instead; unscale_ already recorded what update() needs to back
+            # the scale off. One host sync per optimizer step, which
+            # scaler.step pays already.
+            if torch.isfinite(grad_norm):
+                for inner_opt in optimizer.optimizers:
+                    scaler.step(inner_opt)
+            else:
+                skipped_steps += 1
             scaler.update()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -1519,6 +1533,23 @@ def train(cfg: TrainConfig) -> None:
                 if len(opt_lrs) > 1:
                     log_data["train/lr_muon"] = opt_lrs[1]
                 wandb_logger.log(log_data, step=global_step)
+                if skipped_steps:
+                    logger.warning(
+                        "Skipped %d of the last 50 optimizer steps: non-finite gradients.",
+                        skipped_steps,
+                    )
+                # A stray overflow is routine under fp16 (the scaler grows its
+                # scale until one happens). A whole window of them means the
+                # forward itself is broken, and the step counter, LR and A8->A4
+                # schedules would keep advancing over a model that no longer
+                # learns. No bad update was applied, so checkpoints are clean.
+                if skipped_steps >= 50:
+                    raise RuntimeError(
+                        f"Every optimizer step up to step {global_step} had non-finite "
+                        "gradients. Weights and checkpoints are unaffected: resume from "
+                        "the newest checkpoint with --bf16 true or a lower learning rate."
+                    )
+                skipped_steps = 0
                 running_loss.zero_()
                 running_grad_norm.zero_()
                 running_masked_frac.zero_()
