@@ -421,7 +421,15 @@ class _HybridOptimizer:
                 type(o).__name__, len(sd["param_groups"]), len(o.param_groups),
             )
             return
+        # load_state_dict also restores each group's hyperparameters, so a
+        # checkpoint saved with muon_weight_decay=0 would silently override a
+        # weight decay turned on at resume. Keep this run's configured values;
+        # lr is left alone because the scheduler restore re-derives it.
+        configured = [g.get("weight_decay") for g in o.param_groups]
         o.load_state_dict(sd)
+        for group, weight_decay in zip(o.param_groups, configured):
+            if weight_decay is not None:
+                group["weight_decay"] = weight_decay
 
     def load_state_dict(self, state) -> None:
         # New format: {"hybrid": [sd_per_optimizer, ...]}
