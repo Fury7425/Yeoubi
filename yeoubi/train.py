@@ -23,8 +23,10 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .device import (
     compile_model as _compile_model,
@@ -161,6 +163,11 @@ class TrainConfig:
     correction_noise_prob: float = 0.15
     correction_t_max: float = 0.5
     save_every: int = 2500
+    # Stop after this many hours of training (0 = no limit), saving a resumable
+    # step_<n>_preempted.pt first. For hosts that kill a session at a fixed
+    # time (Kaggle: 12 h): unlike an external timeout's SIGTERM, which torchrun
+    # would also deliver to the DataLoader workers, every rank agrees on it.
+    max_runtime_hours: float = 0.0
     val_every: int = 500
     bitstats_every: int = 250
     num_workers: int = 4
@@ -1029,14 +1036,35 @@ def train(cfg: TrainConfig) -> None:
     if cfg.length_bucket_window < 0:
         raise ValueError("length_bucket_window must be >= 0")
 
+    # Multi-GPU: launched by torchrun (WORLD_SIZE > 1), one process per GPU with
+    # DDP-averaged gradients. Plain `python train.py` stays single-process.
+    # batch_size and grad_accum_steps are per process, so the global batch is
+    # world_size x batch_size x grad_accum_steps.
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    distributed = world_size > 1
+    is_main = rank == 0
+    device_name = cfg.device
+    if distributed:
+        if not is_main:
+            logger.setLevel(logging.WARNING)
+        if torch.cuda.is_available() and (device_name == "auto" or device_name.startswith("cuda")):
+            device_name = f"cuda:{os.environ.get('LOCAL_RANK', '0')}"
+
     # Device
-    device = resolve_device(cfg.device)
+    device = resolve_device(device_name)
     configure_tf32(device)   # no-op on non-CUDA; enables TF32 on Ampere+
     log_device_info(device)
     logger.info("Using device: %s", device)
+    if distributed:
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+        logger.info("Distributed: %d processes, backend=%s", world_size, dist.get_backend())
 
-    # Seed
-    seed_device(device, cfg.seed)
+    # Seed. Offset per rank so ranks draw different noise levels and masks;
+    # DDP broadcasts rank 0's weights at wrap time, so initialization still agrees.
+    seed_device(device, cfg.seed + rank)
 
     if cfg.vocab_size != VOCAB_SIZE:
         raise ValueError(
@@ -1184,6 +1212,16 @@ def train(cfg: TrainConfig) -> None:
     if not train_paths:
         raise FileNotFoundError(f"No training files found matching: {cfg.train_data}")
     logger.info("Training files: %d, Validation files: %d", len(train_paths), len(val_paths))
+    if distributed and not cfg.use_litdata:   # litdata shards across ranks itself
+        # ponytail: whole files per rank, so it needs at least one file per rank
+        # and files of similar size (the Colab/Kaggle parts are). A rank whose
+        # files run out first just starts its next epoch early.
+        if len(train_paths) < world_size:
+            raise ValueError(
+                f"{world_size} processes need at least {world_size} training files "
+                f"to shard; found {len(train_paths)}."
+            )
+        train_paths = train_paths[rank::world_size]
 
     # Train only: the validation loader must keep one fixed order (see
     # data._epoch_shuffle_seed). litdata reshuffles per epoch on its own.
@@ -1192,7 +1230,7 @@ def train(cfg: TrainConfig) -> None:
         bucket_window=cfg.length_bucket_window,
     )
     val_loader = None
-    if val_paths:
+    if val_paths and is_main:   # validation and samples run on rank 0 only
         val_loader = _build_dataloader(
             val_paths, cfg, pad_token_id
         )
@@ -1227,7 +1265,7 @@ def train(cfg: TrainConfig) -> None:
     wandb_logger = WandBLogger(
         project=cfg.wandb_project,
         config={**vars(cfg), **vars(model_cfg)},
-        enabled=bool(cfg.wandb_project),
+        enabled=bool(cfg.wandb_project) and is_main,
     )
 
     # BitStats and ExpertStats
@@ -1302,6 +1340,24 @@ def train(cfg: TrainConfig) -> None:
         logger.info("Gradient checkpointing enabled — trading compute for memory")
     model.train()
 
+    # Forward passes that need gradients go through train_model; everything
+    # else (self-conditioning, validation, saving, activation modes) keeps
+    # using the bare model.
+    train_model = model
+    if distributed:
+        train_model = DDP(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            # The RDT runs its recurrent block a random 1..max times, so the
+            # per-loop norms and LoRA of skipped loops get no gradient (unused
+            # MoE experts likewise), and ranks may draw different counts.
+            find_unused_parameters=True,
+            # RoPE re-registers its cos/sin caches at whatever length a batch
+            # needs, so buffer shapes differ between ranks; nothing trained
+            # lives in buffers.
+            broadcast_buffers=False,
+        )
+
     # --- SIGTERM handler (GCP preemptible VMs send SIGTERM 30s before kill) ---
     _stop_requested = False
 
@@ -1332,6 +1388,7 @@ def train(cfg: TrainConfig) -> None:
     # Optimizer steps dropped for non-finite gradients since the last log line.
     skipped_steps = 0
     epoch = 0
+    started = time.monotonic()
 
     while global_step < cfg.max_steps:
         epoch += 1
@@ -1437,9 +1494,15 @@ def train(cfg: TrainConfig) -> None:
                             model_cfg.vocab_size,
                         )
 
+                if distributed:
+                    # The switch DDP.no_sync() flips: all-reduce gradients only
+                    # on the last micro-step of each optimizer step.
+                    train_model.require_backward_grad_sync = (
+                        step_in_accum + 1 == cfg.grad_accum_steps
+                    )
                 # block_bytes is 0 outside clean-prefix steps, which leaves the
                 # model's own block-causal coin flip in charge.
-                logits, aux_loss = model(
+                logits, aux_loss = train_model(
                     model_input_ids,
                     t_model,
                     self_cond=self_cond,
@@ -1510,10 +1573,11 @@ def train(cfg: TrainConfig) -> None:
             if new_mode != current_mode:
                 # Save a checkpoint right at the A8→A4 boundary so you can
                 # ablate whether degradation came from before or after the switch.
-                pre_a4_path = os.path.join(cfg.output_dir, f"step_{global_step}_pre_a4.pt")
-                save_checkpoint(pre_a4_path, model, optimizer, lr_scheduler,
-                                global_step, current_mode, async_io=cfg.async_checkpoint)
-                logger.info("Pre-A4 ablation checkpoint saved to %s", pre_a4_path)
+                if is_main:
+                    pre_a4_path = os.path.join(cfg.output_dir, f"step_{global_step}_pre_a4.pt")
+                    save_checkpoint(pre_a4_path, model, optimizer, lr_scheduler,
+                                    global_step, current_mode, async_io=cfg.async_checkpoint)
+                    logger.info("Pre-A4 ablation checkpoint saved to %s", pre_a4_path)
                 current_mode = new_mode
                 model.set_activation_mode(current_mode)
                 logger.info("Step %d: activation mode → %s", global_step, current_mode)
@@ -1563,12 +1627,12 @@ def train(cfg: TrainConfig) -> None:
                 running_masked_frac.zero_()
 
             # --- MoE load balance loss logging (every 100 steps) ---
-            if model_cfg.use_moe and global_step % 100 == 0:
+            if is_main and model_cfg.use_moe and global_step % 100 == 0:
                 moe_log = log_expert_utilization(model, global_step)
                 wandb_logger.log(moe_log, step=global_step)
 
             # --- BitStats ---
-            if global_step % cfg.bitstats_every == 0:
+            if is_main and global_step % cfg.bitstats_every == 0:
                 stats = bit_stats.log_to_console(global_step)
                 wandb_logger.log(stats, step=global_step)
                 if expert_stats is not None:
@@ -1596,26 +1660,39 @@ def train(cfg: TrainConfig) -> None:
                 empty_cache(device)
                 model.train()
 
-            # --- Preemption / SIGTERM ---
-            if _stop_requested:
+            # --- Preemption / SIGTERM / runtime budget ---
+            stop = _stop_requested or (
+                cfg.max_runtime_hours > 0
+                and time.monotonic() - started > cfg.max_runtime_hours * 3600
+            )
+            if distributed:
+                # Ranks notice a signal or the clock at slightly different
+                # steps. One leaving alone would block the rest in the next
+                # all-reduce, and rank 0 has to be among those saving.
+                flag = torch.tensor(float(stop), device=device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                stop = bool(flag.item())
+            if stop:
                 drain_checkpoint_writer()  # flush any pending async write first
-                ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}_preempted.pt")
-                save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
-                                global_step, current_mode)  # always synchronous on preemption
-                logger.info("Preemption checkpoint saved to %s — exiting.", ckpt_path)
+                if is_main:
+                    ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}_preempted.pt")
+                    save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
+                                    global_step, current_mode)  # always synchronous on preemption
+                    logger.info("Stop checkpoint saved to %s — exiting.", ckpt_path)
                 wandb_logger.finish()
                 return
 
             # --- Checkpoint ---
-            if global_step % cfg.save_every == 0:
+            if is_main and global_step % cfg.save_every == 0:
                 ckpt_path = os.path.join(cfg.output_dir, f"step_{global_step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, lr_scheduler,
                                 global_step, current_mode, async_io=cfg.async_checkpoint)
 
     # Final checkpoint — drain async writer first so the file exists on exit
     drain_checkpoint_writer()
-    ckpt_path = os.path.join(cfg.output_dir, "final.pt")
-    save_checkpoint(ckpt_path, model, optimizer, lr_scheduler, global_step, current_mode)
+    if is_main:
+        ckpt_path = os.path.join(cfg.output_dir, "final.pt")
+        save_checkpoint(ckpt_path, model, optimizer, lr_scheduler, global_step, current_mode)
     wandb_logger.finish()
     logger.info("Training complete at step %d", global_step)
 
@@ -1643,7 +1720,11 @@ def main() -> None:
 
     args = parser.parse_args()
     cfg = TrainConfig(**vars(args))
-    train(cfg)
+    try:
+        train(cfg)
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
