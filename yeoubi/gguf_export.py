@@ -7,12 +7,13 @@ Write a Yeoubi model as GGUF for the native ggml runtime in ``runtime/``.
 The file is plain GGUF v3, but the tensor graph is Yeoubi's own: generic GGUF
 consumers (llama.cpp etc.) still cannot run it. Only ``runtime/yeoubi`` can.
 
-Ternary BitLinear weights are stored as ggml ``Q4_0`` with every block scale
-set to the per-matrix absmean scale and codes {7, 8, 9} = {-1, 0, +1}. That is
-exact (up to fp16 rounding of the scale) and, unlike ggml's 2-bit ternary
-types, Q4_0 has a matmul kernel on every ggml backend (CUDA, HIP, Vulkan,
-Metal, SYCL, OpenCL/Adreno, Hexagon, OpenVINO, CPU), so no backend falls back
-to the CPU for the hot path.
+Ternary BitLinear weights are stored as ggml ``TQ1_0`` (1.6875 bits/weight,
+five base-3 digits per byte), with every block scale set to the per-matrix
+absmean scale. That is exact (up to fp16 rounding of the scale). The runtime
+repacks them at load time into a type the device multiplies natively (TQ2_0,
+or Q4_0, which every ggml backend has), so the file is as small as ggml allows
+and still runs on any GPU. Rows not a multiple of 256 wide (the RDT LoRA
+up-projection) use Q4_0 with codes {7, 8, 9} instead.
 
 This module needs only numpy, so a machine without torch can export a
 training checkpoint directly:
@@ -37,7 +38,7 @@ _ALIGN = 32
 # int(n * topk_ratio) and an f32 ratio can land one below Python's result.
 _GGUF_I32, _GGUF_BOOL, _GGUF_STR, _GGUF_F64 = 5, 7, 8, 12
 # ggml_type values (ggml.h)
-_GGML_F32, _GGML_Q4_0 = 0, 2
+_GGML_F32, _GGML_Q4_0, _GGML_TQ1_0 = 0, 2, 34
 
 
 def _str(s: str) -> bytes:
@@ -75,7 +76,34 @@ def _q4_0_ternary(w: np.ndarray) -> bytes:
     return np.concatenate([d, qs], axis=-1).tobytes()
 
 
+def _tq1_0_ternary(w: np.ndarray) -> bytes:
+    """Absmean-ternarize and pack as ggml TQ1_0 (1.6875 bits/weight).
+
+    Byte-for-byte gguf-py's ``TQ1_0.quantize_blocks``: per 256 weights, 48
+    bytes of five base-3 digits each (the first 160 weights in 32 columns, the
+    next 80 in 16), 4 bytes of four digits for the last 16, then the fp16
+    scale. Each byte holds ceil(value * 256 / 243) so a decoder can pull the
+    digits out with a multiply and shift. The block scale is the matrix's
+    absmean scale, so the ternary values are exact.
+    """
+    w_q, scale = _absmean_ternary(w)
+    codes = (w_q + 1).astype(np.uint16).reshape(-1, 256)  # {0, 1, 2}
+    nb = codes.shape[0]
+    p5 = np.array([81, 27, 9, 3, 1], dtype=np.uint16)
+    qs0 = (codes[:, :160].reshape(nb, 5, 32) * p5[None, :, None]).sum(axis=1)
+    qs1 = (codes[:, 160:240].reshape(nb, 5, 16) * p5[None, :, None]).sum(axis=1)
+    qh = (codes[:, 240:].reshape(nb, 4, 4) * p5[None, :4, None]).sum(axis=1)
+    q = (np.concatenate([qs0, qs1, qh], axis=-1) * 256 + 242) // 243
+    d = np.full((nb, 1), scale, dtype=np.float16).view(np.uint8)
+    return np.concatenate([q.astype(np.uint8), d], axis=-1).tobytes()
+
+
 def _ternary(name: str, value: np.ndarray) -> tuple[str, tuple, int, bytes]:
+    # Smallest exact format ggml has. The runtime repacks TQ1_0 at load time
+    # into whatever the device multiplies natively (TQ2_0 or Q4_0), so the
+    # file stays minimal without tying it to one backend's kernels.
+    if value.shape[-1] % 256 == 0:
+        return name, value.shape, _GGML_TQ1_0, _tq1_0_ternary(value)
     if value.shape[-1] % 32 == 0:
         return name, value.shape, _GGML_Q4_0, _q4_0_ternary(value)
     # ponytail: odd widths stay dequantized F32; none exist at the shipped
@@ -123,7 +151,7 @@ def _collect_tensors(state: dict, config: dict) -> list[tuple[str, tuple, int, b
 
     # Experts become one [n_experts, out, in] tensor per projection (ggml's
     # [in, out, n_experts] for ggml_mul_mat_id). Each expert keeps its own
-    # absmean scale, which Q4_0 carries per block anyway.
+    # absmean scale, which TQ1_0/Q4_0 carry per block anyway.
     for name, by_index in experts.items():
         stack = [by_index[i] for i in range(len(by_index))]
         if name.endswith(".latent_weight"):

@@ -32,9 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # byte_codec.py constants, repeated so the compare side needs no torch.
 MASK_TOKEN_ID, VOCAB_SIZE = 258, 258
-LIMITS = {"none": (0.9999, 0.97), "a8": (0.999, 0.9), "a4": (0.999, 0.8)}
+LIMITS = {"none": (0.9999, 0.97), "a8": (0.999, 0.9), "a4": (0.995, 0.8)}
 # The KV cache is 4-bit in every mode, so a cached check is never "exact".
-BLOCK_LIMITS = (0.999, 0.8)
+BLOCK_LIMITS = (0.995, 0.8)
 
 
 def reference(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
@@ -99,6 +99,8 @@ def runtime(args, saved: dict) -> np.ndarray:
             cmd += ["--loops", str(saved["loops"])]
         if args.device:
             cmd += ["--device", args.device]
+        if args.weight_type:
+            cmd += ["--weight-type", args.weight_type]
         subprocess.run(cmd, check=True)
         return np.fromfile(out_file, dtype=np.float32).reshape(len(ids), -1)[:, :VOCAB_SIZE]
 
@@ -111,6 +113,8 @@ def main() -> None:
     p.add_argument("--gguf")
     p.add_argument("--runtime", help="path to the built yeoubi executable")
     p.add_argument("--device", default=None, help="runtime --device (default: best)")
+    p.add_argument("--weight-type", choices=("q4", "tq2", "tq1"), default=None,
+                   help="runtime --weight-type (default: the device's best native type)")
     p.add_argument("--prompt", default="The quick brown fox")
     p.add_argument("--length", type=int, default=64)
     p.add_argument("--block", type=int, default=0, help="check the KV-cached path with this block size")

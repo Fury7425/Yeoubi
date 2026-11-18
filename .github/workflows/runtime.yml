@@ -100,6 +100,13 @@ jobs:
                   --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
                   | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
               done
+              # Every in-memory ternary format must repack the TQ1_0 file exactly.
+              for wt in q4 tq2 tq1; do
+                echo "== $m on $dev as $wt"
+                python scripts/check_runtime_parity.py --ref fixture/$m/ref_none.npz \
+                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" --weight-type $wt 2>&1 \
+                  | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
+              done
             done
           done
           exit $fail

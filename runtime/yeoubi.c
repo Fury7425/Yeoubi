@@ -194,7 +194,52 @@ static float *host_copy(struct ggml_context *hctx, const char *name, int *n) {
     return out;
 }
 
-static void model_load(model_t *m, const char *path) {
+// Can the device multiply this weight type natively, dense and MoE alike?
+static int dev_supports(ggml_backend_dev_t dev, enum ggml_type type) {
+    struct ggml_init_params ip = { 16 * ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *c = ggml_init(ip);
+    ten *a   = ggml_new_tensor_2d(c, type, 256, 16);
+    ten *x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, 256, 4);
+    ten *as  = ggml_new_tensor_3d(c, type, 256, 16, 2);
+    ten *x3  = ggml_new_tensor_3d(c, GGML_TYPE_F32, 256, 1, 4);
+    ten *ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, 1, 4);
+    int ok = ggml_backend_dev_supports_op(dev, ggml_mul_mat(c, a, x)) &&
+             ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(c, as, x3, ids));
+    ggml_free(c);
+    return ok;
+}
+
+// Q4_0 holding ternary values: per 32-block scale = |max|, codes {7, 8, 9}.
+// (ggml's own Q4_0 quantizer is asymmetric and would clip one sign to 7/8.)
+static void pack_q4_0_ternary(const float *x, uint8_t *y, int64_t n) {
+    for (int64_t blk = 0; blk < n / 32; blk++, x += 32, y += 18) {
+        float d = 0.0f;
+        for (int j = 0; j < 32; j++) d = fmaxf(d, fabsf(x[j]));
+        ggml_fp16_t h = ggml_fp32_to_fp16(d);
+        memcpy(y, &h, sizeof h);
+        for (int j = 0; j < 16; j++) {
+            int lo = d > 0.0f ? (int) lroundf(x[j] / d) + 8 : 8;
+            int hi = d > 0.0f ? (int) lroundf(x[j + 16] / d) + 8 : 8;
+            y[2 + j] = (uint8_t) (lo | (hi << 4));
+        }
+    }
+}
+
+// TQ1_0 (the file's format) -> `to`. Exact: every value is 0 or +/- the block
+// scale, which is an fp16 number and survives any of these encodings.
+static void *repack_ternary(const ten *src, enum ggml_type to, size_t *size) {
+    int64_t n = ggml_nelements(src), cols = src->ne[0], rows = n / cols;
+    float *f = malloc(sizeof(float) * n);
+    ggml_get_type_traits(src->type)->to_float(src->data, f, n);
+    *size = ggml_row_size(to, cols) * rows;
+    void *dst = malloc(*size);
+    if (to == GGML_TYPE_Q4_0) pack_q4_0_ternary(f, dst, n);
+    else ggml_quantize_chunk(to, f, dst, 0, rows, cols, NULL);
+    free(f);
+    return dst;
+}
+
+static void model_load(model_t *m, const char *path, int weight_type) {
     struct ggml_context *hctx = NULL;
     struct gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &hctx };
     struct gguf_context *g = gguf_init_from_file(path, gp);
@@ -231,21 +276,43 @@ static void model_load(model_t *m, const char *path) {
     if (m->top_k < 1 || m->top_k > MAX_TOPK) die("top_k_experts must be in [1, %d]", MAX_TOPK);
     if (m->kv_bits < 2 || m->kv_bits > 8 || m->kv_bos_bits < 2 || m->kv_bos_bits > 8) die("kv_cache bits out of range");
 
+    // Ternary weights arrive as TQ1_0 (smallest on disk) and are repacked to
+    // the most compact type this device multiplies natively: TQ2_0 where the
+    // backend has kernels for it, else Q4_0, which every backend has.
+    ggml_backend_dev_t dev = ggml_backend_get_device(m->backend);
+    enum ggml_type wt = weight_type >= 0 ? (enum ggml_type) weight_type
+                      : dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
+    if (!dev_supports(dev, wt)) fprintf(stderr, "warning: %s has no native %s matmul; it will run on the CPU\n",
+                                        ggml_backend_dev_name(dev), ggml_type_name(wt));
+
     // Weights: mirror every GGUF tensor into one buffer on the chosen device.
     int64_t nt = gguf_get_n_tensors(g);
     struct ggml_init_params ip = { (size_t) nt * ggml_tensor_overhead(), NULL, true };
     m->wctx = ggml_init(ip);
+    int64_t n_tern = 0;
     for (int64_t i = 0; i < nt; i++) {
         const char *name = gguf_get_tensor_name(g, i);
-        ggml_set_name(ggml_dup_tensor(m->wctx, ggml_get_tensor(hctx, name)), name);
+        ten *src = ggml_get_tensor(hctx, name);
+        enum ggml_type t = src->type == GGML_TYPE_TQ1_0 ? wt : src->type;
+        if (src->type == GGML_TYPE_TQ1_0) n_tern += ggml_nelements(src);
+        ggml_set_name(ggml_new_tensor(m->wctx, t, ggml_n_dims(src), src->ne), name);
     }
     m->wbuf = ggml_backend_alloc_ctx_tensors_from_buft(m->wctx, ggml_backend_get_default_buffer_type(m->backend));
     if (!m->wbuf) die("out of device memory for weights");
     for (int64_t i = 0; i < nt; i++) {
         const char *name = gguf_get_tensor_name(g, i);
-        ten *src = ggml_get_tensor(hctx, name);
-        ggml_backend_tensor_set(get(m, name), src->data, 0, ggml_nbytes(src));
+        ten *src = ggml_get_tensor(hctx, name), *dst = get(m, name);
+        if (dst->type == src->type) {
+            ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+        } else {
+            size_t size;
+            void *buf = repack_ternary(src, dst->type, &size);
+            ggml_backend_tensor_set(dst, buf, 0, size);
+            free(buf);
+        }
     }
+    fprintf(stderr, "weights: %.1fM ternary as %s, %.1f MB on device\n", n_tern / 1e6,
+            ggml_type_name(wt), ggml_backend_buffer_get_size(m->wbuf) / 1e6);
     m->alpha      = host_copy(hctx, "recurrent.alpha", &m->n_alpha);
     m->iter_gate  = host_copy(hctx, "recurrent.lora.iter_gate", &m->n_gate);
     m->loop_embed = host_copy(hctx, "recurrent.loop_embed.weight", &m->n_loop_embed);
@@ -1076,6 +1143,7 @@ static void usage(void) {
         "  --revise F            overwrite visible bytes above this confidence (default off)\n"
         "  --revise-t-max F      only revise when t <= F (default 0.5)\n"
         "  --act a4|a8|none      activation quant: trained A4 stage (default), A8 stage, off\n"
+        "  --weight-type T       q4 | tq2 | tq1: in-memory ternary format (default: best native one)\n"
         "  --dump-logits F       one forward at --t, write float32 logits, exit\n"
         "  --t F                 noise level for --dump-logits (default 1.0)\n"
         "  -v, --verbose         per-step progress and timing on stderr\n");
@@ -1093,7 +1161,7 @@ int main(int argc, char **argv) {
     opts_t o = { 0 };
     o.length = 256; o.steps = 20; o.threads = 4; o.temp = 0.9f; o.top_p = 0.95f; o.seed = 42;
     o.eta = 0.04f; o.revise_t_max = 0.5f; o.dump_t = 1.0f;
-    int act = ACT_A4, list = 0;
+    int act = ACT_A4, list = 0, weight_type = -1;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1121,6 +1189,12 @@ int main(int argc, char **argv) {
             const char *v = argv[++i];
             act = !strcmp(v, "a4") ? ACT_A4 : !strcmp(v, "a8") ? ACT_A8 : !strcmp(v, "none") ? ACT_NONE : -1;
             if (act < 0) usage();
+        }
+        else if (OPT("--weight-type")) {
+            const char *v = argv[++i];
+            weight_type = !strcmp(v, "q4") ? GGML_TYPE_Q4_0 : !strcmp(v, "tq2") ? GGML_TYPE_TQ2_0
+                        : !strcmp(v, "tq1") ? GGML_TYPE_TQ1_0 : -2;
+            if (weight_type == -2) usage();
         }
         else if (OPT("--remask")) {
             const char *r = argv[++i];
@@ -1163,7 +1237,7 @@ int main(int argc, char **argv) {
     set_threads(m.cpu, o.threads);
     fprintf(stderr, "device: %s\n", ggml_backend_dev_name(ggml_backend_get_device(m.backend)));
 
-    model_load(&m, o.model);
+    model_load(&m, o.model, weight_type);
     if (m.is_rdt && m.max_loops > MAX_LOOPS) die("max_loop_iters > %d", MAX_LOOPS);
     // Unsupported ops on the main device fall back to the CPU (always last).
     ggml_backend_t backends[2] = { m.backend, m.cpu };
