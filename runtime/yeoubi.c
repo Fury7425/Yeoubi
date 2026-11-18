@@ -85,6 +85,7 @@ typedef struct {
     // runtime
     int act, fast_topk, fused_quant, fused_topk_max;  // fused_topk_max: widest row for fused TopK (0 = none)
     int flash_attn;
+    int views_compact;  // backend ignores views (OpenVINO): make every split compact
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
@@ -474,6 +475,7 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(m->backend);
     // YEOUBI_NO_FAST_TOPK=1 also turns this off, so CI can still reach the argsort path.
     m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(m->backend) : 0;
+    m->views_compact = strncmp(ggml_backend_dev_name(dev), "OPENVINO", 8) == 0;
     // YEOUBI_NO_FLASH_ATTN=1 forces the matmul/softmax attention (for A/B checks).
     m->flash_attn = !getenv("YEOUBI_NO_FLASH_ATTN") &&
                     dev_supports_flash_attn(m->backend, (int) cfg_num(g, "head_dim", 64), (int) cfg_num(g, "n_heads", 12));
@@ -867,9 +869,12 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
     // RMS norm reads the strided views directly (its rows are contiguous) and
     // writes a compact tensor, so q/k only need a copy without q/k-norm. v is
     // consumed through a permute anyway, except by the cache writes.
-    ten *q = rope(b, L->q_norm ? norm(b, qv, L->q_norm) : ggml_cont(c, qv));
-    ten *k = rope(b, L->k_norm ? norm(b, kw, L->k_norm) : ggml_cont(c, kw));
-    ten *v = b->kv != KV_NONE ? ggml_cont(c, vv) : vv;
+    // (Not on OpenVINO: its translator treats VIEW as a no-op, so every split
+    // is made compact there.)
+    const int compact = m->views_compact;
+    ten *q = rope(b, L->q_norm && !compact ? norm(b, qv, L->q_norm) : norm(b, ggml_cont(c, qv), L->q_norm));
+    ten *k = rope(b, L->k_norm && !compact ? norm(b, kw, L->k_norm) : norm(b, ggml_cont(c, kw), L->k_norm));
+    ten *v = b->kv != KV_NONE || compact ? ggml_cont(c, vv) : vv;
 
     int li = b->layer++;
     if (b->kv != KV_NONE) {
