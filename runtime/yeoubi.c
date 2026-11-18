@@ -255,6 +255,39 @@ static int dev_supports_flash_attn(ggml_backend_t be, int hd, int H) {
     return probe_ops(be, c, &o, 1);
 }
 
+// Microseconds for one attention over T positions, fused (flash) or as the
+// matmul/softmax chain the runtime otherwise builds; huge if unsupported.
+static double time_attention(ggml_backend_t be, int hd, int H, int T, int flash) {
+    struct ggml_context *c = probe_ctx();
+    ten *q = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, T), 0, 2, 1, 3);
+    ten *k = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, T), 0, 2, 1, 3);
+    ten *vv = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, T), *o;
+    if (flash) {
+        o = ggml_flash_attn_ext(c, q, k, ggml_permute(c, vv, 0, 2, 1, 3), NULL, 1.0f, 0.0f, 0.0f);
+        ggml_prec_set_acc(o, GGML_PREC_F32);
+    } else {
+        ten *v  = ggml_cont(c, ggml_permute(c, vv, 1, 2, 0, 3));
+        ten *kq = ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), NULL, 1.0f, 0.0f);
+        o = ggml_cont(c, ggml_permute(c, ggml_mul_mat(c, v, kq), 0, 2, 1, 3));
+    }
+    struct ggml_cgraph *gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, o);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+    double us = 1e30;
+    int ok = buf != NULL;
+    for (int i = 0; ok && i < ggml_graph_n_nodes(gf); i++) ok = ggml_backend_supports_op(be, ggml_graph_node(gf, i));
+    if (ok) {
+        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_graph_compute(be, gf);  // warm-up
+        int64_t t0 = ggml_time_us();
+        for (int i = 0; i < 5; i++) ggml_backend_graph_compute(be, gf);
+        us = (ggml_time_us() - t0) / 5.0;
+    }
+    if (buf) ggml_backend_buffer_free(buf);
+    ggml_free(c);
+    return us;
+}
+
 // Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes, 0 if
 // none: only the CPU has it; GPUs use TOP_K + TOP_K_MASK, which was faster.
 static int dev_fused_topk_max(ggml_backend_t be) {
@@ -477,8 +510,18 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(m->backend) : 0;
     m->views_compact = strncmp(ggml_backend_dev_name(dev), "OPENVINO", 8) == 0;
     // YEOUBI_NO_FLASH_ATTN=1 forces the matmul/softmax attention (for A/B checks).
-    m->flash_attn = !getenv("YEOUBI_NO_FLASH_ATTN") &&
-                    dev_supports_flash_attn(m->backend, (int) cfg_num(g, "head_dim", 64), (int) cfg_num(g, "n_heads", 12));
+    // Flash attention only where it is supported and measured faster: on an
+    // Arc iGPU it tied at 64 positions and lost 22% at 512. Timed at 256
+    // positions (a 1024-byte canvas).
+    {
+        const int hd = (int) cfg_num(g, "head_dim", 64), H = (int) cfg_num(g, "n_heads", 12);
+        m->flash_attn = 0;
+        if (!getenv("YEOUBI_NO_FLASH_ATTN") && dev_supports_flash_attn(m->backend, hd, H)) {
+            double t_fa = time_attention(m->backend, hd, H, 256, 1), t_mm = time_attention(m->backend, hd, H, 256, 0);
+            m->flash_attn = t_fa < t_mm;
+            fprintf(stderr, "attention autotune: flash %.0f us, matmul %.0f us\n", t_fa, t_mm);
+        }
+    }
     fprintf(stderr, "topk: %s, act quant: %s, attention: %s\n",
             m->fused_topk_max ? "fused" : m->fast_topk ? "top_k + top_k_mask" : "argsort",
             m->fused_quant ? "fused" : "op chain", m->flash_attn ? "flash" : "matmul");
