@@ -25,6 +25,7 @@ from __future__ import annotations
 import collections
 import math
 import pickle
+import re
 import struct
 import sys
 import zipfile
@@ -74,40 +75,70 @@ def _q4_0_ternary(w: np.ndarray) -> bytes:
     return np.concatenate([d, qs], axis=-1).tobytes()
 
 
+def _ternary(name: str, value: np.ndarray) -> tuple[str, tuple, int, bytes]:
+    if value.shape[-1] % 32 == 0:
+        return name, value.shape, _GGML_Q4_0, _q4_0_ternary(value)
+    # ponytail: odd widths stay dequantized F32; none exist at the shipped
+    # shapes, so a packed path for them is not worth it.
+    w_q, scale = _absmean_ternary(value)
+    return name, value.shape, _GGML_F32, (w_q.astype(np.float32) * scale).tobytes()
+
+
+def _int8_absmax(w: np.ndarray) -> np.ndarray:
+    """``Int8Linear``'s forward weight (per-tensor absmax INT8), dequantized."""
+    # 127.0 / amax on a tensor is reciprocal(amax) * 127 in torch; same here.
+    scale = (np.float32(1.0) / np.float32(max(np.abs(w).max(), np.float32(1e-8)))) * np.float32(127.0)
+    return (np.clip(np.round(w * scale), -127, 127) / scale).astype(np.float32)
+
+
+_EXPERT = re.compile(r"^(.+\.experts)\.(\d+)\.(.+)$")
+
+
 def _collect_tensors(state: dict, config: dict) -> list[tuple[str, tuple, int, bytes]]:
     """Return ``(name, numpy_shape, ggml_type, data)`` for every runtime tensor."""
     tensors = []
+    experts: dict[str, dict[int, np.ndarray]] = collections.defaultdict(dict)
     tie = config.get("tie_embeddings", False)
     for name, value in state.items():
         if tie and name == "unembed.weight":
             continue  # the runtime reuses embed.weight
         value = np.ascontiguousarray(value, dtype=np.float32)
-        if name.endswith(".latent_weight"):
-            base = name[: -len("latent_weight")] + "weight"
-            if value.shape[1] % 32 == 0:
-                tensors.append((base, value.shape, _GGML_Q4_0, _q4_0_ternary(value)))
-            else:
-                # ponytail: odd widths stay dequantized F32; none exist at the
-                # shipped shapes, so a packed path for them is not worth it.
-                w_q, scale = _absmean_ternary(value)
-                tensors.append((base, value.shape, _GGML_F32,
-                                (w_q.astype(np.float32) * scale).tobytes()))
+        hit = _EXPERT.match(name)
+        if hit:  # MoE: gathered and stacked below
+            experts[f"{hit.group(1)}.{hit.group(3)}"][int(hit.group(2))] = value
             continue
-        if name == "recurrent.injection.A_raw":
+        if name.endswith(".latent_weight"):
+            tensors.append(_ternary(name[: -len("latent_weight")] + "weight", value))
+            continue
+        if name.endswith(".router.weight"):
+            value = _int8_absmax(value)
+        elif name == "recurrent.injection.A_raw":
             # Precompute the LTI diagonal; the runtime never needs A_raw.
             name, value = "recurrent.injection.A", (np.float32(0.99) * np.tanh(value)).astype(np.float32)
         elif name.endswith("_local.weight"):
-            # Depthwise conv (D, 1, K) -> (K, D): ggml then sees one contiguous
-            # [D] row per tap, which the runtime multiplies into shifted views.
-            value = np.ascontiguousarray(value[:, 0, :].T)
+            # Depthwise conv (D, 1, K) -> (D, K): ggml's [K, D], the kernel
+            # layout ggml_ssm_conv takes.
+            value = np.ascontiguousarray(value[:, 0, :])
         tensors.append((name, value.shape, _GGML_F32, value.tobytes()))
+
+    # Experts become one [n_experts, out, in] tensor per projection (ggml's
+    # [in, out, n_experts] for ggml_mul_mat_id). Each expert keeps its own
+    # absmean scale, which Q4_0 carries per block anyway.
+    for name, by_index in experts.items():
+        stack = [by_index[i] for i in range(len(by_index))]
+        if name.endswith(".latent_weight"):
+            parts = [_ternary(name, w) for w in stack]
+            shape = (len(stack),) + stack[0].shape
+            tensors.append((name[: -len("latent_weight")] + "weight", shape, parts[0][2],
+                            b"".join(p[3] for p in parts)))
+        else:  # per-expert ffn_sub_norm gain
+            value = np.ascontiguousarray(np.stack(stack))
+            tensors.append((name, value.shape, _GGML_F32, value.tobytes()))
     return tensors
 
 
 def write_gguf(state: dict, config: dict, path: str, *, is_rdt: bool) -> None:
     """``state``: name -> float numpy array (a model state dict); ``config``: asdict(config)."""
-    if config.get("use_moe"):
-        raise ValueError("The native runtime does not support MoE checkpoints yet.")
     kvs = [_kv("general.architecture", "yeoubi"),
            _kv("yeoubi.model_type", "rdt" if is_rdt else "standard")]
     for key, value in config.items():
@@ -154,6 +185,8 @@ _LEGACY_DEFAULTS = {
     "use_sub_norm": False,
     "int4_absmean": False,
     "timestep_scale": 1.0,
+}
+_LEGACY_RDT_DEFAULTS = {
     "detach_recurrent_anchor": True,
     "recurrent_state_init_std": 0.0,
 }
@@ -230,7 +263,7 @@ def export_checkpoint_file(ckpt_path: str, out_path: str) -> None:
     config = dict(ckpt.get("rdt_config") or ckpt.get("model_config") or {})
     if not config:
         raise ValueError("checkpoint has no embedded config; use export.py with fallback flags")
-    for key, legacy in _LEGACY_DEFAULTS.items():
+    for key, legacy in {**_LEGACY_DEFAULTS, **(_LEGACY_RDT_DEFAULTS if is_rdt else {})}.items():
         config.setdefault(key, legacy)
     if config.get("vocab_size", 258) != 258:
         raise ValueError("not a byte-level checkpoint")

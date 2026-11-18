@@ -71,15 +71,18 @@ jobs:
       - name: Parity fixtures
         run: |
           python scripts/make_parity_fixture.py --out fixture
-          for m in rdt std; do
+          for m in rdt std moe; do
             python export.py --checkpoint fixture/$m.pt --output_dir fixture/$m --format gguf
             # The torch-free exporter must write the same file.
             python -m yeoubi.gguf_export fixture/$m.pt fixture/$m/numpy.gguf
             cmp fixture/$m/model.gguf fixture/$m/numpy.gguf
-            for act in a4 a8; do
+            for act in none a4 a8; do
               python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act $act \
                 --save-ref fixture/$m/ref_$act.npz
             done
+            # Cached block path: multi-chunk prompt commit + one denoised block.
+            python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act a4 --block 8 \
+              --save-ref fixture/$m/ref_block.npz
           done
 
       - name: Parity check
@@ -89,11 +92,11 @@ jobs:
           echo "EXE=$EXE" >> "$GITHUB_ENV"
           "$EXE" --list-devices
           fail=0
-          for m in rdt std; do
+          for m in rdt std moe; do
             for dev in $("$EXE" --list-devices | awk '{print $1}'); do
-              for act in a8 a4; do
+              for ref in none a4 a8 block; do
                 echo "== $m on $dev"
-                python scripts/check_runtime_parity.py --ref fixture/$m/ref_$act.npz \
+                python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
                   --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
                   | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
               done
@@ -102,7 +105,9 @@ jobs:
           exit $fail
 
       - name: Sample smoke run
-        run: '"$EXE" -m fixture/rdt/model.gguf -p "Hello" -n 64 --steps 4 -v | od -c | head -n 5'
+        run: |
+          "$EXE" -m fixture/rdt/model.gguf -p "Hello" -n 64 --steps 4 -v | od -c
+          "$EXE" -m fixture/moe/model.gguf -p "Hello" -n 40 --block 16 --steps 4 --auto-length -v | od -c
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -113,3 +118,4 @@ jobs:
             fixture/*/model.gguf
             fixture/*/ref_*.npz
           if-no-files-found: warn
+          retention-days: 7

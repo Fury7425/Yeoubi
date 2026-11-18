@@ -8,6 +8,8 @@ PyTorch without a trained model.
     rdt.pt: RDT, byte patches + decoder FFN, sub-norms, qk-norm, absmean INT4,
             learned loop embedding, loop-specific norms, bridges, soft ACT.
     std.pt: flat transformer, no byte patches, YaRN RoPE, absmax INT4.
+    moe.pt: RDT with MoE in every block, 4 experts / top-2, capacity factor
+            1.0 so tokens are dropped and the capacity logic is exercised.
 """
 
 from __future__ import annotations
@@ -36,6 +38,10 @@ def _randomize(model: torch.nn.Module) -> None:
         for name, p in model.named_parameters():
             if name.endswith("subposition") or name.endswith("A_raw"):
                 p.normal_(0.0, 0.5)
+            elif name.endswith("router.weight"):
+                # Default std 0.01 leaves expert probabilities near-tied, and
+                # a tie decided by float noise is not a runtime bug.
+                p.normal_(0.0, 1.0)
 
 
 def _save(model: torch.nn.Module, config, path: str, rdt: bool) -> None:
@@ -70,6 +76,16 @@ def main() -> None:
     std = BitDiffusionTransformer(std_cfg).eval()
     _randomize(std)
     _save(std, std_cfg, os.path.join(args.out, "std.pt"), rdt=False)
+
+    moe_cfg = RDTConfig(
+        **COMMON, use_rdt=True, use_byte_patches=True, use_moe=True, n_experts=4,
+        top_k_experts=2, moe_layers="all", expert_capacity_factor=1.0,
+        prelude_layers=1, recurrent_layers=1, coda_layers=1, max_loop_iters=2,
+        lora_rank=32, loop_dim=32,
+    )
+    moe = BitRDTTransformer(moe_cfg).eval()
+    _randomize(moe)
+    _save(moe, moe_cfg, os.path.join(args.out, "moe.pt"), rdt=True)
 
 
 if __name__ == "__main__":

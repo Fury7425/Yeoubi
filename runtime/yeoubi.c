@@ -10,9 +10,11 @@
  * to the CPU through ggml_backend_sched, so every build produces the same
  * numbers, only faster or slower.
  *
- * Input is a GGUF from `python export.py --format gguf` (yeoubi/gguf_export.py).
- * The forward pass mirrors yeoubi/model.py + yeoubi/rdt.py at eval time; the
- * sampler mirrors yeoubi/sample.py:denoise(). Check parity with
+ * Input is a GGUF from `python export.py --format gguf` or the torch-free
+ * `python -m yeoubi.gguf_export` (yeoubi/gguf_export.py). The forward pass
+ * mirrors yeoubi/model.py + yeoubi/rdt.py at eval time, MoE included; the
+ * samplers mirror yeoubi/sample.py: denoise() (full canvas) and
+ * BlockDiffusionSampler (--block, quantized KV cache). Check parity with
  * scripts/check_runtime_parity.py before trusting a new build.
  */
 
@@ -34,10 +36,12 @@
 #include <io.h>
 #endif
 
-#define MASK_ID    258
-#define VOCAB      258   // predictable IDs: bytes 0-255, PAD, EOS (byte_codec.py)
-#define GRAPH_SIZE 32768 // nodes; ~75 per block visit, so ~400 visits of headroom
-#define MAX_LOOPS  256
+#define MASK_ID   258
+#define EOS_ID    257
+#define VOCAB     258   // predictable IDs: bytes 0-255, PAD, EOS (byte_codec.py)
+#define MAX_LOOPS 256
+#define MAX_TOPK  16    // experts per token
+#define N_CONST   64    // distinct scalar constants per graph
 
 typedef struct ggml_tensor ten;
 
@@ -56,9 +60,13 @@ static void die(const char *fmt, ...) {
 // ---------------------------------------------------------------------------
 
 enum { ROPE_NONE, ROPE_LINEAR, ROPE_YARN };
-enum { A_NONE, A_INT4, A_TOPK };
+enum { ACT_A4, ACT_A8, ACT_NONE };          // --act: trained stage / A8 stage / off
+enum { Q_INT4, Q_TOPK, Q_INT8 };            // a BitLinear's configured input quantizer
+enum { KV_NONE, KV_READ, KV_COMMIT };       // full canvas / denoise a block / commit a block
 
-typedef struct { ten *up, *gate, *down, *sub; } ffn_t;
+// Dense BitFFN, or BitMoEFFN when router is set (up/gate/down are then
+// stacked [in, out, n_experts] and sub is [ffn_dim, n_experts]).
+typedef struct { ten *up, *gate, *down, *sub, *router; } ffn_t;
 
 typedef struct {
     ten *attn_norm, *ffn_norm, *t_proj;
@@ -70,9 +78,10 @@ typedef struct {
     // config
     int    n_heads, head_dim, hidden, patch, t_dim, loop_dim, max_loops, min_loops;
     int    int4_absmean, adaptive_loops, context_adaptive, context_threshold, rope_type;
-    double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std;
+    int    n_experts, top_k, kv_bits, kv_bos_bits;
+    double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std, capacity_factor;
     // runtime
-    int act_a4;
+    int act;
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
@@ -83,12 +92,18 @@ typedef struct {
     ten *dec_ffn_norm, *out_norm;
     ffn_t dec_ffn;
     block_t *pre, *rec, *post;   // pre = prelude + pre_recurrent (or blocks), post = post_recurrent + coda
-    int n_pre, n_rec, n_post, is_rdt;
+    int n_pre, n_rec, n_post, is_rdt, has_moe;
     ten *inj_A, *inj_B, *lora_down, *lora_up, *act_w, *loop_proj, *loop_proj2, *loop_proj2_b, *loop_norm;
     ten *loop_norms[MAX_LOOPS];
     int n_loop_norms;
     float *alpha, *iter_gate, *loop_embed;  // tiny host copies used as graph constants
     int n_alpha, n_gate, n_loop_embed;
+    // KV cache for the block sampler: one K and V per virtual layer, holding
+    // the dequantized values of PyTorch's quantized KVCache.
+    struct ggml_context *kvctx;
+    ggml_backend_buffer_t kvbuf;
+    ten **kv_k, **kv_v;
+    int kv_layers, kv_cap, kv_len, kv_loops;  // kv_cap / kv_len in global (patch) positions
 } model_t;
 
 static ten *get(model_t *m, const char *name) { return ggml_get_tensor(m->wctx, name); }
@@ -109,7 +124,16 @@ static ten *getf(model_t *m, int required, const char *fmt, ...) {
 }
 
 static void load_ffn(model_t *m, ffn_t *f, const char *p) {
-    f->up   = getf(m, 0, "%s.up_proj.weight", p);
+    f->router = getf(m, 0, "%s.router.weight", p);
+    if (f->router) {
+        f->up   = getf(m, 1, "%s.experts.up_proj.weight", p);
+        f->gate = getf(m, 1, "%s.experts.gate_proj.weight", p);
+        f->down = getf(m, 1, "%s.experts.down_proj.weight", p);
+        f->sub  = getf(m, 0, "%s.experts.sub_norm.weight", p);
+        m->has_moe = 1;
+        return;
+    }
+    f->up = getf(m, 0, "%s.up_proj.weight", p);
     if (!f->up) return;
     f->gate = getf(m, 1, "%s.gate_proj.weight", p);
     f->down = getf(m, 1, "%s.down_proj.weight", p);
@@ -135,7 +159,7 @@ static int load_blocks(model_t *m, const char *prefix, block_t **list, int n) {
         b->attn_sub  = getf(m, 0, "%s.attn.sub_norm.weight", p);
         snprintf(p, sizeof p, "%s.%d.ffn", prefix, i);
         load_ffn(m, &b->ffn, p);
-        if (!b->ffn.up) die("%s: missing FFN (MoE checkpoints are not supported)", p);
+        if (!b->ffn.up) die("%s: no FFN weights", p);
     }
     return n;
 }
@@ -176,9 +200,9 @@ static void model_load(model_t *m, const char *path) {
     struct gguf_context *g = gguf_init_from_file(path, gp);
     if (!g) die("cannot read GGUF %s", path);
     const char *type = cfg_str(g, "model_type", NULL);
-    if (!type) die("%s is not a Yeoubi export (run: python export.py --format gguf)", path);
-    if (cfg_num(g, "use_moe", 0)) die("MoE checkpoints are not supported yet");
+    if (!type) die("%s is not a Yeoubi export (run: python -m yeoubi.gguf_export CKPT OUT.gguf)", path);
     if (cfg_num(g, "vocab_size", VOCAB) != VOCAB) die("not a byte-level checkpoint");
+    if (cfg_num(g, "N_think", 0) > 0) die("legacy thinking-token checkpoints are not supported");
 
     m->is_rdt            = strcmp(type, "rdt") == 0;
     m->n_heads           = (int) cfg_num(g, "n_heads", 12);
@@ -194,11 +218,18 @@ static void model_load(model_t *m, const char *path) {
     m->context_adaptive  = (int) cfg_num(g, "context_adaptive_loops", 0);
     m->context_threshold = (int) cfg_num(g, "context_loop_threshold", 4096);
     m->state_std         = cfg_num(g, "recurrent_state_init_std", 0.0);
+    m->n_experts         = (int) cfg_num(g, "n_experts", 8);
+    m->top_k             = (int) cfg_num(g, "top_k_experts", 2);
+    m->capacity_factor   = cfg_num(g, "expert_capacity_factor", 1.25);
+    m->kv_bits           = (int) cfg_num(g, "kv_cache_bits", 4);
+    m->kv_bos_bits       = (int) cfg_num(g, "kv_cache_bos_bits", 4);
     const char *rope = cfg_str(g, "rope_scaling_type", "none");
     // Matches RotaryEmbedding._scaled: scaling only applies with factor > 1.
     m->rope_type = m->rope_factor <= 1.0       ? ROPE_NONE
                  : strcmp(rope, "linear") == 0 ? ROPE_LINEAR
                  : strcmp(rope, "yarn") == 0   ? ROPE_YARN : ROPE_NONE;
+    if (m->top_k < 1 || m->top_k > MAX_TOPK) die("top_k_experts must be in [1, %d]", MAX_TOPK);
+    if (m->kv_bits < 2 || m->kv_bits > 8 || m->kv_bos_bits < 2 || m->kv_bos_bits > 8) die("kv_cache bits out of range");
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device.
     int64_t nt = gguf_get_n_tensors(g);
@@ -244,6 +275,7 @@ static void model_load(model_t *m, const char *path) {
         m->dec_ffn_norm = get(m, "byte_codec.decoder_ffn_norm.weight");
         m->out_norm     = need(m, "byte_codec.output_norm.weight");
         load_ffn(m, &m->dec_ffn, "byte_codec.decoder_ffn");
+        if (m->enc_conv->ne[1] != m->hidden) die("old GGUF conv layout: re-export with this version");
     }
 
     if (m->is_rdt) {
@@ -273,85 +305,199 @@ static void model_load(model_t *m, const char *path) {
     }
 }
 
+// KV cache sized for `loops` recurrent iterations and `cap` global positions.
+static void kv_alloc(model_t *m, int loops, int cap) {
+    m->kv_loops  = loops;
+    m->kv_layers = m->n_pre + m->n_post + (m->is_rdt ? m->n_rec * loops : 0);
+    m->kv_cap    = cap;
+    m->kv_len    = 0;
+    struct ggml_init_params ip = { (size_t) 2 * m->kv_layers * ggml_tensor_overhead(), NULL, true };
+    m->kvctx = ggml_init(ip);
+    m->kv_k = malloc(sizeof(ten *) * m->kv_layers);
+    m->kv_v = malloc(sizeof(ten *) * m->kv_layers);
+    for (int i = 0; i < m->kv_layers; i++) {
+        // ponytail: stored dequantized in F32 (exactly PyTorch's read-back
+        // values) rather than bit-packed; pack when long contexts need the memory.
+        m->kv_k[i] = ggml_new_tensor_3d(m->kvctx, GGML_TYPE_F32, m->head_dim, m->n_heads, cap);
+        m->kv_v[i] = ggml_new_tensor_3d(m->kvctx, GGML_TYPE_F32, m->head_dim, m->n_heads, cap);
+    }
+    m->kvbuf = ggml_backend_alloc_ctx_tensors_from_buft(m->kvctx, ggml_backend_get_default_buffer_type(m->backend));
+    if (!m->kvbuf) die("out of device memory for the KV cache");
+    ggml_backend_buffer_clear(m->kvbuf, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Graph
 // ---------------------------------------------------------------------------
 
 typedef struct {
     struct ggml_context *ctx;
+    struct ggml_cgraph *gf;
     model_t *m;
-    ten *rope_cos, *rope_sin, *rope_rot, *one;
+    ten *rope_cos, *rope_sin, *consts, *eye, *tril;
+    float cvals[N_CONST];
+    int ncon, kv, layer;
 } gb_t;
+
+// A [1] view of a host-filled constant table. Views of one input keep every
+// scalar on the device; deriving them from a 1-element input with ggml_scale
+// put that op (and a sync) on the CPU.
+static ten *konst(gb_t *b, float v) {
+    int i = 0;
+    while (i < b->ncon && b->cvals[i] != v) i++;
+    if (i == b->ncon) {
+        if (b->ncon == N_CONST) die("constant table full");
+        b->cvals[b->ncon++] = v;
+    }
+    return ggml_view_1d(b->ctx, b->consts, 1, (size_t) i * sizeof(float));
+}
 
 static ten *norm(gb_t *b, ten *x, ten *w) {
     if (!w) return x;  // nn.Identity in the PyTorch model
     return ggml_mul(b->ctx, ggml_rms_norm(b->ctx, x, 1e-6f), w);
 }
 
-// Per-row k-th largest value (1-based) of a contiguous [n, rows] tensor -> [1, rows].
-static ten *kth_largest(gb_t *b, ten *a, int k) {
+// a: contiguous [n, rows]; idx: I32 with one index per row -> [1, rows].
+static ten *pick(gb_t *b, ten *a, ten *idx) {
     struct ggml_context *c = b->ctx;
     int64_t n = a->ne[0], rows = a->ne[1];
-    ten *idx = ggml_argsort(c, a, GGML_SORT_ORDER_DESC);
-    idx = ggml_cont(c, ggml_view_2d(c, idx, 1, rows, idx->nb[1], (size_t) (k - 1) * idx->nb[0]));
-    // Treat each element as a 1-wide row so get_rows gathers one value per row.
-    ten *v = ggml_get_rows(c, ggml_reshape_3d(c, a, 1, n, rows), idx);
+    // Each element becomes a 1-wide row, so get_rows gathers one value per row.
+    ten *v = ggml_get_rows(c, ggml_reshape_3d(c, a, 1, n, rows), ggml_reshape_2d(c, idx, 1, rows));
     return ggml_reshape_2d(c, v, 1, rows);
 }
 
-// HybridQuantizer "int4": per-token scale, round, clamp +/-7, dequantize.
+static ten *row_max(gb_t *b, ten *a) { return pick(b, a, ggml_argmax(b->ctx, a)); }
+
+// HybridQuantizer.forward / absmax_quantize_int8: per-token absmax, +/-127.
+// `amax` may be passed when the caller already has it.
+static ten *q_int8(gb_t *b, ten *x, ten *amax) {
+    struct ggml_context *c = b->ctx;
+    if (!amax) amax = row_max(b, ggml_abs(c, x));
+    ten *step = ggml_scale(c, ggml_clamp(c, amax, 1e-8f, FLT_MAX), 1.0f / 127.0f);
+    return ggml_mul(c, ggml_clamp(c, ggml_round(c, ggml_div(c, x, step)), -127.0f, 127.0f), step);
+}
+
+// HybridQuantizer "int4": absmean (a4.8) or absmax per-token scale, +/-7.
 static ten *q_int4(gb_t *b, ten *x) {
     struct ggml_context *c = b->ctx;
     ten *a = ggml_abs(c, x), *step;
-    if (b->m->int4_absmean) step = ggml_scale(c, ggml_mean(c, a), 1.0f / sqrtf(7.0f));  // beta / sqrt(7)
-    else                    step = ggml_scale(c, kth_largest(b, a, 1), 1.0f / 7.0f);  // amax / 7
-    step = ggml_clamp(c, step, 1e-8f, FLT_MAX);
-    ten *q = ggml_clamp(c, ggml_round(c, ggml_div(c, x, step)), -7.0f, 7.0f);
-    return ggml_mul(c, q, step);
+    if (b->m->int4_absmean) step = ggml_scale(c, ggml_clamp(c, ggml_mean(c, a), 1e-8f, FLT_MAX), 1.0f / sqrtf(7.0f));
+    else                    step = ggml_scale(c, ggml_clamp(c, row_max(b, a), 1e-8f, FLT_MAX), 1.0f / 7.0f);
+    return ggml_mul(c, ggml_clamp(c, ggml_round(c, ggml_div(c, x, step)), -7.0f, 7.0f), step);
 }
 
-// HybridQuantizer "topk_int8": keep the int(n * ratio) largest |x| per token.
-// ponytail: the INT8 rounding after it (and the plain "int8" mode) is skipped:
-// 127 levels per token is below ggml's own Q8 activation blocking noise.
-static ten *topk(gb_t *b, ten *x) {
+// HybridQuantizer "topk_int8": keep the int(n * ratio) largest |x| per token,
+// then INT8. ggml_top_k (radix select) instead of a full argsort: the sort
+// was a quarter of all GPU time. Its indices are unordered, so the threshold
+// is the minimum of the selected values.
+// ponytail: ggml_round rounds halves away from zero, torch to even; exact
+// .5 products are ~1 in 10^6 values and move one value by one level.
+static ten *q_topk8(gb_t *b, ten *x) {
     struct ggml_context *c = b->ctx;
-    int64_t n = x->ne[0];
+    int64_t n = x->ne[0], rows = x->ne[1];
     int k = (int) (n * b->m->topk_ratio);
     if (k < 1) k = 1;
-    if (k >= n) return x;
-    ten *a   = ggml_abs(c, x);
-    ten *thr = ggml_scale(c, kth_largest(b, a, k), 1.0f - 1e-6f);  // keep the k-th itself
-    return ggml_mul(c, x, ggml_step(c, ggml_sub(c, a, thr)));
+    ten *a = ggml_abs(c, x);
+    ten *amax = row_max(b, a);  // the largest survives TopK, so it is also the INT8 scale
+    if (k < n) {
+        ten *vals = ggml_get_rows(c, ggml_reshape_3d(c, a, 1, n, rows), ggml_top_k(c, a, k));
+        vals = ggml_reshape_2d(c, vals, k, rows);
+        ten *thr = pick(b, vals, ggml_argmax(c, ggml_scale(c, vals, -1.0f)));
+        // 1 - 1e-6 keeps the k-th value itself (step(0) == 0).
+        x = ggml_mul(c, x, ggml_step(c, ggml_sub(c, a, ggml_scale(c, thr, 1.0f - 1e-6f))));
+    }
+    return q_int8(b, x, amax);
 }
 
-static ten *lin(gb_t *b, ten *w, ten *x, int mode) {
-    if (b->m->act_a4) {
-        if (mode == A_INT4) x = q_int4(b, x);
-        if (mode == A_TOPK) x = topk(b, x);
+static ten *quant(gb_t *b, ten *x, int mode) {
+    switch (b->m->act) {
+        case ACT_NONE: return x;
+        case ACT_A8:   return q_int8(b, x, NULL);  // set_activation_mode("A8"): INT8 everywhere
+        default:       break;
     }
-    return ggml_mul_mat(b->ctx, w, x);
+    return mode == Q_INT4 ? q_int4(b, x) : mode == Q_TOPK ? q_topk8(b, x) : q_int8(b, x, NULL);
 }
+
+static ten *lin(gb_t *b, ten *w, ten *x, int mode) { return ggml_mul_mat(b->ctx, w, quant(b, x, mode)); }
 
 static ten *ffn(gb_t *b, ffn_t *f, ten *h) {
     struct ggml_context *c = b->ctx;
-    if (b->m->act_a4) h = q_int4(b, h);  // up and gate share one quantized input
+    h = quant(b, h, Q_INT4);  // up and gate share one quantized input
     ten *mid = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, f->gate, h)), ggml_mul_mat(c, f->up, h));
-    return lin(b, f->down, norm(b, mid, f->sub), A_TOPK);
+    return lin(b, f->down, norm(b, mid, f->sub), Q_TOPK);
 }
 
-// RotaryEmbedding.forward: x * cos + rotate_half(x) * sin, x = [hd, H, T].
-// Not ggml_rope_ext: Vulkan rejects RoPE with per-dimension frequency factors
-// (needed for YaRN), and every attention layer then bounced to the CPU. Host
-// cos/sin tables plus a +/-1 rotation matmul run on every backend and match
-// PyTorch's tables exactly.
+// BitMoEFFN.forward (eager path, which sample.py runs): softmax router,
+// top-k, renormalise, Switch capacity, probability-weighted expert sum.
+static ten *moe(gb_t *b, ffn_t *f, ten *h) {
+    struct ggml_context *c = b->ctx;
+    model_t *m = b->m;
+    int N = m->n_experts, K = m->top_k;
+    int64_t D = h->ne[0], T = h->ne[1];
+    if (f->up->ne[2] != N) die("MoE: %d experts in weights, %d in config", (int) f->up->ne[2], N);
+
+    // Router: Int8Linear, its weight already int8-dequantized at export.
+    ten *probs = ggml_soft_max(c, ggml_mul_mat(c, f->router, h));       // [N, T]
+    ten *order = ggml_argsort(c, probs, GGML_SORT_ORDER_DESC);          // [N, T]
+    ten *ids   = ggml_cont(c, ggml_view_2d(c, order, K, T, order->nb[1], 0));  // [K, T]
+
+    // Capacity in the eager loop's order (slot-major, then token order):
+    // pick (k, t) of expert e survives iff picks of e in earlier slots plus
+    // earlier tokens of slot k are < capacity. Counts come from one-hot rows
+    // of an identity matrix and a strictly-lower-triangular matmul.
+    int cap = (int) ((double) T / N * m->capacity_factor);
+    if (cap < 1) cap = 1;
+    ten *seen = NULL, *psum = NULL, *p[MAX_TOPK], *keep[MAX_TOPK];
+    for (int k = 0; k < K; k++) {
+        ten *idk  = ggml_cont(c, ggml_view_2d(c, order, 1, T, order->nb[1], (size_t) k * order->nb[0]));
+        ten *hot  = ggml_get_rows(c, b->eye, ggml_reshape_1d(c, idk, T));       // [N, T]
+        ten *hotT = ggml_cont(c, ggml_transpose(c, hot));                         // [T, N]
+        ten *rank = ggml_mul_mat(c, hotT, b->tril);                               // [N, T]
+        if (seen) rank = ggml_add(c, rank, seen);
+        ten *ok = ggml_step(c, ggml_add(c, ggml_scale(c, rank, -1.0f), konst(b, (float) cap - 0.5f)));
+        keep[k] = ggml_sum_rows(c, ggml_mul(c, hot, ok));                         // [1, T]
+        p[k]    = ggml_sum_rows(c, ggml_mul(c, hot, probs));                      // [1, T]
+        ten *cnt = ggml_reshape_2d(c, ggml_sum_rows(c, hotT), N, 1);
+        seen = seen ? ggml_add(c, seen, cnt) : cnt;
+        psum = psum ? ggml_add(c, psum, p[k]) : p[k];
+    }
+    ten *w = NULL;  // [1, K, T]
+    for (int k = 0; k < K; k++) {
+        ten *wk = ggml_reshape_3d(c, ggml_mul(c, ggml_div(c, p[k], psum), keep[k]), 1, 1, T);
+        w = w ? ggml_concat(c, w, wk, 1) : wk;
+    }
+
+    ten *x3 = ggml_reshape_3d(c, quant(b, h, Q_INT4), D, 1, T);
+    ten *mid = ggml_mul(c, ggml_silu(c, ggml_mul_mat_id(c, f->gate, x3, ids)),
+                        ggml_mul_mat_id(c, f->up, x3, ids));                      // [F, K, T]
+    int64_t F = mid->ne[0];
+    if (f->sub) {  // per-expert ffn_sub_norm gain
+        ten *g = ggml_get_rows(c, f->sub, ggml_reshape_1d(c, ids, (int64_t) K * T));
+        mid = ggml_mul(c, ggml_rms_norm(c, mid, 1e-6f), ggml_reshape_3d(c, g, F, K, T));
+    }
+    mid = ggml_reshape_3d(c, quant(b, ggml_reshape_2d(c, mid, F, (int64_t) K * T), Q_TOPK), F, K, T);
+    ten *out = ggml_mul(c, ggml_mul_mat_id(c, f->down, mid, ids), w);           // [D, K, T]
+    ten *sum = NULL;
+    for (int k = 0; k < K; k++) {
+        ten *v = ggml_view_2d(c, out, D, T, out->nb[2], (size_t) k * out->nb[1]);
+        sum = sum ? ggml_add(c, sum, v) : ggml_cont(c, v);
+    }
+    return sum;
+}
+
+// RotaryEmbedding.forward: x * cos + rotate_half(x) * sin with x = [hd, H, T].
+// rotate_half(x) = cat(-x2, x1) = roll(x, hd/2) * [-1.., +1..]; the sign is
+// folded into the sin table. Host tables, not ggml_rope_ext: they reproduce
+// PyTorch's YaRN ramp and attention temperature exactly, and the native op
+// with YaRN frequency factors had been landing on the CPU under Vulkan.
 static ten *rope(gb_t *b, ten *x) {
     struct ggml_context *c = b->ctx;
-    ten *rot = ggml_mul_mat(c, b->rope_rot, x);  // cat(-x2, x1)
+    ten *rot = ggml_roll(c, x, b->m->head_dim / 2, 0, 0, 0);
     return ggml_add(c, ggml_mul(c, x, b->rope_cos), ggml_mul(c, rot, b->rope_sin));
 }
 
-// Fill cos/sin [hd, Tp] and the rotate-half matrix, as RotaryEmbedding._build_cache.
-static void rope_tables(model_t *m, int Tp, float *cos_t, float *sin_t, float *rot) {
+// cos and signed sin [hd, Tp] for positions off.., as RotaryEmbedding._build_cache.
+static void rope_tables(model_t *m, int off, int Tp, float *cos_t, float *sin_t) {
     int hd = m->head_dim, n = hd / 2;
     float s = (float) m->rope_factor;
     float mscale = m->rope_type == ROPE_YARN ? (float) (0.1 * log(m->rope_factor) + 1.0) : 1.0f;
@@ -363,66 +509,110 @@ static void rope_tables(model_t *m, int Tp, float *cos_t, float *sin_t, float *r
             inv *= (1.0f - ramp) + ramp / s;
         }
         for (int p = 0; p < Tp; p++) {
-            float a = (m->rope_type == ROPE_LINEAR ? (float) p / s : (float) p) * inv;
-            cos_t[(size_t) p * hd + i] = cos_t[(size_t) p * hd + i + n] = cosf(a) * mscale;
-            sin_t[(size_t) p * hd + i] = sin_t[(size_t) p * hd + i + n] = sinf(a) * mscale;
+            float pos = (float) (off + p);
+            float a = (m->rope_type == ROPE_LINEAR ? pos / s : pos) * inv;
+            float cv = cosf(a) * mscale, sv = sinf(a) * mscale;
+            cos_t[(size_t) p * hd + i] = cos_t[(size_t) p * hd + i + n] = cv;
+            sin_t[(size_t) p * hd + i] = -sv;
+            sin_t[(size_t) p * hd + i + n] = sv;
         }
     }
-    // mul_mat(R, x)[o] = sum_k R[o * hd + k] * x[k]
-    memset(rot, 0, sizeof(float) * hd * hd);
-    for (int o = 0; o < n; o++) rot[(size_t) o * hd + o + n] = -1.0f;
-    for (int o = n; o < hd; o++) rot[(size_t) o * hd + o - n] = 1.0f;
+}
+
+// KVCache quantize_kv + dequantize_kv: per (token, head) absmax over head_dim.
+static ten *kv_quant_bits(gb_t *b, ten *x, int bits) {
+    struct ggml_context *c = b->ctx;
+    int64_t hd = x->ne[0], H = x->ne[1], T = x->ne[2];
+    float half = (float) (((1 << bits) - 1) / 2), top = (float) ((1 << bits) - 1);
+    ten *x2 = ggml_reshape_2d(c, ggml_cont(c, x), hd, H * T);
+    ten *scale = ggml_div(c, ggml_clamp(c, row_max(b, ggml_abs(c, x2)), 1e-8f, FLT_MAX), konst(b, half));
+    ten *q = ggml_clamp(c, ggml_round(c, ggml_add(c, ggml_div(c, x2, scale), konst(b, half))), 0.0f, top);
+    return ggml_reshape_3d(c, ggml_mul(c, ggml_add(c, q, konst(b, -half)), scale), hd, H, T);
+}
+
+static ten *kv_quant(gb_t *b, ten *x, int first) {
+    model_t *m = b->m;
+    int64_t T = x->ne[2];
+    // KVCache.update stores the first position ever (legacy "BOS") at its own width.
+    if (first && m->kv_bos_bits != m->kv_bits && T > 1) {
+        ten *a = ggml_view_3d(b->ctx, x, x->ne[0], x->ne[1], 1, x->nb[1], x->nb[2], 0);
+        ten *r = ggml_view_3d(b->ctx, x, x->ne[0], x->ne[1], T - 1, x->nb[1], x->nb[2], x->nb[2]);
+        return ggml_concat(b->ctx, kv_quant_bits(b, a, m->kv_bos_bits), kv_quant_bits(b, r, m->kv_bits), 2);
+    }
+    return kv_quant_bits(b, x, first ? m->kv_bos_bits : m->kv_bits);
+}
+
+static ten *kv_view(gb_t *b, ten *t, int start, int64_t n) {
+    return ggml_view_3d(b->ctx, t, t->ne[0], t->ne[1], n, t->nb[1], t->nb[2], (size_t) start * t->nb[2]);
 }
 
 static ten *attention(gb_t *b, block_t *L, ten *h) {
     struct ggml_context *c = b->ctx;
-    int hd = b->m->head_dim, H = b->m->n_heads;
+    model_t *m = b->m;
+    int hd = m->head_dim, H = m->n_heads;
     int64_t T = h->ne[1];
-    if (b->m->act_a4) h = q_int4(b, h);  // q, k, v share one quantized input
+    h = quant(b, h, Q_INT4);  // q, k, v share one quantized input
     ten *q = ggml_reshape_3d(c, ggml_mul_mat(c, L->wq, h), hd, H, T);
     ten *k = ggml_reshape_3d(c, ggml_mul_mat(c, L->wk, h), hd, H, T);
     ten *v = ggml_reshape_3d(c, ggml_mul_mat(c, L->wv, h), hd, H, T);
     q = rope(b, norm(b, q, L->q_norm));
     k = rope(b, norm(b, k, L->k_norm));
+
+    int li = b->layer++;
+    if (b->kv != KV_NONE) {
+        if (li >= m->kv_layers) die("KV cache has %d layers, graph needs more", m->kv_layers);
+        int L0 = m->kv_len;
+        if (b->kv == KV_COMMIT) {
+            // Committing attends over the cache's own dequantized copy, as
+            // KVCache.update returns it, and writes that copy back.
+            k = kv_quant(b, k, L0 == 0);
+            v = kv_quant(b, v, L0 == 0);
+            ggml_build_forward_expand(b->gf, ggml_cpy(c, k, kv_view(b, m->kv_k[li], L0, T)));
+            ggml_build_forward_expand(b->gf, ggml_cpy(c, v, kv_view(b, m->kv_v[li], L0, T)));
+        }
+        if (L0 > 0) {
+            k = ggml_concat(c, kv_view(b, m->kv_k[li], 0, L0), k, 2);
+            v = ggml_concat(c, kv_view(b, m->kv_v[li], 0, L0), v, 2);
+        }
+    }
+
     q = ggml_permute(c, q, 0, 2, 1, 3);                 // [hd, T, H]
-    k = ggml_permute(c, k, 0, 2, 1, 3);
-    v = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));   // [T, hd, H]
-    // Bidirectional, unpadded canvas: no mask at all.
-    // ponytail: plain softmax attention (T^2 per head); swap in
-    // ggml_flash_attn_ext when canvases get long enough for that to matter.
+    k = ggml_permute(c, k, 0, 2, 1, 3);                 // [hd, Tk, H]
+    v = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));   // [Tk, hd, H]
+    // Bidirectional and unpadded (the cache holds no padding): no mask at all.
+    // ponytail: plain softmax attention; ggml_flash_attn_ext once canvases or
+    // caches reach a few thousand positions.
     ten *kq = ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), NULL, 1.0f / sqrtf((float) hd), 0.0f);
     ten *o  = ggml_cont(c, ggml_permute(c, ggml_mul_mat(c, v, kq), 0, 2, 1, 3));  // [hd, H, T]
     o = ggml_reshape_2d(c, o, (int64_t) hd * H, T);
-    return lin(b, L->wo, norm(b, o, L->attn_sub), A_TOPK);
+    return lin(b, L->wo, norm(b, o, L->attn_sub), Q_TOPK);
 }
 
 static ten *block(gb_t *b, block_t *L, ten *x, ten *temb) {
     struct ggml_context *c = b->ctx;
     ten *h = ggml_add(c, norm(b, x, L->attn_norm), ggml_mul_mat(c, L->t_proj, temb));
     x = ggml_add(c, x, attention(b, L, h));
-    return ggml_add(c, x, ffn(b, &L->ffn, norm(b, x, L->ffn_norm)));
+    h = norm(b, x, L->ffn_norm);
+    return ggml_add(c, x, L->ffn.router ? moe(b, &L->ffn, h) : ffn(b, &L->ffn, h));
 }
 
-// BytePatchCodec._local_residual: x + depthwise_conv(norm(x)), zero padded,
-// written as K shifted multiply-adds so every backend runs it natively.
-static ten *local_residual(gb_t *b, ten *x, ten *nw, ten *w) {
+// BytePatchCodec._local_residual: x + depthwise_conv(norm(x)), zero padded
+// on both sides. ggml_ssm_conv is exactly that depthwise cross-correlation
+// over a pre-padded input, in one op instead of K multiply-adds.
+static ten *local_residual(gb_t *b, ten *x, ten *nw, ten *w /* [K, D] */) {
     struct ggml_context *c = b->ctx;
     ten *l = norm(b, x, nw);
-    int64_t D = l->ne[0], T = l->ne[1], K = w->ne[1];
-    ten *p = ggml_pad_ext(c, l, 0, 0, (int) (K / 2), (int) (K / 2), 0, 0, 0, 0);
-    ten *acc = NULL;
-    for (int64_t k = 0; k < K; k++) {
-        ten *term = ggml_mul(c, ggml_view_2d(c, p, D, T, p->nb[1], (size_t) k * p->nb[1]),
-                             ggml_view_1d(c, w, D, (size_t) k * w->nb[1]));
-        acc = acc ? ggml_add(c, acc, term) : term;
-    }
-    return ggml_add(c, x, acc);
+    int64_t D = l->ne[0], T = l->ne[1];
+    int K = (int) w->ne[0];
+    ten *lt = ggml_pad_ext(c, ggml_cont(c, ggml_transpose(c, l)), K / 2, K / 2, 0, 0, 0, 0, 0, 0);
+    ten *y = ggml_ssm_conv(c, ggml_reshape_3d(c, lt, lt->ne[0], D, 1), w);  // [D, T, 1]
+    return ggml_add(c, x, ggml_reshape_2d(c, y, D, T));
 }
 
 static int clampi(int i, int n) { return i < n ? i : n - 1; }
 
-// Inputs a given model never reads (b.one without soft ACT, ...) are pruned
-// from the graph and get no buffer; writing to them would assert.
+// Inputs a given model never reads are pruned from the graph and get no
+// buffer; writing to them would assert.
 static void set_input(ten *t, const void *data, size_t size) {
     if (t && t->buffer) ggml_backend_tensor_set(t, data, 0, size);
 }
@@ -431,7 +621,7 @@ static ten *recurrent(gb_t *b, ten *x, ten *temb, int n_loops, ten *noise, ten *
     struct ggml_context *c = b->ctx;
     model_t *m = b->m;
     // Loop invariants: B(e) and the timestep projections never change per loop.
-    ten *Be = ggml_mul_mat(c, m->inj_B, x);
+    ten *Be = lin(b, m->inj_B, x, Q_INT8);
     ten *ts = ggml_mul_mat(c, m->loop_proj, temb);
     ten *tb = ggml_add(c, ggml_mul_mat(c, m->loop_proj2, temb), m->loop_proj2_b);
     ten *h  = noise ? ggml_add(c, x, ggml_scale(c, noise, (float) m->state_std)) : x;
@@ -445,51 +635,67 @@ static ten *recurrent(gb_t *b, ten *x, ten *temb, int n_loops, ten *noise, ten *
         ten *ln = m->n_loop_norms ? m->loop_norms[clampi(i, m->n_loop_norms)] : m->loop_norm;
         ten *bo = norm(b, h, ln);
         for (int r = 0; r < m->n_rec; r++) bo = block(b, &m->rec[r], bo, temb);
-        ten *lora = lin(b, m->lora_up, ggml_mul_mat(c, m->lora_down, bo), A_TOPK);
+        ten *lora = lin(b, m->lora_up, lin(b, m->lora_down, bo, Q_INT8), Q_TOPK);
         bo = ggml_add(c, bo, ggml_scale(c, lora, m->iter_gate[clampi(i, m->n_gate)]));
         bo = ggml_scale(c, bo, m->alpha[clampi(i, m->n_alpha)]);
         h = ggml_add(c, ggml_add(c, ggml_mul(c, h, m->inj_A), Be), bo);
         hs[i] = h;
-        if (m->act_w) ws[i] = ggml_sigmoid(c, ggml_mul_mat(c, m->act_w, h));  // [1, T]
+        if (m->act_w) ws[i] = ggml_sigmoid(c, lin(b, m->act_w, h, Q_INT8));  // [1, T]
     }
     if (!m->act_w) return h;
 
     // Soft ACT blend (BitRecurrentBlock.forward): normalise weights across
     // loops, sequential lerp, divide out the achieved total weight.
+    ten *one = konst(b, 1.0f);
     ten *sum = ws[0];
     for (int i = 1; i < n_loops; i++) sum = ggml_add(c, sum, ws[i]);
-    sum = ggml_add(c, sum, ggml_scale(c, b->one, 1e-6f));
+    sum = ggml_add(c, sum, konst(b, 1e-6f));
     ten *out = NULL, *keep = NULL;
     for (int i = 0; i < n_loops; i++) {
         ten *wn = ggml_div(c, ws[i], sum);
         out = out ? ggml_add(c, out, ggml_mul(c, ggml_sub(c, hs[i], out), wn)) : ggml_mul(c, hs[i], wn);
-        ten *rest = ggml_add(c, ggml_scale(c, wn, -1.0f), b->one);  // 1 - wn
+        ten *rest = ggml_add(c, ggml_scale(c, wn, -1.0f), one);  // 1 - wn
         keep = keep ? ggml_mul(c, keep, rest) : rest;
     }
-    ten *total = ggml_clamp(c, ggml_add(c, ggml_scale(c, keep, -1.0f), b->one), 1e-6f, FLT_MAX);
+    ten *total = ggml_clamp(c, ggml_add(c, ggml_scale(c, keep, -1.0f), one), 1e-6f, FLT_MAX);
     return ggml_div(c, out, total);
 }
 
 // One denoiser call. ids: T byte IDs (T % patch == 0). sc: optional
-// self-conditioning probabilities [T][VOCAB]. out: logits [T][embed rows].
+// self-conditioning probabilities [T][VOCAB]. out: logits [T][embed rows]
+// (unused for KV_COMMIT). kv: KV_NONE (full canvas), KV_READ (attend over the
+// committed cache), KV_COMMIT (store this canvas at t = 0).
 static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
-                    const float *sc, const float *noise, float *out) {
-    size_t mem = ggml_tensor_overhead() * GRAPH_SIZE * 2 + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+                    const float *sc, const float *noise, float *out, int kv) {
+    int D = m->hidden, P = m->patch, Tp = T / P, hd = m->head_dim;
+    if (kv != KV_NONE) {
+        if (m->is_rdt && n_loops != m->kv_loops) die("KV cache was sized for %d loops", m->kv_loops);
+        if (m->kv_len + Tp > m->kv_cap) die("KV cache full");
+    }
+    int visits = m->n_pre + m->n_post + (m->is_rdt ? m->n_rec * n_loops : 0);
+    size_t graph_size = (size_t) 320 * (visits + 4) + 4096;  // nodes; ~200 per block visit with MoE
+    size_t mem = ggml_tensor_overhead() * graph_size * 2 + ggml_graph_overhead_custom(graph_size, false);
     struct ggml_init_params ip = { mem, NULL, true };
     struct ggml_context *c = ggml_init(ip);
-    gb_t b = { c, m, NULL, NULL, NULL, NULL };
-    int D = m->hidden, P = m->patch, Tp = T / P, hd = m->head_dim;
+    gb_t b = { 0 };
+    b.ctx = c;
+    b.m = m;
+    b.kv = kv;
+    b.gf = ggml_new_graph_custom(c, graph_size, false);
 
     ten *in_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
     ten *in_tf  = ggml_new_tensor_2d(c, GGML_TYPE_F32, m->t_dim, 1);
     b.rope_cos = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);  // broadcast over heads
     b.rope_sin = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);
-    b.rope_rot = ggml_new_tensor_2d(c, GGML_TYPE_F32, hd, hd);
-    b.one = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1);
+    b.consts   = ggml_new_tensor_1d(c, GGML_TYPE_F32, N_CONST);
+    if (m->has_moe) {
+        b.eye  = ggml_new_tensor_2d(c, GGML_TYPE_F32, m->n_experts, m->n_experts);
+        b.tril = ggml_new_tensor_2d(c, GGML_TYPE_F32, Tp, Tp);
+    }
     ten *in_sc    = sc && m->self_cond_proj ? ggml_new_tensor_2d(c, GGML_TYPE_F32, VOCAB, T) : NULL;
     ten *in_sig   = m->is_rdt ? ggml_new_tensor_2d(c, GGML_TYPE_F32, m->loop_dim, n_loops) : NULL;
     ten *in_noise = m->is_rdt && noise ? ggml_new_tensor_2d(c, GGML_TYPE_F32, D, Tp) : NULL;
-    ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.rope_rot, b.one, in_sc, in_sig, in_noise };
+    ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.consts, b.eye, b.tril, in_sc, in_sig, in_noise };
     for (size_t i = 0; i < sizeof inputs / sizeof *inputs; i++) if (inputs[i]) ggml_set_input(inputs[i]);
 
     // NoiseEmbedding MLP (the sinusoid features come from the host).
@@ -506,29 +712,30 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
     if (m->subpos) {
         x = ggml_reshape_2d(c, ggml_add(c, ggml_reshape_3d(c, x, D, P, Tp), m->subpos), D, T);
         skip = local_residual(&b, x, m->enc_norm, m->enc_conv);
-        // compress is an "int8" BitLinear: no fake-quant (see topk()).
-        x = ggml_mul_mat(c, m->cmp, norm(&b, ggml_reshape_2d(c, skip, (int64_t) D * P, Tp), m->cmp_norm));
+        x = lin(&b, m->cmp, norm(&b, ggml_reshape_2d(c, skip, (int64_t) D * P, Tp), m->cmp_norm), Q_INT8);
     }
 
     for (int i = 0; i < m->n_pre; i++) x = block(&b, &m->pre[i], x, temb);
     if (m->is_rdt) x = recurrent(&b, x, temb, n_loops, in_noise, in_sig);
     for (int i = 0; i < m->n_post; i++) x = block(&b, &m->post[i], x, temb);
-    x = norm(&b, x, m->final_norm);
 
-    if (m->subpos) {
-        ten *e = ggml_reshape_2d(c, ggml_mul_mat(c, m->exp, x), D, T);
-        x = ggml_scale(c, ggml_add(c, e, skip), 0.70710678f);  // 2 ** -0.5
-        x = local_residual(&b, x, m->dec_norm, m->dec_conv);
-        if (m->dec_ffn.up) x = ggml_add(c, x, ffn(&b, &m->dec_ffn, norm(&b, x, m->dec_ffn_norm)));
-        x = norm(&b, x, m->out_norm);
+    ten *logits = NULL;
+    if (kv != KV_COMMIT) {  // a commit only needs the K/V writes already in the graph
+        x = norm(&b, x, m->final_norm);
+        if (m->subpos) {
+            ten *e = ggml_reshape_2d(c, lin(&b, m->exp, x, Q_INT8), D, T);
+            x = ggml_scale(c, ggml_add(c, e, skip), 0.70710678f);  // 2 ** -0.5
+            x = local_residual(&b, x, m->dec_norm, m->dec_conv);
+            if (m->dec_ffn.up) x = ggml_add(c, x, ffn(&b, &m->dec_ffn, norm(&b, x, m->dec_ffn_norm)));
+            x = norm(&b, x, m->out_norm);
+        }
+        logits = ggml_mul_mat(c, m->embed, x);  // tied head: [rows, T]
+        ggml_set_output(logits);
+        ggml_build_forward_expand(b.gf, logits);
     }
-    ten *logits = ggml_mul_mat(c, m->embed, x);  // tied head: [rows, T]
-    ggml_set_output(logits);
 
-    struct ggml_cgraph *gf = ggml_new_graph_custom(c, GRAPH_SIZE, false);
-    ggml_build_forward_expand(gf, logits);
     ggml_backend_sched_reset(m->sched);
-    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) die("graph allocation failed");
+    if (!ggml_backend_sched_alloc_graph(m->sched, b.gf)) die("graph allocation failed");
 
     // Host-side inputs.
     set_input(in_ids, ids, sizeof(int32_t) * T);
@@ -544,15 +751,24 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
         free(tf);
     }
     {
-        float *cs = malloc(sizeof(float) * ((size_t) 2 * hd * Tp + (size_t) hd * hd));
-        rope_tables(m, Tp, cs, cs + (size_t) hd * Tp, cs + (size_t) 2 * hd * Tp);
+        // With a cache, positions continue after the committed patches.
+        float *cs = malloc(sizeof(float) * 2 * hd * Tp);
+        rope_tables(m, kv != KV_NONE ? m->kv_len : 0, Tp, cs, cs + (size_t) hd * Tp);
         set_input(b.rope_cos, cs, sizeof(float) * hd * Tp);
         set_input(b.rope_sin, cs + (size_t) hd * Tp, sizeof(float) * hd * Tp);
-        set_input(b.rope_rot, cs + (size_t) 2 * hd * Tp, sizeof(float) * hd * hd);
         free(cs);
     }
-    float one = 1.0f;
-    set_input(b.one, &one, sizeof one);
+    set_input(b.consts, b.cvals, sizeof(float) * N_CONST);
+    if (b.eye) {
+        int N = m->n_experts;
+        float *e = calloc((size_t) N * N + (size_t) Tp * Tp, sizeof(float));
+        for (int i = 0; i < N; i++) e[(size_t) i * N + i] = 1.0f;
+        float *tl = e + (size_t) N * N;  // tril[t][s] = 1 for s < t (ne0 = s)
+        for (int tt = 0; tt < Tp; tt++) for (int s = 0; s < tt; s++) tl[(size_t) tt * Tp + s] = 1.0f;
+        set_input(b.eye, e, sizeof(float) * N * N);
+        set_input(b.tril, tl, sizeof(float) * Tp * Tp);
+        free(e);
+    }
     if (in_sc) set_input(in_sc, sc, sizeof(float) * VOCAB * T);
     if (in_noise) set_input(in_noise, noise, sizeof(float) * D * Tp);
     if (in_sig) {
@@ -577,13 +793,14 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
         free(sig);
     }
 
-    if (ggml_backend_sched_graph_compute(m->sched, gf) != GGML_STATUS_SUCCESS) die("graph compute failed");
-    ggml_backend_tensor_get(logits, out, 0, ggml_nbytes(logits));
+    if (ggml_backend_sched_graph_compute(m->sched, b.gf) != GGML_STATUS_SUCCESS) die("graph compute failed");
+    if (logits) ggml_backend_tensor_get(logits, out, 0, ggml_nbytes(logits));
+    if (kv == KV_COMMIT) m->kv_len += Tp;
     ggml_free(c);
 }
 
 // ---------------------------------------------------------------------------
-// Sampler (yeoubi/sample.py: denoise)
+// Samplers (yeoubi/sample.py)
 // ---------------------------------------------------------------------------
 
 static uint64_t rng_state;
@@ -608,6 +825,8 @@ static int by_p_desc(const void *a, const void *b) {
     float x = ((const pi_t *) a)->p, y = ((const pi_t *) b)->p;
     return (x < y) - (x > y);
 }
+
+static int by_p_asc(const void *a, const void *b) { return by_p_desc(b, a); }
 
 static void softmax(const float *l, float temp, float *p) {
     float mx = -FLT_MAX, s = 0;
@@ -635,14 +854,9 @@ static int draw(const float *l, float temp, float top_p) {
     return s[n - 1].i;
 }
 
-static int by_conf(const void *a, const void *b) {
-    float x = ((const pi_t *) a)->p, y = ((const pi_t *) b)->p;
-    return (x > y) - (x < y);
-}
-
 typedef struct {
     const char *model, *device, *prompt, *prompt_file, *dump;
-    int length, steps, loops, threads, verbose, remask;  // remask: 0 random, 1 confidence, 2 remdm
+    int length, steps, loops, threads, verbose, remask, block, auto_length;  // remask: 0 random, 1 confidence, 2 remdm
     float temp, top_p, eta, revise, revise_t_max, dump_t;
     uint64_t seed;
 } opts_t;
@@ -666,38 +880,24 @@ static float *make_noise(model_t *m, int T) {
     return z;
 }
 
-static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int plen) {
-    int P = m->patch, rows = (int) m->embed->ne[1];
-    int T = o->length > plen ? o->length : plen + 1;
-    T = (T + P - 1) / P * P;  // canvas must fill whole patches; extra bytes are just generated too
-    int32_t *ids  = malloc(sizeof(int32_t) * T);
-    char *masked  = malloc(T);
-    float *logits = malloc(sizeof(float) * rows * T);
-    float *sc     = NULL;
-    for (int i = 0; i < T; i++) ids[i] = i < plen ? prompt[i] : MASK_ID;
-
-    if (o->dump) {  // parity mode: one forward, raw float32 [T][rows]
-        float *z = make_noise(m, T);
-        forward(m, ids, T, o->dump_t, select_loops(m, o, o->dump_t, T), NULL, z, logits);
-        free(z);
-        FILE *f = fopen(o->dump, "wb");
-        if (!f) die("cannot write %s", o->dump);
-        fwrite(logits, sizeof(float), (size_t) rows * T, f);
-        fclose(f);
-        fprintf(stderr, "wrote %d x %d logits to %s\n", T, rows, o->dump);
-        return 0;
-    }
-
+// The denoising schedule over one canvas, in place. Positions < frozen are
+// prompt. fixed_loops > 0 pins the recurrent depth (required with a cache).
+static void denoise(model_t *m, const opts_t *o, int32_t *ids, int T, int frozen, int kv,
+                    int fixed_loops, float *logits) {
+    int rows = (int) m->embed->ne[1];
+    char *masked = malloc(T);
+    float *sc = NULL, p[VOCAB];
     for (int s = 0; s < o->steps; s++) {
-        double tc = acos(1.0 - (1.0 - (double) s / o->steps)) / 1.5707963267948966;
-        double tn = acos(1.0 - (1.0 - (double) (s + 1) / o->steps)) / 1.5707963267948966;
+        // Uniform in mask probability (CosineSchedule.inverse of linspace(1, 0)).
+        double tc = acos((double) s / o->steps) / 1.5707963267948966;
+        double tn = acos((double) (s + 1) / o->steps) / 1.5707963267948966;
+        int nl = fixed_loops > 0 ? fixed_loops : select_loops(m, o, tc, T);
         float *z = make_noise(m, T);
         int64_t t0 = ggml_time_us();
-        int nl = select_loops(m, o, tc, T);
-        forward(m, ids, T, (float) tc, nl, sc, z, logits);
+        forward(m, ids, T, (float) tc, nl, sc, z, logits, kv);
         double ms = (ggml_time_us() - t0) / 1000.0;
         free(z);
-        if (m->self_cond_proj) {
+        if (m->self_cond_proj) {  // self_cond_vector: next step sees this step's beliefs
             if (!sc) sc = malloc(sizeof(float) * VOCAB * T);
             for (int i = 0; i < T; i++) softmax(logits + (size_t) i * rows, 1.0f, sc + (size_t) i * VOCAB);
         }
@@ -707,8 +907,7 @@ static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int ple
             if (masked[i]) ids[i] = draw(logits + (size_t) i * rows, o->temp, o->top_p);
         }
         if (o->revise > 0 && tc <= o->revise_t_max) {  // _revise_step
-            float p[VOCAB];
-            for (int i = plen; i < T; i++) {
+            for (int i = frozen; i < T; i++) {
                 if (masked[i]) continue;
                 softmax(logits + (size_t) i * rows, 1.0f, p);
                 int best = 0;
@@ -720,21 +919,20 @@ static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int ple
             double pc = fmax(mask_prob(tc), 1e-6), pn = mask_prob(tn), committed = 1.0 - pc;
             double sigma = o->remask == 2 ? fmin(pn / fmax(committed, 1e-6), o->eta) : 0.0;
             double ratio = (pn - sigma * committed) / pc;
-            if (o->remask == 1) {
+            if (o->remask == 1) {  // least confident of the bytes written this step
                 pi_t *conf = malloc(sizeof(pi_t) * T);
-                float p[VOCAB];
                 int n = 0;
-                for (int i = plen; i < T; i++) {
+                for (int i = frozen; i < T; i++) {
                     if (!masked[i]) continue;
                     softmax(logits + (size_t) i * rows, 1.0f, p);
                     conf[n++] = (pi_t) { p[ids[i] < VOCAB ? ids[i] : VOCAB - 1], i };
                 }
-                qsort(conf, n, sizeof *conf, by_conf);
+                qsort(conf, n, sizeof *conf, by_p_asc);
                 int k = (int) nearbyint(n * ratio);
                 for (int j = 0; j < k && j < n; j++) ids[conf[j].i] = MASK_ID;
                 free(conf);
             } else {
-                for (int i = plen; i < T; i++) {
+                for (int i = frozen; i < T; i++) {
                     double r = rnd();
                     if (masked[i] ? r < ratio : r < sigma) ids[i] = MASK_ID;
                 }
@@ -747,11 +945,109 @@ static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int ple
                     s + 1, o->steps, tc, tn, nl, n, ms);
         }
     }
+    free(masked);
+    free(sc);
+}
 
+static void emit(const int32_t *ids, int n) {
     // Byte IDs only, like decode_byte_ids; the terminal does UTF-8 decoding.
-    for (int i = 0; i < T; i++) if (ids[i] < 256) fputc(ids[i], stdout);
-    fputc('\n', stdout);
-    free(ids); free(masked); free(logits); free(sc);
+    for (int i = 0; i < n; i++) if (ids[i] < 256) fputc(ids[i], stdout);
+    fflush(stdout);
+}
+
+static void write_logits(const char *path, const float *logits, int T, int rows) {
+    FILE *f = fopen(path, "wb");
+    if (!f) die("cannot write %s", path);
+    fwrite(logits, sizeof(float), (size_t) rows * T, f);
+    fclose(f);
+    fprintf(stderr, "wrote %d x %d logits to %s\n", T, rows, path);
+}
+
+// Full-canvas sampler (denoise). --dump-logits: one forward, raw float32.
+static int run_canvas(model_t *m, const opts_t *o, const unsigned char *prompt, int plen) {
+    int P = m->patch, rows = (int) m->embed->ne[1];
+    int T = o->length > plen ? o->length : plen + 1;
+    T = (T + P - 1) / P * P;  // the canvas fills whole patches; the extra bytes are generated too
+    int32_t *ids  = malloc(sizeof(int32_t) * T);
+    float *logits = malloc(sizeof(float) * rows * T);
+    for (int i = 0; i < T; i++) ids[i] = i < plen ? prompt[i] : MASK_ID;
+    if (o->dump) {
+        float *z = make_noise(m, T);
+        forward(m, ids, T, o->dump_t, select_loops(m, o, o->dump_t, T), NULL, z, logits, KV_NONE);
+        free(z);
+        write_logits(o->dump, logits, T, rows);
+    } else {
+        denoise(m, o, ids, T, plen, KV_NONE, 0, logits);
+        emit(ids, T);
+        fputc('\n', stdout);
+    }
+    free(ids);
+    free(logits);
+    return 0;
+}
+
+// BlockDiffusionSampler: blocks left to right, each denoised against the
+// committed cache, then committed at t = 0. -n is the number of bytes to
+// generate (the cap with --auto-length); output streams block by block.
+static int run_block(model_t *m, const opts_t *o, const unsigned char *prompt, int plen) {
+    int P = m->patch, B = o->block, rows = (int) m->embed->ne[1];
+    if (B % P) die("--block must be a multiple of the byte patch size (%d)", P);
+    // A cached forward uses one fixed depth (rdt.py: max_loop_iters unless given).
+    int loops = o->loops > 0 ? o->loops : m->max_loops;
+    // Commit only whole patches of the prompt; the 0..P-1 leftover bytes ride
+    // as frozen literals at the head of the first block.
+    int commit_len = plen / P * P, carry = plen - commit_len;
+    int total = commit_len + carry + o->length + B;
+    kv_alloc(m, loops, total / P + 2);
+
+    int32_t *ids  = malloc(sizeof(int32_t) * B);
+    float *logits = malloc(sizeof(float) * rows * B);
+    // Prompt in block-sized chunks: block-causal training never saw longer spans.
+    for (int start = 0; start < commit_len; start += B) {
+        int n = commit_len - start < B ? commit_len - start : B;
+        for (int i = 0; i < n; i++) ids[i] = prompt[start + i];
+        float *z = make_noise(m, n);
+        forward(m, ids, n, 0.0f, loops, NULL, z, NULL, KV_COMMIT);
+        free(z);
+    }
+
+    if (!o->dump && plen) {  // echo the prompt, as the full-canvas output includes it
+        fwrite(prompt, 1, plen, stdout);
+        fflush(stdout);
+    }
+    int generated = 0;
+    for (int first = 1; generated < o->length; first = 0) {
+        int nc = first ? carry : 0;
+        int nn = B - nc < o->length - generated ? B - nc : o->length - generated;
+        int T = (nn + nc + P - 1) / P * P;  // whole patches; the few extra bytes are generated too
+        for (int i = 0; i < T; i++) ids[i] = i < nc ? prompt[commit_len + i] : MASK_ID;
+        if (o->dump) {
+            float *z = make_noise(m, T);
+            forward(m, ids, T, o->dump_t, loops, NULL, z, logits, KV_READ);
+            free(z);
+            write_logits(o->dump, logits, T, rows);
+            break;
+        }
+        int64_t t0 = ggml_time_us();
+        denoise(m, o, ids, T, nc, KV_READ, loops, logits);
+        float *z = make_noise(m, T);
+        forward(m, ids, T, 0.0f, loops, NULL, z, NULL, KV_COMMIT);
+        free(z);
+        int n_out = T - nc, stop = 0;
+        if (o->auto_length) {
+            for (int i = nc; i < T; i++) if (ids[i] == EOS_ID) { n_out = i - nc; stop = 1; break; }
+        }
+        emit(ids + nc, n_out);
+        generated += T - nc;
+        if (o->verbose) {
+            double s = (ggml_time_us() - t0) / 1e6;
+            fprintf(stderr, "\nblock: %d bytes in %.2f s (%.0f bytes/s)\n", T - nc, s, (T - nc) / s);
+        }
+        if (stop) break;
+    }
+    if (!o->dump) fputc('\n', stdout);
+    free(ids);
+    free(logits);
     return 0;
 }
 
@@ -767,8 +1063,10 @@ static void usage(void) {
         "  -t, --threads N       CPU threads (default 4)\n"
         "  -p, --prompt TEXT     frozen prompt prefix\n"
         "  -f, --prompt-file F   read the prompt bytes from a file (use for non-ASCII on Windows)\n"
-        "  -n, --length N        canvas bytes, prompt included (default 256)\n"
-        "  --steps N             denoising steps (default 20)\n"
+        "  -n, --length N        canvas bytes incl. prompt (default 256); with --block: bytes to generate\n"
+        "  --block N             block diffusion with a KV cache, N bytes per block (multiple of the patch size)\n"
+        "  --auto-length         with --block: stop at the first EOS\n"
+        "  --steps N             denoising steps (per block with --block, default 20)\n"
         "  --temp F              temperature (default 0.9)\n"
         "  --top-p F             nucleus threshold (default 0.95)\n"
         "  --seed N              RNG seed (default 42)\n"
@@ -777,10 +1075,10 @@ static void usage(void) {
         "  --eta F               remdm cap (default 0.04)\n"
         "  --revise F            overwrite visible bytes above this confidence (default off)\n"
         "  --revise-t-max F      only revise when t <= F (default 0.5)\n"
-        "  --act a4|a8           a4 = trained INT4/TopK activations (default), a8 = none\n"
+        "  --act a4|a8|none      activation quant: trained A4 stage (default), A8 stage, off\n"
         "  --dump-logits F       one forward at --t, write float32 logits, exit\n"
         "  --t F                 noise level for --dump-logits (default 1.0)\n"
-        "  -v, --verbose         per-step progress on stderr\n");
+        "  -v, --verbose         per-step progress and timing on stderr\n");
     exit(1);
 }
 
@@ -795,40 +1093,48 @@ int main(int argc, char **argv) {
     opts_t o = { 0 };
     o.length = 256; o.steps = 20; o.threads = 4; o.temp = 0.9f; o.top_p = 0.95f; o.seed = 42;
     o.eta = 0.04f; o.revise_t_max = 0.5f; o.dump_t = 1.0f;
-    int act_a4 = 1, list = 0;
+    int act = ACT_A4, list = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         int more = i + 1 < argc;
 #define ARG(s, l) ((!strcmp(a, s) || !strcmp(a, l)) && more)
+#define OPT(l) (!strcmp(a, l) && more)
         if      (ARG("-m", "--model"))       o.model = argv[++i];
         else if (ARG("-d", "--device"))      o.device = argv[++i];
         else if (ARG("-t", "--threads"))     o.threads = atoi(argv[++i]);
         else if (ARG("-p", "--prompt"))      o.prompt = argv[++i];
         else if (ARG("-f", "--prompt-file")) o.prompt_file = argv[++i];
         else if (ARG("-n", "--length"))      o.length = atoi(argv[++i]);
-        else if (ARG("--steps", "--steps"))  o.steps = atoi(argv[++i]);
-        else if (ARG("--temp", "--temp"))    o.temp = (float) atof(argv[++i]);
-        else if (ARG("--top-p", "--top-p"))  o.top_p = (float) atof(argv[++i]);
-        else if (ARG("--seed", "--seed"))    o.seed = strtoull(argv[++i], NULL, 10);
-        else if (ARG("--loops", "--loops"))  o.loops = atoi(argv[++i]);
-        else if (ARG("--eta", "--eta"))      o.eta = (float) atof(argv[++i]);
-        else if (ARG("--revise", "--revise")) o.revise = (float) atof(argv[++i]);
-        else if (ARG("--revise-t-max", "--revise-t-max")) o.revise_t_max = (float) atof(argv[++i]);
-        else if (ARG("--dump-logits", "--dump-logits")) o.dump = argv[++i];
-        else if (ARG("--t", "--t"))          o.dump_t = (float) atof(argv[++i]);
-        else if (ARG("--act", "--act"))      act_a4 = strcmp(argv[++i], "a8") != 0;
-        else if (ARG("--remask", "--remask")) {
+        else if (OPT("--block"))             o.block = atoi(argv[++i]);
+        else if (OPT("--steps"))             o.steps = atoi(argv[++i]);
+        else if (OPT("--temp"))              o.temp = (float) atof(argv[++i]);
+        else if (OPT("--top-p"))             o.top_p = (float) atof(argv[++i]);
+        else if (OPT("--seed"))              o.seed = strtoull(argv[++i], NULL, 10);
+        else if (OPT("--loops"))             o.loops = atoi(argv[++i]);
+        else if (OPT("--eta"))               o.eta = (float) atof(argv[++i]);
+        else if (OPT("--revise"))            o.revise = (float) atof(argv[++i]);
+        else if (OPT("--revise-t-max"))      o.revise_t_max = (float) atof(argv[++i]);
+        else if (OPT("--dump-logits"))       o.dump = argv[++i];
+        else if (OPT("--t"))                 o.dump_t = (float) atof(argv[++i]);
+        else if (OPT("--act")) {
+            const char *v = argv[++i];
+            act = !strcmp(v, "a4") ? ACT_A4 : !strcmp(v, "a8") ? ACT_A8 : !strcmp(v, "none") ? ACT_NONE : -1;
+            if (act < 0) usage();
+        }
+        else if (OPT("--remask")) {
             const char *r = argv[++i];
             o.remask = !strcmp(r, "confidence") ? 1 : !strcmp(r, "remdm") ? 2 : !strcmp(r, "random") ? 0 : -1;
             if (o.remask < 0) usage();
         }
+        else if (!strcmp(a, "--auto-length")) o.auto_length = 1;
         else if (!strcmp(a, "--list-devices")) list = 1;
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) o.verbose = 1;
         else usage();
 #undef ARG
+#undef OPT
     }
-    if (o.steps < 1 || o.length < 1 || o.loops > MAX_LOOPS) usage();
+    if (o.steps < 1 || o.length < 1 || o.loops > MAX_LOOPS || o.block < 0) usage();
 
     ggml_time_init();
     ggml_backend_load_all();  // dynamic backends (GGML_BACKEND_DL); no-op for static builds
@@ -842,7 +1148,7 @@ int main(int argc, char **argv) {
     if (!o.model) usage();
 
     model_t m = { 0 };
-    m.act_a4 = act_a4;
+    m.act = act;
     if (o.device) {
         ggml_backend_dev_t d = ggml_backend_dev_by_name(o.device);
         if (!d) die("no device %s (see --list-devices)", o.device);
@@ -861,7 +1167,8 @@ int main(int argc, char **argv) {
     if (m.is_rdt && m.max_loops > MAX_LOOPS) die("max_loop_iters > %d", MAX_LOOPS);
     // Unsupported ops on the main device fall back to the CPU (always last).
     ggml_backend_t backends[2] = { m.backend, m.cpu };
-    m.sched = ggml_backend_sched_new(backends, NULL, on_cpu ? 1 : 2, GRAPH_SIZE, false, false);
+    int visits = m.n_pre + m.n_post + (m.is_rdt ? m.n_rec * (o.loops > m.max_loops ? o.loops : m.max_loops) : 0);
+    m.sched = ggml_backend_sched_new(backends, NULL, on_cpu ? 1 : 2, (size_t) 320 * (visits + 4) + 4096, false, false);
 
     unsigned char *prompt = NULL;
     int plen = 0;
@@ -883,9 +1190,11 @@ int main(int argc, char **argv) {
     _setmode(_fileno(stdout), _O_BINARY);  // raw UTF-8 bytes, no CRLF rewriting
 #endif
     rng_state = o.seed;
-    int rc = run(&m, &o, prompt, plen);
+    int rc = o.block ? run_block(&m, &o, prompt, plen) : run_canvas(&m, &o, prompt, plen);
 
     ggml_backend_sched_free(m.sched);
+    if (m.kvbuf) ggml_backend_buffer_free(m.kvbuf);
+    if (m.kvctx) ggml_free(m.kvctx);
     ggml_backend_buffer_free(m.wbuf);
     ggml_free(m.wctx);
     if (!on_cpu) ggml_backend_free(m.cpu);

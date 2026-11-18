@@ -66,6 +66,15 @@ The flags match `sample.py`: `--temp`, `--top-p`, `--seed`, `--loops`,
 pass non-ASCII prompts with `-f prompt.txt`, because the console code page
 can corrupt `-p`.
 
+Block diffusion: the prompt and each finished block are committed to a 4-bit
+KV cache, and each new block is denoised against it, the same as
+`sample.py --block`. Here `-n` is the number of bytes to generate, and output
+is printed one block at a time:
+
+```bash
+runtime/build/yeoubi -m export/model.gguf -p "Hello" -n 1024 --block 256 --auto-length
+```
+
 ## Check against PyTorch
 
 Run this once for each new build or backend:
@@ -74,15 +83,22 @@ Run this once for each new build or backend:
 python scripts/check_runtime_parity.py --checkpoint checkpoints/final.pt --gguf export/model.gguf --runtime runtime/build/yeoubi
 ```
 
+`--act none` is the exact check. It turns quantization off on both sides
+and must reach a cosine of at least 0.9999. `--block 8` checks the KV-cached
+path.
+
 ## How it works and what is missing
 
 - Ternary weights are stored as ggml `Q4_0`, with codes {7, 8, 9} and the
   absmean scale in each block. This is exact, and every backend has a Q4_0
   matmul. The cost is 4.5 bits per weight instead of 2.
-- Activations go through the trained INT4 (absmean) quantizer and TopK
-  sparsification, as `sample.py` does. `--act a8` turns both off. The INT8
-  rounding steps are skipped because their error is below ggml's own
-  activation quantization.
-- Not supported yet: MoE checkpoints, the block sampler with its quantized KV
-  cache (`--block`), and legacy thinking tokens. Attention is plain softmax
-  attention, not flash attention.
+- Activations are quantized the same way as in `sample.py`: INT4 into
+  q/k/v/up/gate, TopK followed by INT8 into o/down, and INT8 into the other
+  layers. `--act a8` matches the A8 training stage (INT8 everywhere), and
+  `--act none` turns quantization off.
+- MoE is supported. Routing matches PyTorch's eager path: a softmax router
+  with INT8 weights, top-k, renormalised probabilities, and Switch capacity
+  dropping in the same order. Experts run through `ggml_mul_mat_id`.
+- Not supported: legacy thinking tokens. Attention is plain softmax
+  attention, not flash attention. The KV cache stores its 4-bit values
+  dequantized, as F32.
