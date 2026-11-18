@@ -84,6 +84,7 @@ typedef struct {
     double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std, capacity_factor;
     // runtime
     int act, fast_topk, fused_quant, fused_topk_max;  // fused_topk_max: widest row for fused TopK (0 = none)
+    int flash_attn;
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
@@ -290,6 +291,21 @@ static enum ggml_type pick_weight_type(ggml_backend_t be, int is_cpu, int64_t te
     return best;
 }
 
+// Does the device run F32-precision flash attention with F32 K/V and no mask,
+// on strided (permuted) q/k/v views, natively?
+static int dev_supports_flash_attn(ggml_backend_dev_t dev, int hd, int H) {
+    struct ggml_init_params ip = { 16 * ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *c = ggml_init(ip);
+    ten *q = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *k = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *v = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *o = ggml_flash_attn_ext(c, q, k, v, NULL, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    int ok = ggml_backend_dev_supports_op(dev, o);
+    ggml_free(c);
+    return ok;
+}
+
 // Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
 // Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
 static int dev_fused_topk_max(ggml_backend_dev_t dev) {
@@ -429,9 +445,12 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(dev);
     // YEOUBI_NO_FAST_TOPK=1 also turns this off, so CI can still reach the argsort path.
     m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(dev) : 0;
-    fprintf(stderr, "topk: %s, act quant: %s\n",
+    // YEOUBI_NO_FLASH_ATTN=1 forces the matmul/softmax attention (for A/B checks).
+    m->flash_attn = !getenv("YEOUBI_NO_FLASH_ATTN") &&
+                    dev_supports_flash_attn(dev, (int) cfg_num(g, "head_dim", 64), (int) cfg_num(g, "n_heads", 12));
+    fprintf(stderr, "topk: %s, act quant: %s, attention: %s\n",
             m->fused_topk_max ? "fused" : m->fast_topk ? "top_k + top_k_mask" : "argsort",
-            m->fused_quant ? "fused" : "op chain");
+            m->fused_quant ? "fused" : "op chain", m->flash_attn ? "flash" : "matmul");
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device,
     // fusing projections that read the same input (see fuse_slot).
@@ -813,11 +832,15 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
     h = quant(b, h, Q_INT4);  // q, k, v share one quantized input
     ten *qkv = ggml_mul_mat(c, L->wqkv, h);  // [3 * H * hd, T]
     size_t es = ggml_element_size(qkv), part = (size_t) hd * H * es;
-    ten *q = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 0));
-    ten *k = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], part));
-    ten *v = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 2 * part));
-    q = rope(b, norm(b, q, L->q_norm));
-    k = rope(b, norm(b, k, L->k_norm));
+    ten *qv = ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 0);
+    ten *kw = ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], part);
+    ten *vv = ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 2 * part);
+    // RMS norm reads the strided views directly (its rows are contiguous) and
+    // writes a compact tensor, so q/k only need a copy without q/k-norm. v is
+    // consumed through a permute anyway, except by the cache writes.
+    ten *q = rope(b, L->q_norm ? norm(b, qv, L->q_norm) : ggml_cont(c, qv));
+    ten *k = rope(b, L->k_norm ? norm(b, kw, L->k_norm) : ggml_cont(c, kw));
+    ten *v = b->kv != KV_NONE ? ggml_cont(c, vv) : vv;
 
     int li = b->layer++;
     if (b->kv != KV_NONE) {
@@ -837,14 +860,21 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
         }
     }
 
+    // Bidirectional and unpadded (the cache holds no padding): no mask at all.
+    const float scale = 1.0f / sqrtf((float) hd);
     q = ggml_permute(c, q, 0, 2, 1, 3);                 // [hd, T, H]
     k = ggml_permute(c, k, 0, 2, 1, 3);                 // [hd, Tk, H]
-    v = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));   // [Tk, hd, H]
-    // Bidirectional and unpadded (the cache holds no padding): no mask at all.
-    // ponytail: plain softmax attention; ggml_flash_attn_ext once canvases or
-    // caches reach a few thousand positions.
-    ten *kq = ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), NULL, 1.0f / sqrtf((float) hd), 0.0f);
-    ten *o  = ggml_cont(c, ggml_permute(c, ggml_mul_mat(c, v, kq), 0, 2, 1, 3));  // [hd, H, T]
+    ten *o;
+    if (m->flash_attn) {
+        // One fused kernel instead of QK^T, softmax, PV and two copies, at F32
+        // precision so it matches the unfused path; output is already [hd, H, T].
+        o = ggml_flash_attn_ext(c, q, k, ggml_permute(c, v, 0, 2, 1, 3), NULL, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    } else {
+        v = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));  // [Tk, hd, H]
+        ten *kq = ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), NULL, scale, 0.0f);
+        o = ggml_cont(c, ggml_permute(c, ggml_mul_mat(c, v, kq), 0, 2, 1, 3));  // [hd, H, T]
+    }
     o = ggml_reshape_2d(c, o, (int64_t) hd * H, T);
     return lin(b, L->wo, norm(b, o, L->attn_sub), Q_TOPK);
 }
