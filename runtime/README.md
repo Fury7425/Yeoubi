@@ -29,6 +29,13 @@ from `--list-devices` with `-d`. The OpenVINO backend has no `TOP_K` or
 `TOP_K_MASK` and does not know the fused quantizer, so on that device the
 runtime uses its argsort and stock-op paths automatically.
 
+**OpenVINO support is experimental.** ggml's OpenVINO graph translator
+follows llama.cpp's graph conventions and treats `VIEW` as a no-op, which
+this runtime's graphs do not survive in most places. Flat (non-RDT) models
+in the full-canvas sampler match PyTorch on the OpenVINO CPU and GPU
+devices. RDT and MoE models, the KV-cached block sampler, and the NPU do
+not work yet. Use Vulkan for the Arc GPU.
+
 ## Build
 
 ```bash
