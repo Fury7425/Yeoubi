@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Write two tiny random checkpoints that cover the native runtime's branches.
+
+CI exports them with ``export.py --format gguf`` and runs
+``check_runtime_parity.py`` on each, so the runtime is checked against
+PyTorch without a trained model.
+
+    rdt.pt: RDT, byte patches + decoder FFN, sub-norms, qk-norm, absmean INT4,
+            learned loop embedding, loop-specific norms, bridges, soft ACT.
+    std.pt: flat transformer, no byte patches, YaRN RoPE, absmax INT4.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import asdict
+
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from yeoubi.model import BitDiffusionTransformer, ModelConfig  # noqa: E402
+from yeoubi.rdt import BitRDTTransformer, RDTConfig  # noqa: E402
+
+COMMON = dict(hidden_dim=128, n_heads=4, ffn_dim=256, t_embed_dim=64, max_seq_len=256)
+
+
+def _randomize(model: torch.nn.Module) -> None:
+    # Default init makes the tied head ~0.02 wide, so logits are near-uniform
+    # and argmax agreement is a coin flip. Unit-scale embeddings give the head
+    # real margins; small random offsets exercise the zero-initialised paths.
+    with torch.no_grad():
+        model.embed.weight.normal_(0.0, 1.0)
+        for name, p in model.named_parameters():
+            if name.endswith("subposition") or name.endswith("A_raw"):
+                p.normal_(0.0, 0.5)
+
+
+def _save(model: torch.nn.Module, config, path: str, rdt: bool) -> None:
+    ckpt = {"model_state_dict": model.state_dict(), "model_config": asdict(config), "step": 0}
+    if rdt:
+        ckpt["rdt_config"] = asdict(config)
+    torch.save(ckpt, path)
+    print(f"wrote {path}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--out", required=True)
+    args = p.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+    torch.manual_seed(0)
+
+    rdt_cfg = RDTConfig(
+        **COMMON, use_rdt=True, use_byte_patches=True, byte_decoder_ffn=True,
+        qk_norm=True, prelude_layers=1, pre_recurrent_layers=1, recurrent_layers=1,
+        post_recurrent_layers=1, coda_layers=1, max_loop_iters=3, lora_rank=32,
+        loop_dim=32, learned_loop_embedding=True, loop_specific_norms=True,
+    )
+    rdt = BitRDTTransformer(rdt_cfg).eval()
+    _randomize(rdt)
+    _save(rdt, rdt_cfg, os.path.join(args.out, "rdt.pt"), rdt=True)
+
+    std_cfg = ModelConfig(
+        **COMMON, n_layers=2, int4_absmean=False, rope_scaling_type="yarn",
+        rope_scaling_factor=4.0,
+    )
+    std = BitDiffusionTransformer(std_cfg).eval()
+    _randomize(std)
+    _save(std, std_cfg, os.path.join(args.out, "std.pt"), rdt=False)
+
+
+if __name__ == "__main__":
+    main()

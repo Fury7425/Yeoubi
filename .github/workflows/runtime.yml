@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Build the native runtime on each OS and check it against PyTorch on tiny
+# random checkpoints (scripts/make_parity_fixture.py). The executables plus
+# the fixture GGUFs and reference logits are uploaded as artifacts, so a
+# machine without torch can rerun the comparison on its own GPU.
+name: runtime
+
+on:
+  push:
+    paths:
+      - "runtime/**"
+      - "yeoubi/**"
+      - "export.py"
+      - "scripts/check_runtime_parity.py"
+      - "scripts/make_parity_fixture.py"
+      - ".github/workflows/runtime.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            flags: -DGGML_VULKAN=ON
+          - os: ubuntu-24.04
+            flags: -DGGML_VULKAN=ON
+          - os: macos-latest
+            flags: -DGGML_METAL=ON
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VULKAN_VERSION: 1.4.313.2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -o "$env:RUNNER_TEMP\vulkan.exe" -L "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkan.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+      - name: Vulkan SDK + lavapipe (Linux)
+        if: runner.os == 'Linux'
+        # mesa-vulkan-drivers brings lavapipe, a software Vulkan device, so the
+        # Vulkan backend is actually executed here, not just compiled.
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc spirv-headers mesa-vulkan-drivers
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python deps (CPU torch)
+        run: |
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build
+        run: |
+          cmake -S runtime -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
+          cmake --build build --config Release -j 4
+
+      - name: Parity fixtures
+        run: |
+          python scripts/make_parity_fixture.py --out fixture
+          for m in rdt std; do
+            python export.py --checkpoint fixture/$m.pt --output_dir fixture/$m --format gguf
+            python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --save-ref fixture/$m/ref.npz
+          done
+
+      - name: Parity check
+        run: |
+          EXE=$(ls build/bin/Release/yeoubi.exe build/bin/yeoubi 2>/dev/null | head -n 1)
+          echo "EXE=$EXE" >> "$GITHUB_ENV"
+          "$EXE" --list-devices
+          for m in rdt std; do
+            for dev in $("$EXE" --list-devices | awk '{print $1}'); do
+              echo "== $m on $dev"
+              python scripts/check_runtime_parity.py --ref fixture/$m/ref.npz \
+                --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev"
+            done
+          done
+
+      - name: Sample smoke run
+        run: '"$EXE" -m fixture/rdt/model.gguf -p "Hello" -n 64 --steps 4 -v | od -c | head -n 5'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yeoubi-${{ runner.os }}
+          path: |
+            build/bin/
+            fixture/*/model.gguf
+            fixture/*/ref.npz
+          if-no-files-found: warn

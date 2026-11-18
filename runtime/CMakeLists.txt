@@ -7,6 +7,9 @@ project(yeoubi_runtime C CXX)
 #   -DGGML_SYCL=ON  -DGGML_OPENVINO=ON  -DGGML_HEXAGON=ON  -DGGML_OPENCL=ON
 # Several may be enabled at once; --list-devices shows what was built.
 set(YEOUBI_GGML_TAG "v1.0.0" CACHE STRING "ggml git tag to build against")
+# One self-contained executable: nothing to copy next to it, nothing to install.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt)
     add_subdirectory(ggml)  # local checkout wins (offline / patched builds)
