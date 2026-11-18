@@ -250,7 +250,7 @@ static int dev_supports_flash_attn(ggml_backend_t be, int hd, int H) {
     ten *k = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
     ten *v = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
     ten *o = ggml_flash_attn_ext(c, q, k, v, NULL, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    ggml_prec_set_acc(o, GGML_PREC_F32);
     return probe_ops(be, c, &o, 1);
 }
 
@@ -898,7 +898,7 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
         // One fused kernel instead of QK^T, softmax, PV and two copies, at F32
         // precision so it matches the unfused path; output is already [hd, H, T].
         o = ggml_flash_attn_ext(c, q, k, ggml_permute(c, v, 0, 2, 1, 3), NULL, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        ggml_prec_set_acc(o, GGML_PREC_F32);
     } else {
         v = ggml_cont(c, ggml_permute(c, v, 1, 2, 0, 3));  // [Tk, hd, H]
         ten *kq = ggml_soft_max_ext(c, ggml_mul_mat(c, k, q), NULL, scale, 0.0f);
