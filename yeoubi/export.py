@@ -4,11 +4,11 @@
 """
 Export Yeoubi checkpoints into portable weight packages.
 
-This project cannot be exported into a broadly runnable GGUF model in the
-llama.cpp sense because the architecture is a bidirectional diffusion LM,
-not a supported autoregressive decoder family. Instead, this script exports
-the model weights to ``safetensors`` or a plain PyTorch state dict together
-with the serialized model config. Byte-level models need no tokenizer asset.
+The architecture is a bidirectional diffusion LM, not an autoregressive
+decoder family, so llama.cpp cannot run it. ``--format gguf`` writes a GGUF
+for this repo's own native runtime (``runtime/``, ggml backends); the other
+formats export ``safetensors`` or a plain PyTorch state dict together with the
+serialized model config. Byte-level models need no tokenizer asset.
 """
 
 from __future__ import annotations
@@ -139,12 +139,16 @@ def export_checkpoint(args: argparse.Namespace) -> None:
         packed = True
 
     if args.format == "gguf":
-        raise ValueError(
-            "GGUF export is not supported for this architecture. "
-            f"{MODEL_NAME} is a diffusion transformer, so standard GGUF/llama.cpp "
-            "runtimes will not understand its forward pass. Use --format safetensors "
-            "for the most portable output supported by this repo."
-        )
+        if packed:
+            raise ValueError("--format gguf ternarizes weights itself; drop --pack.")
+        if getattr(config, "use_moe", False):
+            raise ValueError("The native runtime does not support MoE checkpoints yet.")
+        from .gguf_export import write_gguf
+        output_path = os.path.join(args.output_dir, "model.gguf")
+        # Readable only by runtime/ (Yeoubi's own graph), not by llama.cpp.
+        write_gguf(model, config, output_path, is_rdt=hasattr(model, "rdt_config"))
+        logger.info("Exported native-runtime GGUF to %s", output_path)
+        return
     if args.format == "safetensors":
         try:
             from safetensors.torch import save_model
@@ -221,7 +225,7 @@ def main() -> None:
         type=str,
         default="safetensors",
         choices=["safetensors", "pytorch", "gguf"],
-        help="Export format. GGUF is rejected with an explanatory error.",
+        help="Export format. gguf targets the native runtime in runtime/ (not llama.cpp).",
     )
     # Fallback model config args for older checkpoints.
     parser.add_argument("--hidden_dim", type=int, default=768)

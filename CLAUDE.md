@@ -148,6 +148,15 @@ mixture. `train.py`'s loader does **not** read `.gz` itself (suffix dispatch onl
 `--min-free-gb` (abort on low disk), `--hf-token-file` (keeps the token out of shell
 history).
 
+### Native runtime (`runtime/`)
+
+`runtime/yeoubi.c` is a C re-implementation of the eval forward pass and of
+`denoise()` on ggml. It is the deployment path for CUDA, HIP, Vulkan, Metal, SYCL,
+OpenVINO, Hexagon and OpenCL. Its input is `export.py --format gguf`
+(`yeoubi/gguf_export.py`), which stores ternary weights as exact Q4_0. **Any change to
+the forward pass in `model.py`/`rdt.py` must be mirrored there.** Verify with
+`scripts/check_runtime_parity.py`.
+
 ### Devices
 
 Never hardcode `.cuda()`. `yeoubi/device.py` resolves `auto | cuda[:n] | xpu[:n] | rocm |
