@@ -140,6 +140,12 @@ if(NOT done)
             struct ggml_tensor  * mask,
             int                   mode);
 
+    // mode 3: keep the k largest |x| per row (ties with the k-th kept), zero the rest, then INT8
+    GGML_API struct ggml_tensor * ggml_act_quant_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k);
+
 ")
 
     file(READ "${GGML_SRC}/src/ggml.c" s)
@@ -180,6 +186,24 @@ struct ggml_tensor * ggml_act_quant(
     return result;
 }
 
+struct ggml_tensor * ggml_act_quant_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(k >= 1 && k <= a->ne[0]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params_i32(result, 0, 3);
+    ggml_set_op_params_i32(result, 1, k);
+
+    result->op     = GGML_OP_ACT_QUANT;
+    result->src[0] = a;
+
+    return result;
+}
+
 ")
 
     # --- CPU --------------------------------------------------------------
@@ -199,7 +223,30 @@ void ggml_compute_forward_act_quant(
     const int     mode  = ggml_get_op_params_i32(dst, 0);
     const int64_t n     = src0->ne[0];
     const int64_t nr    = ggml_nrows(src0);
-    const float   level = mode == 2 ? 127.0f : 7.0f;
+    const float   level = mode == 2 || mode == 3 ? 127.0f : 7.0f;
+
+    if (mode == 3) {  // TopK (k largest |x|, ties with the k-th kept) + INT8
+        const int64_t k = ggml_get_op_params_i32(dst, 1);
+        float * tmp = (float *) malloc(sizeof(float) * n);
+        for (int64_t r = params->ith; r < nr; r += params->nth) {
+            const float * x = (const float *) src0->data + r*n;
+            float       * y = (float *) dst->data + r*n;
+            float amax = 0.0f;
+            for (int64_t i = 0; i < n; i++) {
+                tmp[i] = std::fabs(x[i]);
+                amax = std::max(amax, tmp[i]);
+            }
+            std::nth_element(tmp, tmp + (k - 1), tmp + n, [](float a, float b) { return a > b; });
+            const float thr = tmp[k - 1];
+            const float s   = (1.0f / std::max(amax, 1e-8f)) * level;
+            for (int64_t i = 0; i < n; i++) {
+                const float v = std::fabs(x[i]) >= thr ? x[i] : 0.0f;
+                y[i] = std::min(std::max(std::nearbyint(v*s), -level), level) / s;
+            }
+        }
+        free(tmp);
+        return;
+    }
 
     for (int64_t r = params->ith; r < nr; r += params->nth) {
         const float * x = (const float *) src0->data + r*n;
@@ -249,26 +296,35 @@ void ggml_compute_forward_act_quant(
         "static int ggml_get_n_tasks(")
 
     # --- Vulkan -----------------------------------------------------------
-    file(COPY "${PATCH_DIR}/act_quant.comp" DESTINATION "${V}/vulkan-shaders")
+    file(COPY "${PATCH_DIR}/act_quant.comp" "${PATCH_DIR}/act_quant_topk.comp" DESTINATION "${V}/vulkan-shaders")
 
     insert("${V}/vulkan-shaders/vulkan-shaders-gen.cpp" AFTER
         "    string_to_spv(\"argmax_f32\""
-        "    string_to_spv(\"act_quant_f32\", \"act_quant.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n")
+        "    string_to_spv(\"act_quant_f32\", \"act_quant.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n    string_to_spv(\"act_quant_topk_f32\", \"act_quant_topk.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n")
 
     insert("${V}/ggml-vulkan-types.h" AFTER
         "    vk_pipeline pipeline_argmax_f32;"
-        "    vk_pipeline pipeline_act_quant_f32;\n")
+        "    vk_pipeline pipeline_act_quant_f32;\n    vk_pipeline pipeline_act_quant_topk_f32;\n")
 
     insert("${V}/ggml-vulkan.cpp" AFTER
         "    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, \"argmax_f32\""
-        "    ggml_vk_create_pipeline(device, device->pipeline_act_quant_f32, \"act_quant_f32\", act_quant_f32_len, act_quant_f32_data, \"main\", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n")
+        "    ggml_vk_create_pipeline(device, device->pipeline_act_quant_f32, \"act_quant_f32\", act_quant_f32_len, act_quant_f32_data, \"main\", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_act_quant_topk_f32, \"act_quant_topk_f32\", act_quant_topk_f32_len, act_quant_topk_f32_data, \"main\", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n")
 
     insert("${V}/ggml-vulkan.cpp" BEFORE
         "void ggml_vk_argmax(ggml_backend_vk_context * ctx"
 "static void ggml_vk_act_quant(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    vk_pipeline pipeline = ctx->device->pipeline_act_quant_f32;
+    const int mode = ggml_get_op_params_i32(dst, 0);
     const uint32_t nrows = (uint32_t) ggml_nrows(dst);
-    vk_op_push_constants pc { (uint32_t) dst->ne[0], nrows, (float) ggml_get_op_params_i32(dst, 0), src1 ? 1.0f : 0.0f, 0.0f, 0.0f };
+    if (mode == 3) {  // fused TopK + INT8
+        vk_pipeline pipeline = ctx->device->pipeline_act_quant_topk_f32;
+        vk_op_push_constants pc { (uint32_t) dst->ne[0], nrows, (float) ggml_get_op_params_i32(dst, 1), 0.0f, 0.0f, 0.0f };
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc, { 1, nrows, 1 });
+        return;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_act_quant_f32;
+    vk_op_push_constants pc { (uint32_t) dst->ne[0], nrows, (float) mode, src1 ? 1.0f : 0.0f, 0.0f, 0.0f };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1 ? src1 : src0), ggml_vk_tensor_subbuffer(ctx, dst) },
@@ -287,8 +343,10 @@ void ggml_compute_forward_act_quant(
     insert("${V}/ggml-vulkan.cpp" BEFORE
         "        case GGML_OP_ARGMAX:"
 "        case GGML_OP_ACT_QUANT:
+            // mode 3 (fused TopK) holds a row in 16 KiB of shared memory
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op) && ggml_nrows(op) <= 65535 &&
+                   (ggml_get_op_params_i32(op, 0) != 3 || op->ne[0] <= 4096) &&
                    (op->src[1] == nullptr || (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1])));
 ")
 
@@ -351,7 +409,8 @@ void ggml_compute_forward_act_quant(
     insert("${M}/ggml-metal-device.m" BEFORE
         "        case GGML_OP_ARGMAX:"
 "        case GGML_OP_ACT_QUANT:
-            return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32 &&
+            // no fused TopK (mode 3) kernel on Metal: it has TOP_K + TOP_K_MASK natively
+            return has_simdgroup_reduction && ggml_get_op_params_i32(op, 0) != 3 && op->src[0]->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
                 (op->src[1] == NULL || (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1])));
 ")

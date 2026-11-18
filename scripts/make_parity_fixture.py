@@ -7,9 +7,11 @@ PyTorch without a trained model.
 
     rdt.pt: RDT, byte patches + decoder FFN, sub-norms, qk-norm, absmean INT4,
             learned loop embedding, loop-specific norms, bridges, soft ACT.
-    std.pt: flat transformer, no byte patches, YaRN RoPE, absmax INT4.
+    std.pt: flat transformer, no byte patches, YaRN RoPE, absmax INT4,
+            untied output head.
     moe.pt: RDT with MoE in every block, 4 experts / top-2, capacity factor
-            1.0 so tokens are dropped and the capacity logic is exercised.
+            1.0 so tokens are dropped and the capacity logic is exercised;
+            use_act=False.
 """
 
 from __future__ import annotations
@@ -35,6 +37,8 @@ def _randomize(model: torch.nn.Module) -> None:
     # real margins; small random offsets exercise the zero-initialised paths.
     with torch.no_grad():
         model.embed.weight.normal_(0.0, 1.0)
+        if model.unembed.weight is not model.embed.weight:  # untied head
+            model.unembed.weight.normal_(0.0, 1.0)
         for name, p in model.named_parameters():
             if name.endswith("subposition") or name.endswith("A_raw"):
                 p.normal_(0.0, 0.5)
@@ -86,7 +90,7 @@ def main() -> None:
 
     std_cfg = ModelConfig(
         **COMMON, n_layers=2, int4_absmean=False, rope_scaling_type="yarn",
-        rope_scaling_factor=4.0,
+        rope_scaling_factor=4.0, tie_embeddings=False,
     )
     std = BitDiffusionTransformer(std_cfg).eval()
     _randomize(std)
@@ -97,6 +101,9 @@ def main() -> None:
         top_k_experts=2, moe_layers="all", expert_capacity_factor=1.0,
         prelude_layers=1, recurrent_layers=1, coda_layers=1, max_loop_iters=2,
         lora_rank=32, loop_dim=32,
+        # The ACT head exists either way; the runtime must follow the flag
+        # (the step-25000 checkpoint is use_act=False).
+        use_act=False,
     )
     moe = BitRDTTransformer(moe_cfg).eval()
     _randomize(moe)

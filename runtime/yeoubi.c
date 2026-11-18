@@ -83,13 +83,13 @@ typedef struct {
     int    n_experts, top_k, kv_bits, kv_bos_bits;
     double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std, capacity_factor;
     // runtime
-    int act, fast_topk, fused_quant;
+    int act, fast_topk, fused_quant, fused_topk_max;  // fused_topk_max: widest row for fused TopK (0 = none)
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
     ggml_backend_buffer_t wbuf;
     // weights (NULL = absent in this checkpoint)
-    ten *embed, *ne0_w, *ne0_b, *ne2_w, *ne2_b, *final_norm, *self_cond_proj;
+    ten *embed, *head, *ne0_w, *ne0_b, *ne2_w, *ne2_b, *final_norm, *self_cond_proj;  // head: unembed, = embed when tied
     ten *subpos, *enc_norm, *enc_conv, *cmp_norm, *cmp, *exp, *dec_norm, *dec_conv;
     ten *dec_ffn_norm, *out_norm;
     ffn_t dec_ffn;
@@ -240,6 +240,21 @@ static int dev_supports_act_quant(ggml_backend_dev_t dev) {
     return ok;
 }
 
+// Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
+// Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
+static int dev_fused_topk_max(ggml_backend_dev_t dev) {
+    static const int widths[] = { 1 << 20, 4096 };
+    int best = 0;
+    for (size_t w = 0; w < sizeof widths / sizeof *widths && !best; w++) {
+        struct ggml_init_params ip = { 4 * ggml_tensor_overhead(), NULL, true };
+        struct ggml_context *c = ggml_init(ip);
+        ten *a = ggml_new_tensor_2d(c, GGML_TYPE_F32, widths[w], 4);
+        if (ggml_backend_dev_supports_op(dev, ggml_act_quant_topk(c, a, widths[w] / 2))) best = widths[w];
+        ggml_free(c);
+    }
+    return best;
+}
+
 // Q4_0 holding ternary values: per 32-block scale = |max|, codes {7, 8, 9}.
 // (ggml's own Q4_0 quantizer is asymmetric and would clip one sign to 7/8.)
 static void pack_q4_0_ternary(const float *x, uint8_t *y, int64_t n) {
@@ -330,6 +345,7 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     m->context_adaptive  = (int) cfg_num(g, "context_adaptive_loops", 0);
     m->context_threshold = (int) cfg_num(g, "context_loop_threshold", 4096);
     m->state_std         = cfg_num(g, "recurrent_state_init_std", 0.0);
+    const int cfg_use_act = (int) cfg_num(g, "use_act", 1);
     m->n_experts         = (int) cfg_num(g, "n_experts", 8);
     m->top_k             = (int) cfg_num(g, "top_k_experts", 2);
     m->capacity_factor   = cfg_num(g, "expert_capacity_factor", 1.25);
@@ -355,7 +371,10 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(dev);
     // YEOUBI_NO_FUSED_QUANT=1 forces the stock-op chains (for A/B checks).
     m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(dev);
-    fprintf(stderr, "topk: %s, act quant: %s\n", m->fast_topk ? "top_k + top_k_mask" : "argsort",
+    // YEOUBI_NO_FAST_TOPK=1 also turns this off, so CI can still reach the argsort path.
+    m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(dev) : 0;
+    fprintf(stderr, "topk: %s, act quant: %s\n",
+            m->fused_topk_max ? "fused" : m->fast_topk ? "top_k + top_k_mask" : "argsort",
             m->fused_quant ? "fused" : "op chain");
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device,
@@ -412,6 +431,8 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     gguf_free(g);
 
     m->embed  = need(m, "embed.weight");
+    m->head   = get(m, "unembed.weight");  // only written when tie_embeddings is off
+    if (!m->head) m->head = m->embed;
     m->hidden = (int) m->embed->ne[0];
     m->ne0_w  = need(m, "noise_embed.proj.0.weight");
     m->ne0_b  = need(m, "noise_embed.proj.0.bias");
@@ -447,7 +468,9 @@ static void model_load(model_t *m, const char *path, int weight_type) {
         m->inj_B        = need(m, "recurrent.injection.B.weight");
         m->lora_down    = need(m, "recurrent.lora.down.weight");
         m->lora_up      = need(m, "recurrent.lora.up.weight");
-        m->act_w        = get(m, "recurrent.act.weight_proj.weight");
+        // BitRecurrentBlock builds the ACT head whatever use_act says, so the
+        // weights alone do not mean the blend is on: the config decides.
+        m->act_w        = cfg_use_act ? get(m, "recurrent.act.weight_proj.weight") : NULL;
         m->loop_proj    = need(m, "recurrent.loop_proj.weight");
         m->loop_proj2   = need(m, "recurrent.loop_proj2.weight");
         m->loop_proj2_b = need(m, "recurrent.loop_proj2.bias");
@@ -568,6 +591,7 @@ static ten *q_topk8(gb_t *b, ten *x) {
     if (k < 1) k = 1;
     int fused = b->m->fused_quant;
     if (k >= n) return fused ? ggml_act_quant(c, x, NULL, 2) : q_int8(b, x, NULL);
+    if (n <= b->m->fused_topk_max) return ggml_act_quant_topk(c, x, k);  // select + drop + INT8, one kernel
     ten *a = ggml_abs(c, x);
     if (b->m->fast_topk && n <= ZEROS_MAX) {
         ten *zeros = ggml_view_2d(c, b->zeros, n, 1, (size_t) n * sizeof(float), 0);
@@ -925,7 +949,7 @@ static void build_graph(model_t *m, int T, int n_loops, int has_sc, int has_nois
             if (m->dec_ffn.up) x = ggml_add(c, x, ffn(&b, &m->dec_ffn, norm(&b, x, m->dec_ffn_norm)));
             x = norm(&b, x, m->out_norm);
         }
-        logits = ggml_mul_mat(c, m->embed, x);  // tied head: [rows, T]
+        logits = ggml_mul_mat(c, m->head, x);  // [rows, T]
         ggml_set_output(logits);
         ggml_build_forward_expand(b.gf, logits);
     }
@@ -1112,7 +1136,7 @@ static float *make_noise(model_t *m, int T) {
 // prompt. fixed_loops > 0 pins the recurrent depth (required with a cache).
 static void denoise(model_t *m, const opts_t *o, int32_t *ids, int T, int frozen, int kv,
                     int fixed_loops, float *logits) {
-    int rows = (int) m->embed->ne[1];
+    int rows = (int) m->head->ne[1];
     char *masked = malloc(T);
     float *sc = NULL, p[VOCAB];
     for (int s = 0; s < o->steps; s++) {
@@ -1193,7 +1217,7 @@ static void write_logits(const char *path, const float *logits, int T, int rows)
 
 // Full-canvas sampler (denoise). --dump-logits: one forward, raw float32.
 static int run_canvas(model_t *m, const opts_t *o, const unsigned char *prompt, int plen) {
-    int P = m->patch, rows = (int) m->embed->ne[1];
+    int P = m->patch, rows = (int) m->head->ne[1];
     int T = o->length > plen ? o->length : plen + 1;
     T = (T + P - 1) / P * P;  // the canvas fills whole patches; the extra bytes are generated too
     int32_t *ids  = malloc(sizeof(int32_t) * T);
@@ -1218,7 +1242,7 @@ static int run_canvas(model_t *m, const opts_t *o, const unsigned char *prompt, 
 // committed cache, then committed at t = 0. -n is the number of bytes to
 // generate (the cap with --auto-length); output streams block by block.
 static int run_block(model_t *m, const opts_t *o, const unsigned char *prompt, int plen) {
-    int P = m->patch, B = o->block, rows = (int) m->embed->ne[1];
+    int P = m->patch, B = o->block, rows = (int) m->head->ne[1];
     if (B % P) die("--block must be a multiple of the byte patch size (%d)", P);
     // A cached forward uses one fixed depth (rdt.py: max_loop_iters unless given).
     int loops = o->loops > 0 ? o->loops : m->max_loops;
