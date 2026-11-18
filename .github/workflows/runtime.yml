@@ -76,7 +76,8 @@ jobs:
 
       - name: Parity check
         run: |
-          EXE=$(ls build/bin/Release/yeoubi.exe build/bin/yeoubi 2>/dev/null | head -n 1)
+          EXE=build/bin/yeoubi
+          if [ -f build/bin/Release/yeoubi.exe ]; then EXE=build/bin/Release/yeoubi.exe; fi
           echo "EXE=$EXE" >> "$GITHUB_ENV"
           "$EXE" --list-devices
           for m in rdt std; do
