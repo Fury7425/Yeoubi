@@ -32,7 +32,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # byte_codec.py constants, repeated so the compare side needs no torch.
 MASK_TOKEN_ID, VOCAB_SIZE = 258, 258
-LIMITS = {"none": (0.9999, 0.97), "a8": (0.999, 0.9), "a4": (0.995, 0.8)}
+# Exact mode is judged by cosine; argmax agreement only guards gross errors,
+# since random-weight fixtures can have near-tied top bytes.
+LIMITS = {"none": (0.9999, 0.9), "a8": (0.999, 0.9), "a4": (0.995, 0.8)}
 # The KV cache is 4-bit in every mode, so a cached check is never "exact".
 BLOCK_LIMITS = (0.995, 0.8)
 

@@ -206,62 +206,86 @@ static float *host_copy(struct ggml_context *hctx, const char *name, int *n) {
     return out;
 }
 
-// Can the device multiply this weight type natively?
-static int dev_supports(ggml_backend_dev_t dev, enum ggml_type type) {
-    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
-    struct ggml_context *c = ggml_init(ip);
-    ten *a = ggml_new_tensor_2d(c, type, 256, 16);
-    ten *x = ggml_new_tensor_2d(c, GGML_TYPE_F32, 256, 4);
-    int ok = ggml_backend_dev_supports_op(dev, ggml_mul_mat(c, a, x));
+// supports_op, asked with the probe tensors placed in a real buffer on the
+// device: Metal and the CPU's repacking buffer types decide partly by where
+// a tensor lives, so asking about buffer-less tensors gave false negatives.
+static int probe_ops(ggml_backend_t be, struct ggml_context *c, ten **ops, int n) {
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+    int ok = buf != NULL;
+    for (int i = 0; ok && i < n; i++) ok = ggml_backend_supports_op(be, ops[i]);
+    if (buf) ggml_backend_buffer_free(buf);
     ggml_free(c);
     return ok;
+}
+
+static struct ggml_context *probe_ctx(void) {
+    struct ggml_init_params ip = { 16 * ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+    return ggml_init(ip);
 }
 
 // Can the device run the fast TopK path (ggml_top_k + TOP_K_MASK) natively?
-static int dev_supports_topk_mask(ggml_backend_dev_t dev) {
-    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
-    struct ggml_context *c = ggml_init(ip);
+static int dev_supports_topk_mask(ggml_backend_t be) {
+    struct ggml_context *c = probe_ctx();
     ten *a    = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
     ten *idx  = ggml_top_k(c, a, 1126);
     ten *mask = ggml_top_k_mask(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 1), idx, NULL, NULL, NULL);
-    int ok = ggml_backend_dev_supports_op(dev, idx) && ggml_backend_dev_supports_op(dev, mask);
-    ggml_free(c);
-    return ok;
+    ten *ops[] = { idx, mask };
+    return probe_ops(be, c, ops, 2);
 }
 
 // Does the device run the patched GGML_OP_ACT_QUANT natively, with and without a mask?
-static int dev_supports_act_quant(ggml_backend_dev_t dev) {
-    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
-    struct ggml_context *c = ggml_init(ip);
-    ten *a = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
+static int dev_supports_act_quant(ggml_backend_t be) {
+    struct ggml_context *c = probe_ctx();
+    ten *a    = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
     ten *mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
-    int ok = ggml_backend_dev_supports_op(dev, ggml_act_quant(c, a, NULL, 0)) &&
-             ggml_backend_dev_supports_op(dev, ggml_act_quant(c, a, mask, 2));
-    ggml_free(c);
-    return ok;
+    ten *ops[] = { ggml_act_quant(c, a, NULL, 0), ggml_act_quant(c, a, mask, 2) };
+    return probe_ops(be, c, ops, 2);
+}
+
+// Does the device run F32-precision flash attention with F32 K/V and no mask,
+// on strided (permuted) q/k/v views, natively?
+static int dev_supports_flash_attn(ggml_backend_t be, int hd, int H) {
+    struct ggml_context *c = probe_ctx();
+    ten *q = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *k = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *v = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
+    ten *o = ggml_flash_attn_ext(c, q, k, v, NULL, 1.0f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    return probe_ops(be, c, &o, 1);
+}
+
+// Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
+// Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
+static int dev_fused_topk_max(ggml_backend_t be) {
+    static const int widths[] = { 65536, 4096 };
+    for (size_t w = 0; w < sizeof widths / sizeof *widths; w++) {
+        struct ggml_context *c = probe_ctx();
+        ten *op = ggml_act_quant_topk(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, widths[w], 1), widths[w] / 2);
+        if (probe_ops(be, c, &op, 1)) return widths[w];
+    }
+    return 0;
 }
 
 // Microseconds for one [k -> n_out] x 64-token matmul with weights of `type`
-// on `be` (mean of 5 runs after a warm-up), or a huge value if the
-// device has no native kernel for it.
+// on `be` (mean of 5 runs after a warm-up), or a huge value if the device
+// has no native kernel for it.
 static double time_matmul(ggml_backend_t be, enum ggml_type type, int k, int n_out) {
-    if (!dev_supports(ggml_backend_get_device(be), type)) return 1e30;
-    struct ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
-    struct ggml_context *c = ggml_init(ip);
+    struct ggml_context *c = probe_ctx();
     ten *w = ggml_new_tensor_2d(c, type, k, n_out);
     ten *x = ggml_new_tensor_2d(c, GGML_TYPE_F32, k, 64);
+    ten *y = ggml_mul_mat(c, w, x);
     struct ggml_cgraph *gf = ggml_new_graph(c);
-    ggml_build_forward_expand(gf, ggml_mul_mat(c, w, x));
+    ggml_build_forward_expand(gf, y);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
     double us = 1e30;
-    if (buf) {
+    if (buf && ggml_backend_supports_op(be, y)) {
         ggml_backend_buffer_clear(buf, 0);
         ggml_backend_graph_compute(be, gf);  // warm-up (pipeline compile, caches)
         int64_t t0 = ggml_time_us();
         for (int i = 0; i < 5; i++) ggml_backend_graph_compute(be, gf);
         us = (ggml_time_us() - t0) / 5.0;
-        ggml_backend_buffer_free(buf);
     }
+    if (buf) ggml_backend_buffer_free(buf);
     ggml_free(c);
     return us;
 }
@@ -291,63 +315,67 @@ static enum ggml_type pick_weight_type(ggml_backend_t be, int is_cpu, int64_t te
     return best;
 }
 
-// Does the device run F32-precision flash attention with F32 K/V and no mask,
-// on strided (permuted) q/k/v views, natively?
-static int dev_supports_flash_attn(ggml_backend_dev_t dev, int hd, int H) {
-    struct ggml_init_params ip = { 16 * ggml_tensor_overhead(), NULL, true };
-    struct ggml_context *c = ggml_init(ip);
-    ten *q = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
-    ten *k = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
-    ten *v = ggml_permute(c, ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, H, 64), 0, 2, 1, 3);
-    ten *o = ggml_flash_attn_ext(c, q, k, v, NULL, 1.0f, 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
-    int ok = ggml_backend_dev_supports_op(dev, o);
-    ggml_free(c);
-    return ok;
+// TQ1_0 decoding table: byte -> its five base-3 digits, most significant
+// first, exactly as gguf-py's TQ1_0.dequantize_blocks extracts them
+// (multiply by 3^n mod 256, then * 3 >> 8). Codes 0/1/2 mean -1/0/+1.
+static uint8_t tq1_trits[256][5];
+
+static void tq1_init(void) {
+    static const uint8_t pow3[5] = { 1, 3, 9, 27, 81 };
+    for (int q = 0; q < 256; q++)
+        for (int n = 0; n < 5; n++)
+            tq1_trits[q][n] = (uint8_t) (((uint8_t) (q * pow3[n]) * 3) >> 8);
 }
 
-// Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
-// Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
-static int dev_fused_topk_max(ggml_backend_dev_t dev) {
-    static const int widths[] = { 1 << 20, 4096 };
-    int best = 0;
-    for (size_t w = 0; w < sizeof widths / sizeof *widths && !best; w++) {
-        struct ggml_init_params ip = { 4 * ggml_tensor_overhead(), NULL, true };
-        struct ggml_context *c = ggml_init(ip);
-        ten *a = ggml_new_tensor_2d(c, GGML_TYPE_F32, widths[w], 4);
-        if (ggml_backend_dev_supports_op(dev, ggml_act_quant_topk(c, a, widths[w] / 2))) best = widths[w];
-        ggml_free(c);
-    }
-    return best;
+// One 256-weight TQ1_0 block (48 + 4 bytes of digits, then the fp16 scale) -> codes.
+static void tq1_block_codes(const uint8_t *blk, uint8_t *t) {
+    for (int m = 0; m < 32; m++) for (int n = 0; n < 5; n++) t[n * 32 + m]       = tq1_trits[blk[m]][n];
+    for (int m = 0; m < 16; m++) for (int n = 0; n < 5; n++) t[160 + n * 16 + m] = tq1_trits[blk[32 + m]][n];
+    for (int j = 0; j < 4; j++)  for (int n = 0; n < 4; n++) t[240 + n * 4 + j]  = tq1_trits[blk[48 + j]][n];
 }
 
-// Q4_0 holding ternary values: per 32-block scale = |max|, codes {7, 8, 9}.
-// (ggml's own Q4_0 quantizer is asymmetric and would clip one sign to 7/8.)
-static void pack_q4_0_ternary(const float *x, uint8_t *y, int64_t n) {
-    for (int64_t blk = 0; blk < n / 32; blk++, x += 32, y += 18) {
-        float d = 0.0f;
-        for (int j = 0; j < 32; j++) d = fmaxf(d, fabsf(x[j]));
-        ggml_fp16_t h = ggml_fp32_to_fp16(d);
-        memcpy(y, &h, sizeof h);
-        for (int j = 0; j < 16; j++) {
-            int lo = d > 0.0f ? (int) lroundf(x[j] / d) + 8 : 8;
-            int hi = d > 0.0f ? (int) lroundf(x[j + 16] / d) + 8 : 8;
-            y[2 + j] = (uint8_t) (lo | (hi << 4));
-        }
-    }
-}
-
-// TQ1_0 (the file's format) -> `to`. Exact: every value is 0 or +/- the block
-// scale, which is an fp16 number and survives any of these encodings.
+// TQ1_0 (the file's format) -> `to`, straight from the codes: every value is
+// 0 or +/- the block's fp16 scale, so each target is written exactly without
+// a float detour. (Through floats and ggml's quantizers this took ~1.6 s of
+// a ~2 s startup for 106M weights.) Other targets take the float path.
 static void *repack_ternary(const ten *src, enum ggml_type to, size_t *size) {
-    int64_t n = ggml_nelements(src), cols = src->ne[0], rows = n / cols;
+    int64_t n = ggml_nelements(src), cols = src->ne[0], rows = n / cols, nblk = n / 256;
+    *size = ggml_row_size(to, cols) * rows;
+    uint8_t *dst = malloc(*size);
+    const uint8_t *in = (const uint8_t *) src->data;
+    uint8_t t[256];
+    if (to == GGML_TYPE_Q4_0 || to == GGML_TYPE_TQ2_0 || to == GGML_TYPE_F16) {
+        for (int64_t blk = 0; blk < nblk; blk++, in += 54) {
+            tq1_block_codes(in, t);
+            const uint8_t *d = in + 52;  // fp16 scale, copied bit for bit
+            if (to == GGML_TYPE_Q4_0) {
+                // 8 Q4_0 blocks of {fp16 d, 16 bytes}: code j in the low nibble,
+                // code j + 16 in the high one, value (nibble - 8) * d.
+                uint8_t *o = dst + blk * 8 * 18;
+                for (int s = 0; s < 8; s++, o += 18) {
+                    memcpy(o, d, 2);
+                    for (int j = 0; j < 16; j++)
+                        o[2 + j] = (uint8_t) ((t[s * 32 + j] + 7) | ((t[s * 32 + j + 16] + 7) << 4));
+                }
+            } else if (to == GGML_TYPE_TQ2_0) {
+                // {64 bytes, fp16 d}: element c*128 + n*32 + m in bits 2n of byte c*32 + m.
+                uint8_t *o = dst + blk * 66;
+                for (int c = 0; c < 2; c++)
+                    for (int m = 0; m < 32; m++)
+                        o[c * 32 + m] = (uint8_t) (t[c * 128 + m] | (t[c * 128 + 32 + m] << 2) |
+                                                   (t[c * 128 + 64 + m] << 4) | (t[c * 128 + 96 + m] << 6));
+                memcpy(o + 64, d, 2);
+            } else {  // F16: 0, +d or -d
+                uint16_t db, *o = (uint16_t *) dst + blk * 256;
+                memcpy(&db, d, 2);
+                for (int i = 0; i < 256; i++) o[i] = t[i] == 1 ? 0 : t[i] == 2 ? db : (uint16_t) (db ^ 0x8000u);
+            }
+        }
+        return dst;
+    }
     float *f = malloc(sizeof(float) * n);
     ggml_get_type_traits(src->type)->to_float(src->data, f, n);
-    *size = ggml_row_size(to, cols) * rows;
-    void *dst = malloc(*size);
-    if (to == GGML_TYPE_Q4_0) pack_q4_0_ternary(f, dst, n);
-    else if (to == GGML_TYPE_F16) ggml_fp32_to_fp16_row(f, dst, n);  // exact: +/- an fp16 scale
-    else ggml_quantize_chunk(to, f, dst, 0, rows, cols, NULL);
+    ggml_quantize_chunk(to, f, dst, 0, rows, cols, NULL);
     free(f);
     return dst;
 }
@@ -388,6 +416,7 @@ static int fuse_slot(model_t *m, const char *name, const ten *src, char *fused, 
 }
 
 static void model_load(model_t *m, const char *path, int weight_type) {
+    tq1_init();
     struct ggml_context *hctx = NULL;
     struct gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &hctx };
     struct gguf_context *g = gguf_init_from_file(path, gp);
@@ -440,14 +469,14 @@ static void model_load(model_t *m, const char *path, int weight_type) {
                       : pick_weight_type(m->backend, is_cpu, tern_params,
                                          (int) cfg_num(g, "hidden_dim", 768), (int) cfg_num(g, "ffn_dim", 2048));
     // YEOUBI_NO_FAST_TOPK=1 forces the argsort path (for A/B checks).
-    m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(dev);
+    m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(m->backend);
     // YEOUBI_NO_FUSED_QUANT=1 forces the stock-op chains (for A/B checks).
-    m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(dev);
+    m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(m->backend);
     // YEOUBI_NO_FAST_TOPK=1 also turns this off, so CI can still reach the argsort path.
-    m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(dev) : 0;
+    m->fused_topk_max = m->fused_quant && !getenv("YEOUBI_NO_FAST_TOPK") ? dev_fused_topk_max(m->backend) : 0;
     // YEOUBI_NO_FLASH_ATTN=1 forces the matmul/softmax attention (for A/B checks).
     m->flash_attn = !getenv("YEOUBI_NO_FLASH_ATTN") &&
-                    dev_supports_flash_attn(dev, (int) cfg_num(g, "head_dim", 64), (int) cfg_num(g, "n_heads", 12));
+                    dev_supports_flash_attn(m->backend, (int) cfg_num(g, "head_dim", 64), (int) cfg_num(g, "n_heads", 12));
     fprintf(stderr, "topk: %s, act quant: %s, attention: %s\n",
             m->fused_topk_max ? "fused" : m->fast_topk ? "top_k + top_k_mask" : "argsort",
             m->fused_quant ? "fused" : "op chain", m->flash_attn ? "flash" : "matmul");
