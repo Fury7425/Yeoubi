@@ -55,9 +55,24 @@ def _save(model: torch.nn.Module, config, path: str, rdt: bool) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--out", required=True)
+    p.add_argument("--bench", action="store_true",
+                   help="also write bench.pt: random weights at the step-25000 checkpoint's dimensions, "
+                        "for timing the runtime (not for parity)")
     args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
     torch.manual_seed(0)
+
+    if args.bench:
+        bench_cfg = RDTConfig(
+            hidden_dim=768, n_heads=12, ffn_dim=2048, t_embed_dim=256, max_seq_len=4096,
+            rope_scaling_type="yarn", rope_scaling_factor=4.0, qk_norm=True, use_rdt=True,
+            use_byte_patches=True, byte_decoder_ffn=True, prelude_layers=4,
+            pre_recurrent_layers=2, recurrent_layers=2, post_recurrent_layers=2, coda_layers=4,
+            max_loop_iters=3, adaptive_loops=True, use_act=False,
+        )
+        bench = BitRDTTransformer(bench_cfg).eval()
+        _randomize(bench)
+        _save(bench, bench_cfg, os.path.join(args.out, "bench.pt"), rdt=True)
 
     rdt_cfg = RDTConfig(
         **COMMON, use_rdt=True, use_byte_patches=True, byte_decoder_ffn=True,

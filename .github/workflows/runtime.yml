@@ -118,6 +118,30 @@ jobs:
           done
           exit $fail
 
+      - name: Benchmark (step-25000 dimensions, random weights)
+        run: |
+          python scripts/make_parity_fixture.py --out bench --bench > /dev/null
+          python -m yeoubi.gguf_export bench/bench.pt bench/bench.gguf
+          med() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
+          for dev in $("$EXE" --list-devices | awk '{print $1}'); do
+            for n in 256 1024; do
+              new=$("$EXE" -m bench/bench.gguf -d $dev -t 4 -n $n --steps 8 -v 2>&1 | grep -oE 'forward=[0-9.]+' | tail -6 | cut -d= -f2 | med)
+              old=$(YEOUBI_NO_FUSED_QUANT=1 YEOUBI_NO_FAST_TOPK=1 "$EXE" -m bench/bench.gguf -d $dev -t 4 -n $n --steps 8 -v 2>&1 | grep -oE 'forward=[0-9.]+' | tail -6 | cut -d= -f2 | med)
+              echo "BENCH $dev n=$n: stock-op path $old ms/step, fused kernels $new ms/step"
+            done
+          done
+
+      - name: Fused kernels off must still match
+        run: |
+          fail=0
+          for m in rdt moe; do
+            for ref in a4 a8 block; do
+              YEOUBI_NO_FUSED_QUANT=1 python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
+                --gguf fixture/$m/model.gguf --runtime "$EXE" --device CPU 2>&1 | grep -E '^\[|FAIL' || fail=1
+            done
+          done
+          exit $fail
+
       - name: Graph reuse gives identical samples
         run: |
           for args in "-m fixture/rdt/model.gguf -p Hello -n 64 --steps 6" \

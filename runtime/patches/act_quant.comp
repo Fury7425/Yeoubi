@@ -1,0 +1,67 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// GGML_OP_ACT_QUANT for ggml's Vulkan backend (added by runtime/cmake/patch_ggml.cmake).
+//
+// Yeoubi's activation fake-quant (yeoubi/quantization.py HybridQuantizer) for
+// one row per workgroup, replacing a chain of 6-13 tiny ops per quantizer:
+//   mode 0: INT4, scale sqrt(7) / mean|x|   (a4.8 absmean)
+//   mode 1: INT4, scale 7 / max|x|
+//   mode 2: INT8, scale 127 / max|x|
+// With a mask (TOP_K_MASK output: 0 keep, -inf drop), dropped values are
+// zeroed first. out = clamp(roundEven(x * s), -L, L) / s, with
+// s = (1 / max(stat, 1e-8)) * level, the order torch evaluates it in.
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};   // x    [n, rows]
+layout (binding = 1) readonly buffer B {A_TYPE data_b[];};   // mask [n, rows] (x when unmasked)
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};  // out  [n, rows]
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+
+shared float red[BLOCK_SIZE];
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.KY) {
+        return;  // uniform across the workgroup
+    }
+    const uint n      = p.KX;
+    const uint mode   = uint(p.param1);
+    const bool masked = p.param2 != 0.0;
+    const uint base   = row * n;
+    const float ninf  = uintBitsToFloat(0xff800000u);
+
+    float acc = 0.0;
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        float v = float(data_a[base + i]);
+        if (masked && !(float(data_b[base + i]) > ninf)) {
+            v = 0.0;
+        }
+        acc = mode == 0u ? acc + abs(v) : max(acc, abs(v));
+    }
+    red[tid] = acc;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2u; s > 0u; s >>= 1) {
+        if (tid < s) {
+            red[tid] = mode == 0u ? red[tid] + red[tid + s] : max(red[tid], red[tid + s]);
+        }
+        barrier();
+    }
+
+    const float stat  = max(mode == 0u ? red[0] / float(n) : red[0], 1e-8);
+    const float level = mode == 2u ? 127.0 : 7.0;
+    const float s     = (1.0 / stat) * (mode == 0u ? 2.6457513110645907 : level);
+
+    for (uint i = tid; i < n; i += BLOCK_SIZE) {
+        float v = float(data_a[base + i]);
+        if (masked && !(float(data_b[base + i]) > ninf)) {
+            v = 0.0;
+        }
+        data_d[base + i] = D_TYPE(clamp(roundEven(v * s), -level, level) / s);
+    }
+}

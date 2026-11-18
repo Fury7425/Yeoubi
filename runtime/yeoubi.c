@@ -83,7 +83,7 @@ typedef struct {
     int    n_experts, top_k, kv_bits, kv_bos_bits;
     double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std, capacity_factor;
     // runtime
-    int act, fast_topk;
+    int act, fast_topk, fused_quant;
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
@@ -228,6 +228,18 @@ static int dev_supports_topk_mask(ggml_backend_dev_t dev) {
     return ok;
 }
 
+// Does the device run the patched GGML_OP_ACT_QUANT natively, with and without a mask?
+static int dev_supports_act_quant(ggml_backend_dev_t dev) {
+    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *c = ggml_init(ip);
+    ten *a = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
+    ten *mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
+    int ok = ggml_backend_dev_supports_op(dev, ggml_act_quant(c, a, NULL, 0)) &&
+             ggml_backend_dev_supports_op(dev, ggml_act_quant(c, a, mask, 2));
+    ggml_free(c);
+    return ok;
+}
+
 // Q4_0 holding ternary values: per 32-block scale = |max|, codes {7, 8, 9}.
 // (ggml's own Q4_0 quantizer is asymmetric and would clip one sign to 7/8.)
 static void pack_q4_0_ternary(const float *x, uint8_t *y, int64_t n) {
@@ -341,7 +353,10 @@ static void model_load(model_t *m, const char *path, int weight_type) {
                       : is_cpu && dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
     // YEOUBI_NO_FAST_TOPK=1 forces the argsort path (for A/B checks).
     m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(dev);
-    fprintf(stderr, "topk: %s\n", m->fast_topk ? "top_k + top_k_mask" : "argsort");
+    // YEOUBI_NO_FUSED_QUANT=1 forces the stock-op chains (for A/B checks).
+    m->fused_quant = !getenv("YEOUBI_NO_FUSED_QUANT") && dev_supports_act_quant(dev);
+    fprintf(stderr, "topk: %s, act quant: %s\n", m->fast_topk ? "top_k + top_k_mask" : "argsort",
+            m->fused_quant ? "fused" : "op chain");
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device,
     // fusing projections that read the same input (see fuse_slot).
@@ -551,11 +566,13 @@ static ten *q_topk8(gb_t *b, ten *x) {
     int64_t n = x->ne[0], rows = x->ne[1];
     int k = (int) (n * b->m->topk_ratio);
     if (k < 1) k = 1;
+    int fused = b->m->fused_quant;
+    if (k >= n) return fused ? ggml_act_quant(c, x, NULL, 2) : q_int8(b, x, NULL);
     ten *a = ggml_abs(c, x);
-    if (k >= n) return q_int8(b, x, row_max(b, a));
     if (b->m->fast_topk && n <= ZEROS_MAX) {
         ten *zeros = ggml_view_2d(c, b->zeros, n, 1, (size_t) n * sizeof(float), 0);
         ten *mask  = ggml_top_k_mask(c, zeros, ggml_top_k(c, a, k), NULL, NULL, NULL);
+        if (fused) return ggml_act_quant(c, x, mask, 2);  // drop + INT8 in one kernel
         return q_int8(b, ggml_mul(c, x, ggml_exp(c, mask)), row_max(b, a));
     }
     ten *order = ggml_argsort(c, a, GGML_SORT_ORDER_DESC);
@@ -564,16 +581,20 @@ static ten *q_topk8(gb_t *b, ten *x) {
     ten *thr   = pick(b, a, colk);
     // 1 - 1e-6 keeps the k-th value itself (step(0) == 0).
     x = ggml_mul(c, x, ggml_step(c, ggml_sub(c, a, ggml_scale(c, thr, 1.0f - 1e-6f))));
-    return q_int8(b, x, pick(b, a, col0));
+    return fused ? ggml_act_quant(c, x, NULL, 2) : q_int8(b, x, pick(b, a, col0));
 }
 
+// Activation fake-quant for a BitLinear input. Where the device has the
+// patched GGML_OP_ACT_QUANT (CPU, Vulkan, Metal), each quantizer is one
+// kernel; elsewhere (CUDA/HIP replay whole graphs as CUDA graphs, so the op
+// chains cost them little) the equivalent chain of stock ops.
 static ten *quant(gb_t *b, ten *x, int mode) {
-    switch (b->m->act) {
-        case ACT_NONE: return x;
-        case ACT_A8:   return q_int8(b, x, NULL);  // set_activation_mode("A8"): INT8 everywhere
-        default:       break;
-    }
-    return mode == Q_INT4 ? q_int4(b, x) : mode == Q_TOPK ? q_topk8(b, x) : q_int8(b, x, NULL);
+    model_t *m = b->m;
+    if (m->act == ACT_NONE) return x;
+    if (m->act == ACT_A8 || mode == Q_INT8)  // set_activation_mode("A8"): INT8 everywhere
+        return m->fused_quant ? ggml_act_quant(b->ctx, x, NULL, 2) : q_int8(b, x, NULL);
+    if (mode == Q_TOPK) return q_topk8(b, x);
+    return m->fused_quant ? ggml_act_quant(b->ctx, x, NULL, m->int4_absmean ? 0 : 1) : q_int4(b, x);
 }
 
 static ten *lin(gb_t *b, ten *w, ten *x, int mode) { return ggml_mul_mat(b->ctx, w, quant(b, x, mode)); }
