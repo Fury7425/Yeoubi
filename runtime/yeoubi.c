@@ -280,7 +280,7 @@ static void model_load(model_t *m, const char *path) {
 typedef struct {
     struct ggml_context *ctx;
     model_t *m;
-    ten *pos, *freq_factors, *one;
+    ten *rope_cos, *rope_sin, *rope_rot, *one;
 } gb_t;
 
 static ten *norm(gb_t *b, ten *x, ten *w) {
@@ -339,13 +339,39 @@ static ten *ffn(gb_t *b, ffn_t *f, ten *h) {
     return lin(b, f->down, norm(b, mid, f->sub), A_TOPK);
 }
 
+// RotaryEmbedding.forward: x * cos + rotate_half(x) * sin, x = [hd, H, T].
+// Not ggml_rope_ext: Vulkan rejects RoPE with per-dimension frequency factors
+// (needed for YaRN), and every attention layer then bounced to the CPU. Host
+// cos/sin tables plus a +/-1 rotation matmul run on every backend and match
+// PyTorch's tables exactly.
 static ten *rope(gb_t *b, ten *x) {
-    model_t *m = b->m;
-    float freq_scale = m->rope_type == ROPE_LINEAR ? (float) (1.0 / m->rope_factor) : 1.0f;
-    // YaRN attention temperature, folded into cos/sin as in RotaryEmbedding.
+    struct ggml_context *c = b->ctx;
+    ten *rot = ggml_mul_mat(c, b->rope_rot, x);  // cat(-x2, x1)
+    return ggml_add(c, ggml_mul(c, x, b->rope_cos), ggml_mul(c, rot, b->rope_sin));
+}
+
+// Fill cos/sin [hd, Tp] and the rotate-half matrix, as RotaryEmbedding._build_cache.
+static void rope_tables(model_t *m, int Tp, float *cos_t, float *sin_t, float *rot) {
+    int hd = m->head_dim, n = hd / 2;
+    float s = (float) m->rope_factor;
     float mscale = m->rope_type == ROPE_YARN ? (float) (0.1 * log(m->rope_factor) + 1.0) : 1.0f;
-    return ggml_rope_ext(b->ctx, x, b->pos, b->freq_factors, m->head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                         (float) m->rope_theta, freq_scale, 0.0f, mscale, 0.0f, 0.0f);
+    for (int i = 0; i < n; i++) {
+        float inv = 1.0f / powf((float) m->rope_theta, (float) (2 * i) / (float) hd);
+        if (m->rope_type == ROPE_YARN) {
+            float ramp = n > 1 ? (float) i / (float) (n - 1) : 0.0f;
+            ramp = fminf(fmaxf((ramp - 0.25f) / 0.5f, 0.0f), 1.0f);
+            inv *= (1.0f - ramp) + ramp / s;
+        }
+        for (int p = 0; p < Tp; p++) {
+            float a = (m->rope_type == ROPE_LINEAR ? (float) p / s : (float) p) * inv;
+            cos_t[(size_t) p * hd + i] = cos_t[(size_t) p * hd + i + n] = cosf(a) * mscale;
+            sin_t[(size_t) p * hd + i] = sin_t[(size_t) p * hd + i + n] = sinf(a) * mscale;
+        }
+    }
+    // mul_mat(R, x)[o] = sum_k R[o * hd + k] * x[k]
+    memset(rot, 0, sizeof(float) * hd * hd);
+    for (int o = 0; o < n; o++) rot[(size_t) o * hd + o + n] = -1.0f;
+    for (int o = n; o < hd; o++) rot[(size_t) o * hd + o - n] = 1.0f;
 }
 
 static ten *attention(gb_t *b, block_t *L, ten *h) {
@@ -451,18 +477,19 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
     size_t mem = ggml_tensor_overhead() * GRAPH_SIZE * 2 + ggml_graph_overhead_custom(GRAPH_SIZE, false);
     struct ggml_init_params ip = { mem, NULL, true };
     struct ggml_context *c = ggml_init(ip);
-    gb_t b = { c, m, NULL, NULL, NULL };
+    gb_t b = { c, m, NULL, NULL, NULL, NULL };
     int D = m->hidden, P = m->patch, Tp = T / P, hd = m->head_dim;
 
     ten *in_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T);
     ten *in_tf  = ggml_new_tensor_2d(c, GGML_TYPE_F32, m->t_dim, 1);
-    b.pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, Tp);
+    b.rope_cos = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);  // broadcast over heads
+    b.rope_sin = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);
+    b.rope_rot = ggml_new_tensor_2d(c, GGML_TYPE_F32, hd, hd);
     b.one = ggml_new_tensor_1d(c, GGML_TYPE_F32, 1);
-    if (m->rope_type == ROPE_YARN) b.freq_factors = ggml_new_tensor_1d(c, GGML_TYPE_F32, hd / 2);
     ten *in_sc    = sc && m->self_cond_proj ? ggml_new_tensor_2d(c, GGML_TYPE_F32, VOCAB, T) : NULL;
     ten *in_sig   = m->is_rdt ? ggml_new_tensor_2d(c, GGML_TYPE_F32, m->loop_dim, n_loops) : NULL;
     ten *in_noise = m->is_rdt && noise ? ggml_new_tensor_2d(c, GGML_TYPE_F32, D, Tp) : NULL;
-    ten *inputs[] = { in_ids, in_tf, b.pos, b.one, b.freq_factors, in_sc, in_sig, in_noise };
+    ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.rope_rot, b.one, in_sc, in_sig, in_noise };
     for (size_t i = 0; i < sizeof inputs / sizeof *inputs; i++) if (inputs[i]) ggml_set_input(inputs[i]);
 
     // NoiseEmbedding MLP (the sinusoid features come from the host).
@@ -517,24 +544,15 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
         free(tf);
     }
     {
-        int32_t *pos = malloc(sizeof(int32_t) * Tp);
-        for (int i = 0; i < Tp; i++) pos[i] = i;
-        set_input(b.pos, pos, sizeof(int32_t) * Tp);
-        free(pos);
+        float *cs = malloc(sizeof(float) * ((size_t) 2 * hd * Tp + (size_t) hd * hd));
+        rope_tables(m, Tp, cs, cs + (size_t) hd * Tp, cs + (size_t) 2 * hd * Tp);
+        set_input(b.rope_cos, cs, sizeof(float) * hd * Tp);
+        set_input(b.rope_sin, cs + (size_t) hd * Tp, sizeof(float) * hd * Tp);
+        set_input(b.rope_rot, cs + (size_t) 2 * hd * Tp, sizeof(float) * hd * hd);
+        free(cs);
     }
     float one = 1.0f;
     set_input(b.one, &one, sizeof one);
-    if (b.freq_factors) {
-        // YaRN ramp from RotaryEmbedding._scaled_inv_freq, as a divisor of theta.
-        int n = hd / 2;
-        float ff[1024];
-        for (int i = 0; i < n && i < 1024; i++) {
-            float ramp = n > 1 ? (float) i / (n - 1) : 0.0f;
-            ramp = fminf(fmaxf((ramp - 0.25f) / 0.5f, 0.0f), 1.0f);
-            ff[i] = 1.0f / ((1.0f - ramp) + ramp / (float) m->rope_factor);
-        }
-        set_input(b.freq_factors, ff, sizeof(float) * n);
-    }
     if (in_sc) set_input(in_sc, sc, sizeof(float) * VOCAB * T);
     if (in_noise) set_input(in_noise, noise, sizeof(float) * D * Tp);
     if (in_sig) {
@@ -674,7 +692,10 @@ static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int ple
         double tc = acos(1.0 - (1.0 - (double) s / o->steps)) / 1.5707963267948966;
         double tn = acos(1.0 - (1.0 - (double) (s + 1) / o->steps)) / 1.5707963267948966;
         float *z = make_noise(m, T);
-        forward(m, ids, T, (float) tc, select_loops(m, o, tc, T), sc, z, logits);
+        int64_t t0 = ggml_time_us();
+        int nl = select_loops(m, o, tc, T);
+        forward(m, ids, T, (float) tc, nl, sc, z, logits);
+        double ms = (ggml_time_us() - t0) / 1000.0;
         free(z);
         if (m->self_cond_proj) {
             if (!sc) sc = malloc(sizeof(float) * VOCAB * T);
@@ -722,7 +743,8 @@ static int run(model_t *m, const opts_t *o, const unsigned char *prompt, int ple
         if (o->verbose) {
             int n = 0;
             for (int i = 0; i < T; i++) n += ids[i] == MASK_ID;
-            fprintf(stderr, "step %d/%d t=%.3f->%.3f masked=%d\n", s + 1, o->steps, tc, tn, n);
+            fprintf(stderr, "step %d/%d t=%.3f->%.3f loops=%d masked=%d forward=%.1f ms\n",
+                    s + 1, o->steps, tc, tn, nl, n, ms);
         }
     }
 
@@ -808,6 +830,7 @@ int main(int argc, char **argv) {
     }
     if (o.steps < 1 || o.length < 1 || o.loops > MAX_LOOPS) usage();
 
+    ggml_time_init();
     ggml_backend_load_all();  // dynamic backends (GGML_BACKEND_DL); no-op for static builds
     if (list) {
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
