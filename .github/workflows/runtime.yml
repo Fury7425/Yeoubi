@@ -63,7 +63,9 @@ jobs:
 
       - name: Build
         run: |
-          cmake -S runtime -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
+          # GGML_NATIVE=OFF: a native build targets the runner's CPU (AVX-512
+          # Xeons) and dies with "illegal instruction" on most laptops.
+          cmake -S runtime -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF ${{ matrix.flags }}
           cmake --build build --config Release -j 4
 
       - name: Parity fixtures
