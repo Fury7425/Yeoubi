@@ -64,14 +64,15 @@ enum { ACT_A4, ACT_A8, ACT_NONE };          // --act: trained stage / A8 stage /
 enum { Q_INT4, Q_TOPK, Q_INT8 };            // a BitLinear's configured input quantizer
 enum { KV_NONE, KV_READ, KV_COMMIT };       // full canvas / denoise a block / commit a block
 
-// Dense BitFFN, or BitMoEFFN when router is set (up/gate/down are then
-// stacked [in, out, n_experts] and sub is [ffn_dim, n_experts]).
+// Dense BitFFN (up = fused [gate; up] rows), or BitMoEFFN when router is set
+// (up/gate/down are then stacked [in, out, n_experts], sub [ffn_dim, n_experts]).
 typedef struct { ten *up, *gate, *down, *sub, *router; } ffn_t;
 
 typedef struct {
-    ten *attn_norm, *ffn_norm, *t_proj;
-    ten *wq, *wk, *wv, *wo, *q_norm, *k_norm, *attn_sub;
+    ten *attn_norm, *ffn_norm;
+    ten *wqkv, *wo, *q_norm, *k_norm, *attn_sub;  // wqkv: fused [q; k; v] rows
     ffn_t ffn;
+    int tidx;  // this block's slice of the fused t_proj
 } block_t;
 
 typedef struct {
@@ -98,6 +99,9 @@ typedef struct {
     int n_loop_norms;
     float *alpha, *iter_gate, *loop_embed;  // tiny host copies used as graph constants
     int n_alpha, n_gate, n_loop_embed;
+    ten *tproj_all;                          // every block's t_proj, stacked
+    char (*tproj_names)[GGML_MAX_NAME];
+    int n_tproj;
     // KV cache for the block sampler: one K and V per virtual layer, holding
     // the dequantized values of PyTorch's quantized KVCache.
     struct ggml_context *kvctx;
@@ -133,11 +137,19 @@ static void load_ffn(model_t *m, ffn_t *f, const char *p) {
         m->has_moe = 1;
         return;
     }
-    f->up = getf(m, 0, "%s.up_proj.weight", p);
+    f->up = getf(m, 0, "%s.gate_up.weight", p);  // fused at load, see fuse_slot()
     if (!f->up) return;
-    f->gate = getf(m, 1, "%s.gate_proj.weight", p);
     f->down = getf(m, 1, "%s.down_proj.weight", p);
     f->sub  = getf(m, 0, "%s.sub_norm.weight", p);
+}
+
+// Index of a block's t_proj inside the fused "t_proj.all" matrix.
+static int t_proj_index(model_t *m, const char *block_prefix) {
+    char name[GGML_MAX_NAME];
+    snprintf(name, sizeof name, "%s.t_proj.weight", block_prefix);
+    for (int i = 0; i < m->n_tproj; i++) if (!strcmp(m->tproj_names[i], name)) return i;
+    die("missing tensor %s", name);
+    return -1;
 }
 
 // Append every "<prefix>.<i>" block that exists; returns the new count.
@@ -149,10 +161,8 @@ static int load_blocks(model_t *m, const char *prefix, block_t **list, int n) {
         snprintf(p, sizeof p, "%s.%d", prefix, i);
         b->attn_norm = getf(m, 1, "%s.attn_norm.weight", p);
         b->ffn_norm  = getf(m, 1, "%s.ffn_norm.weight", p);
-        b->t_proj    = getf(m, 1, "%s.t_proj.weight", p);
-        b->wq        = getf(m, 1, "%s.attn.q_proj.weight", p);
-        b->wk        = getf(m, 1, "%s.attn.k_proj.weight", p);
-        b->wv        = getf(m, 1, "%s.attn.v_proj.weight", p);
+        b->tidx      = t_proj_index(m, p);
+        b->wqkv      = getf(m, 1, "%s.attn.qkv.weight", p);
         b->wo        = getf(m, 1, "%s.attn.o_proj.weight", p);
         b->q_norm    = getf(m, 0, "%s.attn.q_norm.weight", p);
         b->k_norm    = getf(m, 0, "%s.attn.k_norm.weight", p);
@@ -235,6 +245,41 @@ static void *repack_ternary(const ten *src, enum ggml_type to, size_t *size) {
     return dst;
 }
 
+// Projections that read the same input are fused into one matmul at load:
+// q/k/v -> "<p>.qkv.weight", gate/up -> "<p>.gate_up.weight" (gate rows first,
+// the order ggml_swiglu expects), and every block's t_proj -> "t_proj.all".
+// At 64 patch positions per step the GPU is launch-bound, so one wide matmul
+// beats three narrow ones. Returns the number of parts (0 = not fused).
+static int fuse_slot(model_t *m, const char *name, const ten *src, char *fused, int *part) {
+    static const struct { const char *suffix, *to; int part, parts; } rules[] = {
+        { ".q_proj.weight",    ".qkv.weight",     0, 3 },
+        { ".k_proj.weight",    ".qkv.weight",     1, 3 },
+        { ".v_proj.weight",    ".qkv.weight",     2, 3 },
+        { ".gate_proj.weight", ".gate_up.weight", 0, 2 },
+        { ".up_proj.weight",   ".gate_up.weight", 1, 2 },
+    };
+    size_t n = strlen(name);
+    if (strstr(name, ".t_proj.weight")) {
+        for (int i = 0; i < m->n_tproj; i++) {
+            if (!strcmp(m->tproj_names[i], name)) {
+                *part = i;
+                snprintf(fused, GGML_MAX_NAME, "t_proj.all");
+                return m->n_tproj;
+            }
+        }
+    }
+    if (ggml_n_dims(src) != 2 || strstr(name, ".experts.")) return 0;  // MoE experts stay per projection
+    for (size_t r = 0; r < sizeof rules / sizeof *rules; r++) {
+        size_t s = strlen(rules[r].suffix);
+        if (n > s && !strcmp(name + n - s, rules[r].suffix)) {
+            snprintf(fused, GGML_MAX_NAME, "%.*s%s", (int) (n - s), name, rules[r].to);
+            *part = rules[r].part;
+            return rules[r].parts;
+        }
+    }
+    return 0;
+}
+
 static void model_load(model_t *m, const char *path, int weight_type) {
     struct ggml_context *hctx = NULL;
     struct gguf_init_params gp = { /*.no_alloc =*/ false, /*.ctx =*/ &hctx };
@@ -281,32 +326,51 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     enum ggml_type wt = weight_type >= 0 ? (enum ggml_type) weight_type
                       : is_cpu && dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
 
-    // Weights: mirror every GGUF tensor into one buffer on the chosen device.
+    // Weights: mirror every GGUF tensor into one buffer on the chosen device,
+    // fusing projections that read the same input (see fuse_slot).
     int64_t nt = gguf_get_n_tensors(g);
-    struct ggml_init_params ip = { (size_t) nt * ggml_tensor_overhead(), NULL, true };
+    struct ggml_init_params ip = { (size_t) (nt + 8) * ggml_tensor_overhead(), NULL, true };
     m->wctx = ggml_init(ip);
+    m->tproj_names = malloc(sizeof *m->tproj_names * (size_t) nt);
+    for (int64_t i = 0; i < nt; i++) {
+        const char *name = gguf_get_tensor_name(g, i);
+        if (strstr(name, ".t_proj.weight")) snprintf(m->tproj_names[m->n_tproj++], GGML_MAX_NAME, "%s", name);
+    }
     int64_t n_tern = 0;
     for (int64_t i = 0; i < nt; i++) {
         const char *name = gguf_get_tensor_name(g, i);
         ten *src = ggml_get_tensor(hctx, name);
         enum ggml_type t = src->type == GGML_TYPE_TQ1_0 ? wt : src->type;
         if (src->type == GGML_TYPE_TQ1_0) n_tern += ggml_nelements(src);
-        ggml_set_name(ggml_new_tensor(m->wctx, t, ggml_n_dims(src), src->ne), name);
+        char fused[GGML_MAX_NAME];
+        int part, parts = fuse_slot(m, name, src, fused, &part);
+        if (!parts) {
+            ggml_set_name(ggml_new_tensor(m->wctx, t, ggml_n_dims(src), src->ne), name);
+        } else if (!get(m, fused)) {
+            ggml_set_name(ggml_new_tensor_2d(m->wctx, t, src->ne[0], src->ne[1] * parts), fused);
+        }
     }
     m->wbuf = ggml_backend_alloc_ctx_tensors_from_buft(m->wctx, ggml_backend_get_default_buffer_type(m->backend));
     if (!m->wbuf) die("out of device memory for weights");
     for (int64_t i = 0; i < nt; i++) {
         const char *name = gguf_get_tensor_name(g, i);
-        ten *src = ggml_get_tensor(hctx, name), *dst = get(m, name);
+        ten *src = ggml_get_tensor(hctx, name);
+        char fused[GGML_MAX_NAME];
+        int part = 0, parts = fuse_slot(m, name, src, fused, &part);
+        ten *dst = get(m, parts ? fused : name);
+        // A fused part is a run of whole rows: part p starts p row-blocks in.
+        size_t offset = (size_t) part * ggml_row_size(dst->type, src->ne[0]) * src->ne[1];
         if (dst->type == src->type) {
-            ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+            ggml_backend_tensor_set(dst, src->data, offset, ggml_nbytes(src));
         } else {
             size_t size;
             void *buf = repack_ternary(src, dst->type, &size);
-            ggml_backend_tensor_set(dst, buf, 0, size);
+            ggml_backend_tensor_set(dst, buf, offset, size);
             free(buf);
         }
     }
+    m->tproj_all = get(m, "t_proj.all");
+    if (!m->tproj_all) die("no t_proj weights in %s", path);
     fprintf(stderr, "weights: %.1fM ternary as %s, %.1f MB on device\n", n_tern / 1e6,
             ggml_type_name(wt), ggml_backend_buffer_get_size(m->wbuf) / 1e6);
     m->alpha      = host_copy(hctx, "recurrent.alpha", &m->n_alpha);
@@ -397,7 +461,7 @@ typedef struct {
     struct ggml_context *ctx;
     struct ggml_cgraph *gf;
     model_t *m;
-    ten *rope_cos, *rope_sin, *consts, *eye, *tril;
+    ten *rope_cos, *rope_sin, *consts, *eye, *tril, *tbias;
     float cvals[N_CONST];
     int ncon, kv, layer;
 } gb_t;
@@ -491,7 +555,7 @@ static ten *lin(gb_t *b, ten *w, ten *x, int mode) { return ggml_mul_mat(b->ctx,
 static ten *ffn(gb_t *b, ffn_t *f, ten *h) {
     struct ggml_context *c = b->ctx;
     h = quant(b, h, Q_INT4);  // up and gate share one quantized input
-    ten *mid = ggml_mul(c, ggml_silu(c, ggml_mul_mat(c, f->gate, h)), ggml_mul_mat(c, f->up, h));
+    ten *mid = ggml_swiglu(c, ggml_mul_mat(c, f->up, h));  // silu(gate) * up from the fused rows
     return lin(b, f->down, norm(b, mid, f->sub), Q_TOPK);
 }
 
@@ -620,9 +684,11 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
     int hd = m->head_dim, H = m->n_heads;
     int64_t T = h->ne[1];
     h = quant(b, h, Q_INT4);  // q, k, v share one quantized input
-    ten *q = ggml_reshape_3d(c, ggml_mul_mat(c, L->wq, h), hd, H, T);
-    ten *k = ggml_reshape_3d(c, ggml_mul_mat(c, L->wk, h), hd, H, T);
-    ten *v = ggml_reshape_3d(c, ggml_mul_mat(c, L->wv, h), hd, H, T);
+    ten *qkv = ggml_mul_mat(c, L->wqkv, h);  // [3 * H * hd, T]
+    size_t es = ggml_element_size(qkv), part = (size_t) hd * H * es;
+    ten *q = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 0));
+    ten *k = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], part));
+    ten *v = ggml_cont(c, ggml_view_3d(c, qkv, hd, H, T, hd * es, qkv->nb[1], 2 * part));
     q = rope(b, norm(b, q, L->q_norm));
     k = rope(b, norm(b, k, L->k_norm));
 
@@ -658,7 +724,9 @@ static ten *attention(gb_t *b, block_t *L, ten *h) {
 
 static ten *block(gb_t *b, block_t *L, ten *x, ten *temb) {
     struct ggml_context *c = b->ctx;
-    ten *h = ggml_add(c, norm(b, x, L->attn_norm), ggml_mul_mat(c, L->t_proj, temb));
+    (void) temb;  // its per-block projections were all done at once (b->tbias)
+    ten *tb = ggml_view_1d(c, b->tbias, b->m->hidden, (size_t) L->tidx * b->m->hidden * ggml_element_size(b->tbias));
+    ten *h = ggml_add(c, norm(b, x, L->attn_norm), tb);
     x = ggml_add(c, x, attention(b, L, h));
     h = norm(b, x, L->ffn_norm);
     return ggml_add(c, x, L->ffn.router ? moe(b, &L->ffn, h) : ffn(b, &L->ffn, h));
@@ -769,6 +837,9 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
     // NoiseEmbedding MLP (the sinusoid features come from the host).
     ten *temb = ggml_add(c, ggml_mul_mat(c, m->ne0_w, in_tf), m->ne0_b);
     temb = ggml_add(c, ggml_mul_mat(c, m->ne2_w, ggml_silu(c, temb)), m->ne2_b);
+    // Every block's t_proj(t_emb) in one matmul; recurrent blocks reuse theirs
+    // on every loop instead of recomputing it.
+    b.tbias = ggml_mul_mat(c, m->tproj_all, temb);  // [hidden * n_blocks, 1]
 
     ten *x = ggml_get_rows(c, m->embed, in_ids);  // [D, T]
     if (in_sc) {
