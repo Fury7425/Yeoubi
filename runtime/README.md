@@ -20,6 +20,15 @@ run it, and any op a backend lacks runs on the CPU instead.
 Each backend needs its own SDK installed (CUDA toolkit, ROCm, Vulkan SDK,
 OpenVINO, Hexagon SDK, and so on). See ggml's build docs for each one.
 
+CI also produces a Windows OpenVINO build, `yeoubi-Windows-OpenVINO`. It
+ships the OpenVINO runtime DLLs next to the exe, so nothing needs
+installing. OpenVINO picks its target from an environment variable,
+`GGML_OPENVINO_DEVICE`, which can be `CPU`, `GPU` or `NPU`, where `NPU` is
+the Core Ultra's AI Boost unit. With that set, select the OpenVINO entry
+from `--list-devices` with `-d`. The OpenVINO backend has no `TOP_K` or
+`TOP_K_MASK` and does not know the fused quantizer, so on that device the
+runtime uses its argsort and stock-op paths automatically.
+
 ## Build
 
 ```bash

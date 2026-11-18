@@ -166,3 +166,98 @@ jobs:
             fixture/*/ref_*.npz
           if-no-files-found: warn
           retention-days: 7
+
+  # OpenVINO build (Intel CPU / Arc GPU / Core Ultra NPU). A separate binary:
+  # it links openvino.dll, so the OpenVINO runtime DLLs ship next to it and
+  # nothing has to be installed on the target machine. Recipe and version
+  # follow llama.cpp's build-openvino.yml / release.yml.
+  openvino-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    env:
+      OV_MAJOR: "2026.4.1"
+      OV_FULL: "2026.4.1.22982.07f9c262b05"
+      GGML_OPENVINO_DEVICE: CPU  # CI runners have no Intel GPU/NPU
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OpenVINO toolkit + OpenCL
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://storage.openvinotoolkit.org/repositories/openvino/packages/$env:OV_MAJOR/windows/openvino_toolkit_windows_$($env:OV_FULL)_x86_64.zip" -OutFile ov.zip
+          Expand-Archive ov.zip -DestinationPath openvino_toolkit
+          $root = (Get-ChildItem openvino_toolkit -Directory | Select-Object -First 1).FullName
+          if (-not (Test-Path "$root\runtime\cmake\OpenVINOConfig.cmake")) { throw "OpenVINOConfig.cmake not found under $root" }
+          Add-Content $env:GITHUB_ENV "OPENVINO_ROOT=$root"
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python deps (CPU torch)
+        run: |
+          pip install numpy
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%OPENVINO_ROOT%\setupvars.bat"
+          cmake -S runtime -B build -G "Visual Studio 17 2022" -A x64 -DGGML_NATIVE=OFF -DGGML_OPENVINO=ON -DCMAKE_TOOLCHAIN_FILE=%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake || exit /b 1
+          cmake --build build --config Release -- /m || exit /b 1
+
+      - name: Bundle the OpenVINO runtime next to the exe
+        shell: pwsh
+        run: |
+          $dest = "build\bin\Release"
+          $ovBin = Join-Path $env:OPENVINO_ROOT 'runtime\bin\intel64\Release'
+          Copy-Item (Join-Path $ovBin '*.dll') $dest -Force
+          Copy-Item (Join-Path $ovBin 'cache.json') $dest -Force -ErrorAction SilentlyContinue
+          Copy-Item (Join-Path $env:OPENVINO_ROOT 'runtime\3rdparty\tbb\bin\tbb*.dll') $dest -Force
+          Copy-Item (Join-Path $env:VCPKG_INSTALLATION_ROOT 'installed\x64-windows\bin\OpenCL.dll') $dest -Force -ErrorAction SilentlyContinue
+          Copy-Item -Recurse (Join-Path $env:OPENVINO_ROOT 'docs\licensing') "$dest\openvino-licensing" -ErrorAction SilentlyContinue
+
+      - name: Parity on every device (OpenVINO on its CPU plugin)
+        run: |
+          EXE=build/bin/Release/yeoubi.exe
+          echo "EXE=$EXE" >> "$GITHUB_ENV"
+          "$EXE" --list-devices
+          python scripts/make_parity_fixture.py --out fixture
+          fail=0
+          for m in rdt std moe; do
+            python export.py --checkpoint fixture/$m.pt --output_dir fixture/$m --format gguf
+            for act in none a4; do
+              python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act $act --save-ref fixture/$m/ref_$act.npz
+            done
+            python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act a4 --block 8 --save-ref fixture/$m/ref_block.npz
+            for dev in $("$EXE" --list-devices | awk '{print $1}'); do
+              for ref in none a4 block; do
+                echo "== $m on $dev ($ref)"
+                python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
+                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
+                  | grep -E '^\[|FAIL|^topk|rror' || fail=1
+              done
+            done
+          done
+          exit $fail
+
+      - name: Benchmark (step-25000 dimensions, random weights)
+        run: |
+          python scripts/make_parity_fixture.py --out bench --bench > /dev/null
+          python -m yeoubi.gguf_export bench/bench.pt bench/bench.gguf
+          med() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
+          for dev in $("$EXE" --list-devices | awk '{print $1}'); do
+            t=$("$EXE" -m bench/bench.gguf -d $dev -t 4 -n 256 --steps 8 -v 2>&1 | grep -oE 'forward=[0-9.]+' | tail -6 | cut -d= -f2 | med)
+            echo "BENCH $dev n=256: $t ms/step"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: yeoubi-Windows-OpenVINO
+          path: build/bin/Release/
+          if-no-files-found: warn
+          retention-days: 7
