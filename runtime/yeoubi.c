@@ -240,6 +240,56 @@ static int dev_supports_act_quant(ggml_backend_dev_t dev) {
     return ok;
 }
 
+// Microseconds for one [k -> n_out] x 64-token matmul with weights of `type`
+// on `be` (mean of 5 runs after a warm-up), or a huge value if the
+// device has no native kernel for it.
+static double time_matmul(ggml_backend_t be, enum ggml_type type, int k, int n_out) {
+    if (!dev_supports(ggml_backend_get_device(be), type)) return 1e30;
+    struct ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), NULL, true };
+    struct ggml_context *c = ggml_init(ip);
+    ten *w = ggml_new_tensor_2d(c, type, k, n_out);
+    ten *x = ggml_new_tensor_2d(c, GGML_TYPE_F32, k, 64);
+    struct ggml_cgraph *gf = ggml_new_graph(c);
+    ggml_build_forward_expand(gf, ggml_mul_mat(c, w, x));
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(c, be);
+    double us = 1e30;
+    if (buf) {
+        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_graph_compute(be, gf);  // warm-up (pipeline compile, caches)
+        int64_t t0 = ggml_time_us();
+        for (int i = 0; i < 5; i++) ggml_backend_graph_compute(be, gf);
+        us = (ggml_time_us() - t0) / 5.0;
+        ggml_backend_buffer_free(buf);
+    }
+    ggml_free(c);
+    return us;
+}
+
+// The exact in-memory type for ternary weights that is fastest here. F16 is
+// tried on GPUs only, and only if it would use under half the free memory.
+static enum ggml_type pick_weight_type(ggml_backend_t be, int is_cpu, int64_t tern_params, int hidden, int ffn) {
+    enum ggml_type cand[] = { GGML_TYPE_Q4_0, GGML_TYPE_TQ2_0, GGML_TYPE_F16 };
+    int n_cand = 3;
+    if (is_cpu) {
+        n_cand = 2;
+    } else {
+        size_t free_mem = 0, total = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &free_mem, &total);
+        if (free_mem && (size_t) tern_params * 2 > free_mem / 2) n_cand = 2;
+    }
+    if (hidden % 256) hidden = 768;  // TQ2_0 needs rows of 256
+    enum ggml_type best = GGML_TYPE_Q4_0;
+    double best_us = 1e30;
+    fprintf(stderr, "weight type autotune:");
+    for (int i = 0; i < n_cand; i++) {
+        double us = time_matmul(be, cand[i], hidden, 2 * ffn);  // the fused gate/up shape
+        if (us < 1e29) fprintf(stderr, " %s %.0f us", ggml_type_name(cand[i]), us);
+        if (us < best_us) { best_us = us; best = cand[i]; }
+    }
+    fprintf(stderr, "\n");
+    return best;
+}
+
 // Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
 // Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
 static int dev_fused_topk_max(ggml_backend_dev_t dev) {
@@ -359,14 +409,20 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     if (m->top_k < 1 || m->top_k > MAX_TOPK) die("top_k_experts must be in [1, %d]", MAX_TOPK);
     if (m->kv_bits < 2 || m->kv_bits > 8 || m->kv_bos_bits < 2 || m->kv_bos_bits > 8) die("kv_cache bits out of range");
 
-    // Ternary weights arrive as TQ1_0 (smallest on disk) and are repacked for
-    // speed on this device: TQ2_0 on CPUs (measured 1.5x faster than Q4_0 on
-    // a Core Ultra 7), Q4_0 on GPUs, where every backend has tuned Q4_0
-    // kernels (TQ2_0 ran 1.5x slower on an Arc iGPU under Vulkan).
+    // Ternary weights arrive as TQ1_0 (smallest on disk) and are repacked to
+    // whichever exact type multiplies fastest on this device, timed now
+    // rather than assumed: the best type differs by backend and CPU (TQ2_0
+    // won on an x86 laptop CPU, Q4_0 on its Arc iGPU, ARM is different again).
     ggml_backend_dev_t dev = ggml_backend_get_device(m->backend);
     int is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    int64_t tern_params = 0;
+    for (int64_t i = 0; i < gguf_get_n_tensors(g); i++) {
+        ten *t = ggml_get_tensor(hctx, gguf_get_tensor_name(g, i));
+        if (t->type == GGML_TYPE_TQ1_0) tern_params += ggml_nelements(t);
+    }
     enum ggml_type wt = weight_type >= 0 ? (enum ggml_type) weight_type
-                      : is_cpu && dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
+                      : pick_weight_type(m->backend, is_cpu, tern_params,
+                                         (int) cfg_num(g, "hidden_dim", 768), (int) cfg_num(g, "ffn_dim", 2048));
     // YEOUBI_NO_FAST_TOPK=1 forces the argsort path (for A/B checks).
     m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(dev);
     // YEOUBI_NO_FUSED_QUANT=1 forces the stock-op chains (for A/B checks).
