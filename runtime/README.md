@@ -50,6 +50,14 @@ CMake fetches ggml at the tag in `YEOUBI_GGML_TAG` (default `v1.0.0`). To
 build offline or against a patched ggml, put a checkout at `runtime/ggml/`
 and CMake uses that instead.
 
+Either way, `cmake/patch_ggml.cmake` adds one Vulkan kernel to ggml,
+`patches/top_k_mask.comp`, for `GGML_OP_TOP_K_MASK`. ggml already runs that
+op on CPU, CUDA, Metal, OpenCL and Hexagon. The runtime uses it to build
+TopK sparsification from `ggml_top_k`, which was 17–28% faster per step on
+an Arc iGPU than sorting every row. Devices without the op fall back to the
+sort automatically. `YEOUBI_NO_FAST_TOPK=1` forces the fallback for
+comparisons.
+
 ## Run
 
 ```bash
