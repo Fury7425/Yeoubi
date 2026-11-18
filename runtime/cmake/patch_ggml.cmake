@@ -296,33 +296,25 @@ void ggml_compute_forward_act_quant(
         "static int ggml_get_n_tasks(")
 
     # --- Vulkan -----------------------------------------------------------
-    file(COPY "${PATCH_DIR}/act_quant.comp" "${PATCH_DIR}/act_quant_topk.comp" DESTINATION "${V}/vulkan-shaders")
+    file(COPY "${PATCH_DIR}/act_quant.comp" DESTINATION "${V}/vulkan-shaders")
 
     insert("${V}/vulkan-shaders/vulkan-shaders-gen.cpp" AFTER
         "    string_to_spv(\"argmax_f32\""
-        "    string_to_spv(\"act_quant_f32\", \"act_quant.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n    string_to_spv(\"act_quant_topk_f32\", \"act_quant_topk.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n")
+        "    string_to_spv(\"act_quant_f32\", \"act_quant.comp\", merge_maps(base_dict, {{\"A_TYPE\", \"float\"}, {\"D_TYPE\", \"float\"}}));\n")
 
     insert("${V}/ggml-vulkan-types.h" AFTER
         "    vk_pipeline pipeline_argmax_f32;"
-        "    vk_pipeline pipeline_act_quant_f32;\n    vk_pipeline pipeline_act_quant_topk_f32;\n")
+        "    vk_pipeline pipeline_act_quant_f32;\n")
 
     insert("${V}/ggml-vulkan.cpp" AFTER
         "    ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, \"argmax_f32\""
-        "    ggml_vk_create_pipeline(device, device->pipeline_act_quant_f32, \"act_quant_f32\", act_quant_f32_len, act_quant_f32_data, \"main\", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n    ggml_vk_create_pipeline(device, device->pipeline_act_quant_topk_f32, \"act_quant_topk_f32\", act_quant_topk_f32_len, act_quant_topk_f32_data, \"main\", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n")
+        "    ggml_vk_create_pipeline(device, device->pipeline_act_quant_f32, \"act_quant_f32\", act_quant_f32_len, act_quant_f32_data, \"main\", 3, sizeof(vk_op_push_constants), {1, 1, 1}, { 256 }, 1);\n")
 
     insert("${V}/ggml-vulkan.cpp" BEFORE
         "void ggml_vk_argmax(ggml_backend_vk_context * ctx"
 "static void ggml_vk_act_quant(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int mode = ggml_get_op_params_i32(dst, 0);
     const uint32_t nrows = (uint32_t) ggml_nrows(dst);
-    if (mode == 3) {  // fused TopK + INT8
-        vk_pipeline pipeline = ctx->device->pipeline_act_quant_topk_f32;
-        vk_op_push_constants pc { (uint32_t) dst->ne[0], nrows, (float) ggml_get_op_params_i32(dst, 1), 0.0f, 0.0f, 0.0f };
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, dst) }, pc, { 1, nrows, 1 });
-        return;
-    }
     vk_pipeline pipeline = ctx->device->pipeline_act_quant_f32;
     vk_op_push_constants pc { (uint32_t) dst->ne[0], nrows, (float) mode, src1 ? 1.0f : 0.0f, 0.0f, 0.0f };
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -343,10 +335,12 @@ void ggml_compute_forward_act_quant(
     insert("${V}/ggml-vulkan.cpp" BEFORE
         "        case GGML_OP_ARGMAX:"
 "        case GGML_OP_ACT_QUANT:
-            // mode 3 (fused TopK) holds a row in 16 KiB of shared memory
+            // No fused TopK (mode 3) here: a shared-memory radix-select kernel lost
+            // to TOP_K + TOP_K_MASK on an Arc iGPU (histogram atomics contend on
+            // the few exponent bins activations share), so Vulkan keeps those.
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous(op) && ggml_nrows(op) <= 65535 &&
-                   (ggml_get_op_params_i32(op, 0) != 3 || op->ne[0] <= 4096) &&
+                   ggml_get_op_params_i32(op, 0) != 3 &&
                    (op->src[1] == nullptr || (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1])));
 ")
 

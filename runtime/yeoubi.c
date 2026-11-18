@@ -255,10 +255,10 @@ static int dev_supports_flash_attn(ggml_backend_t be, int hd, int H) {
     return probe_ops(be, c, &o, 1);
 }
 
-// Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes: the
-// Vulkan kernel keeps a row in shared memory (4096), the CPU takes any.
+// Widest row the device's fused TopK + INT8 (ACT_QUANT mode 3) takes, 0 if
+// none: only the CPU has it; GPUs use TOP_K + TOP_K_MASK, which was faster.
 static int dev_fused_topk_max(ggml_backend_t be) {
-    static const int widths[] = { 65536, 4096 };
+    static const int widths[] = { 65536 };
     for (size_t w = 0; w < sizeof widths / sizeof *widths; w++) {
         struct ggml_context *c = probe_ctx();
         ten *op = ggml_act_quant_topk(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, widths[w], 1), widths[w] / 2);
