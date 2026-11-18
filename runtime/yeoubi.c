@@ -194,17 +194,13 @@ static float *host_copy(struct ggml_context *hctx, const char *name, int *n) {
     return out;
 }
 
-// Can the device multiply this weight type natively, dense and MoE alike?
+// Can the device multiply this weight type natively?
 static int dev_supports(ggml_backend_dev_t dev, enum ggml_type type) {
-    struct ggml_init_params ip = { 16 * ggml_tensor_overhead(), NULL, true };
+    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
     struct ggml_context *c = ggml_init(ip);
-    ten *a   = ggml_new_tensor_2d(c, type, 256, 16);
-    ten *x   = ggml_new_tensor_2d(c, GGML_TYPE_F32, 256, 4);
-    ten *as  = ggml_new_tensor_3d(c, type, 256, 16, 2);
-    ten *x3  = ggml_new_tensor_3d(c, GGML_TYPE_F32, 256, 1, 4);
-    ten *ids = ggml_new_tensor_2d(c, GGML_TYPE_I32, 1, 4);
-    int ok = ggml_backend_dev_supports_op(dev, ggml_mul_mat(c, a, x)) &&
-             ggml_backend_dev_supports_op(dev, ggml_mul_mat_id(c, as, x3, ids));
+    ten *a = ggml_new_tensor_2d(c, type, 256, 16);
+    ten *x = ggml_new_tensor_2d(c, GGML_TYPE_F32, 256, 4);
+    int ok = ggml_backend_dev_supports_op(dev, ggml_mul_mat(c, a, x));
     ggml_free(c);
     return ok;
 }
@@ -276,14 +272,14 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     if (m->top_k < 1 || m->top_k > MAX_TOPK) die("top_k_experts must be in [1, %d]", MAX_TOPK);
     if (m->kv_bits < 2 || m->kv_bits > 8 || m->kv_bos_bits < 2 || m->kv_bos_bits > 8) die("kv_cache bits out of range");
 
-    // Ternary weights arrive as TQ1_0 (smallest on disk) and are repacked to
-    // the most compact type this device multiplies natively: TQ2_0 where the
-    // backend has kernels for it, else Q4_0, which every backend has.
+    // Ternary weights arrive as TQ1_0 (smallest on disk) and are repacked for
+    // speed on this device: TQ2_0 on CPUs (measured 1.5x faster than Q4_0 on
+    // a Core Ultra 7), Q4_0 on GPUs, where every backend has tuned Q4_0
+    // kernels (TQ2_0 ran 1.5x slower on an Arc iGPU under Vulkan).
     ggml_backend_dev_t dev = ggml_backend_get_device(m->backend);
+    int is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     enum ggml_type wt = weight_type >= 0 ? (enum ggml_type) weight_type
-                      : dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
-    if (!dev_supports(dev, wt)) fprintf(stderr, "warning: %s has no native %s matmul; it will run on the CPU\n",
-                                        ggml_backend_dev_name(dev), ggml_type_name(wt));
+                      : is_cpu && dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device.
     int64_t nt = gguf_get_n_tensors(g);
@@ -433,7 +429,12 @@ static ten *pick(gb_t *b, ten *a, ten *idx) {
     return ggml_reshape_2d(c, v, 1, rows);
 }
 
-static ten *row_max(gb_t *b, ten *a) { return pick(b, a, ggml_argmax(b->ctx, a)); }
+// Per-row max of a contiguous [n, rows] tensor -> [1, rows], as one max-pool
+// over the whole row. argmax + gather cost two ops and a slow 1-wide gather.
+static ten *row_max(gb_t *b, ten *a) {
+    int n = (int) a->ne[0];
+    return ggml_pool_2d(b->ctx, a, GGML_OP_POOL_MAX, n, 1, n, 1, 0.0f, 0.0f);
+}
 
 // HybridQuantizer.forward / absmax_quantize_int8: per-token absmax, +/-127.
 // `amax` may be passed when the caller already has it.
@@ -454,9 +455,10 @@ static ten *q_int4(gb_t *b, ten *x) {
 }
 
 // HybridQuantizer "topk_int8": keep the int(n * ratio) largest |x| per token,
-// then INT8. ggml_top_k (radix select) instead of a full argsort: the sort
-// was a quarter of all GPU time. Its indices are unordered, so the threshold
-// is the minimum of the selected values.
+// then INT8. One descending argsort gives both numbers needed: column k-1 is
+// the TopK threshold, column 0 the INT8 scale (the largest survives TopK).
+// Not ggml_top_k: its indices are unordered, so the threshold needs a k-wide
+// 1-element gather, which on Vulkan cost a third of the whole step.
 // ponytail: ggml_round rounds halves away from zero, torch to even; exact
 // .5 products are ~1 in 10^6 values and move one value by one level.
 static ten *q_topk8(gb_t *b, ten *x) {
@@ -465,15 +467,14 @@ static ten *q_topk8(gb_t *b, ten *x) {
     int k = (int) (n * b->m->topk_ratio);
     if (k < 1) k = 1;
     ten *a = ggml_abs(c, x);
-    ten *amax = row_max(b, a);  // the largest survives TopK, so it is also the INT8 scale
-    if (k < n) {
-        ten *vals = ggml_get_rows(c, ggml_reshape_3d(c, a, 1, n, rows), ggml_top_k(c, a, k));
-        vals = ggml_reshape_2d(c, vals, k, rows);
-        ten *thr = pick(b, vals, ggml_argmax(c, ggml_scale(c, vals, -1.0f)));
-        // 1 - 1e-6 keeps the k-th value itself (step(0) == 0).
-        x = ggml_mul(c, x, ggml_step(c, ggml_sub(c, a, ggml_scale(c, thr, 1.0f - 1e-6f))));
-    }
-    return q_int8(b, x, amax);
+    if (k >= n) return q_int8(b, x, row_max(b, a));
+    ten *order = ggml_argsort(c, a, GGML_SORT_ORDER_DESC);
+    ten *col0  = ggml_cont(c, ggml_view_2d(c, order, 1, rows, order->nb[1], 0));
+    ten *colk  = ggml_cont(c, ggml_view_2d(c, order, 1, rows, order->nb[1], (size_t) (k - 1) * order->nb[0]));
+    ten *thr   = pick(b, a, colk);
+    // 1 - 1e-6 keeps the k-th value itself (step(0) == 0).
+    x = ggml_mul(c, x, ggml_step(c, ggml_sub(c, a, ggml_scale(c, thr, 1.0f - 1e-6f))));
+    return q_int8(b, x, pick(b, a, col0));
 }
 
 static ten *quant(gb_t *b, ten *x, int mode) {

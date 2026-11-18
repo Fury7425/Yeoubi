@@ -92,11 +92,11 @@ path.
 - Ternary weights are stored on disk as ggml `TQ1_0`, which packs five
   base-3 digits per byte, or 1.69 bits per weight. The step-25000
   checkpoint's GGUF is 35 MB, against 837 MB for the `.pt`. At load time the
-  runtime repacks the weights into the most compact type the device can
-  multiply natively: `TQ2_0` if the backend has kernels for it, otherwise
-  `Q4_0`, which every backend supports. The repack is exact, because every
-  value is 0 or ± the scale. To force a type, for example for benchmarking,
-  pass `--weight-type q4|tq2|tq1`.
+  runtime repacks the weights into whichever type is fastest on the device:
+  `TQ2_0` on CPUs and `Q4_0` on GPUs. Every GPU backend has tuned `Q4_0`
+  kernels, and `TQ2_0` was 1.5× slower on an Arc iGPU. The repack is exact,
+  because every value is 0 or ± the scale. To force a type, for example for
+  benchmarking, pass `--weight-type q4|tq2|tq1`.
 - Activations are quantized the same way as in `sample.py`: INT4 into
   q/k/v/up/gate, TopK followed by INT8 into o/down, and INT8 into the other
   layers. `--act a8` matches the A8 training stage (INT8 everywhere), and
