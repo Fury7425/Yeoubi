@@ -203,20 +203,31 @@ void ggml_compute_forward_act_quant(
 
     for (int64_t r = params->ith; r < nr; r += params->nth) {
         const float * x = (const float *) src0->data + r*n;
-        const float * m = mask ? (const float *) mask->data + r*n : nullptr;
         float       * y = (float *) dst->data + r*n;
-
-        float acc = 0.0f;
-        for (int64_t i = 0; i < n; i++) {
-            const float v = (m && !(m[i] > -INFINITY)) ? 0.0f : x[i];
-            acc = mode == 0 ? acc + std::fabs(v) : std::max(acc, std::fabs(v));
+        if (mask) {  // dropped values -> 0 into y, then work on y in place
+            const float * m = (const float *) mask->data + r*n;
+            for (int64_t i = 0; i < n; i++) {
+                y[i] = m[i] > -INFINITY ? x[i] : 0.0f;
+            }
+            x = y;
         }
-        const float stat = std::max(mode == 0 ? acc / (float) n : acc, 1e-8f);
+        // Branch-free loops, so compilers can vectorize them.
+        float acc = 0.0f;
+        if (mode == 0) {
+            for (int64_t i = 0; i < n; i++) {
+                acc += std::fabs(x[i]);
+            }
+            acc /= (float) n;
+        } else {
+            for (int64_t i = 0; i < n; i++) {
+                acc = std::max(acc, std::fabs(x[i]));
+            }
+        }
+        const float stat = std::max(acc, 1e-8f);
         const float s    = (1.0f / stat) * (mode == 0 ? 2.6457513110645907f : level);
         for (int64_t i = 0; i < n; i++) {
-            const float v = (m && !(m[i] > -INFINITY)) ? 0.0f : x[i];
             // nearbyint rounds half to even under the default mode, as torch.round does
-            y[i] = std::min(std::max(std::nearbyint(v*s), -level), level) / s;
+            y[i] = std::min(std::max(std::nearbyint(x[i]*s), -level), level) / s;
         }
     }
 }
@@ -285,9 +296,14 @@ void ggml_compute_forward_act_quant(
     file(READ "${PATCH_DIR}/act_quant.metal" kernel)
     file(APPEND "${M}/kernels/misc.metal" "${kernel}")
 
+    # Declared in the header: the op dispatch switch comes before the definitions.
+    insert("${M}/ggml-metal-ops.h" AFTER
+        "int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);"
+        "int ggml_metal_op_act_quant         (ggml_metal_op_t ctx, int idx);\n")
+
     insert("${M}/ggml-metal-ops.cpp" BEFORE
         "int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {"
-"static int ggml_metal_op_act_quant(ggml_metal_op_t ctx, int idx) {
+"int ggml_metal_op_act_quant(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
