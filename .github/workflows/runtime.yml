@@ -73,7 +73,10 @@ jobs:
           python scripts/make_parity_fixture.py --out fixture
           for m in rdt std; do
             python export.py --checkpoint fixture/$m.pt --output_dir fixture/$m --format gguf
-            python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --save-ref fixture/$m/ref.npz
+            for act in a4 a8; do
+              python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act $act \
+                --save-ref fixture/$m/ref_$act.npz
+            done
           done
 
       - name: Parity check
@@ -82,13 +85,18 @@ jobs:
           if [ -f build/bin/Release/yeoubi.exe ]; then EXE=build/bin/Release/yeoubi.exe; fi
           echo "EXE=$EXE" >> "$GITHUB_ENV"
           "$EXE" --list-devices
+          fail=0
           for m in rdt std; do
             for dev in $("$EXE" --list-devices | awk '{print $1}'); do
-              echo "== $m on $dev"
-              python scripts/check_runtime_parity.py --ref fixture/$m/ref.npz \
-                --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev"
+              for act in a8 a4; do
+                echo "== $m on $dev"
+                python scripts/check_runtime_parity.py --ref fixture/$m/ref_$act.npz \
+                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
+                  | grep -E '^\[a|FAIL|^OK|Error' || fail=1
+              done
             done
           done
+          exit $fail
 
       - name: Sample smoke run
         run: '"$EXE" -m fixture/rdt/model.gguf -p "Hello" -n 64 --steps 4 -v | od -c | head -n 5'
@@ -100,5 +108,5 @@ jobs:
           path: |
             build/bin/
             fixture/*/model.gguf
-            fixture/*/ref.npz
+            fixture/*/ref_*.npz
           if-no-files-found: warn

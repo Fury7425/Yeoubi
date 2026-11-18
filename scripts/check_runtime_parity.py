@@ -42,6 +42,12 @@ def reference(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
         moe_layers_override=None,
     ))
     model.eval()
+    if args.act == "a8":
+        # Matches the runtime's --act a8: no activation fake-quant at all.
+        from yeoubi.quantization import HybridQuantizer
+        for module in model.modules():
+            if isinstance(module, HybridQuantizer):
+                module.enabled = False
     if getattr(config, "recurrent_state_init_std", 0.0) > 0:
         print("warning: recurrent_state_init_std > 0 adds random noise; expect drift")
 
@@ -57,7 +63,7 @@ def reference(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
     return ids, logits[0, :, :VOCAB_SIZE].float().numpy()
 
 
-def runtime(args: argparse.Namespace, ids: np.ndarray, t: float, loops: int) -> np.ndarray:
+def runtime(args: argparse.Namespace, ids: np.ndarray, t: float, loops: int, act: str) -> np.ndarray:
     prompt = bytes(int(i) for i in ids if i != MASK_TOKEN_ID)
     with tempfile.TemporaryDirectory() as tmp:
         prompt_file = os.path.join(tmp, "prompt.bin")
@@ -65,7 +71,7 @@ def runtime(args: argparse.Namespace, ids: np.ndarray, t: float, loops: int) -> 
         with open(prompt_file, "wb") as f:
             f.write(prompt)
         cmd = [args.runtime, "-m", args.gguf, "-f", prompt_file, "-n", str(len(ids)),
-               "--t", str(t), "--dump-logits", out_file]
+               "--t", str(t), "--act", act, "--dump-logits", out_file]
         if loops:
             cmd += ["--loops", str(loops)]
         if args.device:
@@ -86,18 +92,21 @@ def main() -> None:
     p.add_argument("--length", type=int, default=64)
     p.add_argument("--t", type=float, default=0.5)
     p.add_argument("--loops", type=int, default=0)
+    p.add_argument("--act", choices=("a4", "a8"), default="a4",
+                   help="a4: trained INT4/TopK activations (sample.py default); "
+                        "a8: activation quant off on both sides, an exact graph check")
     p.add_argument("--trust_checkpoint", action="store_true")
     args = p.parse_args()
 
     if args.ref:
         saved = np.load(args.ref)
         ids, ref = saved["ids"], saved["logits"]
-        t, loops = float(saved["t"]), int(saved["loops"])
+        t, loops, act = float(saved["t"]), int(saved["loops"]), str(saved["act"])
     elif args.checkpoint:
         ids, ref = reference(args)
-        t, loops = args.t, args.loops
+        t, loops, act = args.t, args.loops, args.act
         if args.save_ref:
-            np.savez(args.save_ref, ids=ids, logits=ref, t=t, loops=loops)
+            np.savez(args.save_ref, ids=ids, logits=ref, t=t, loops=loops, act=act)
             print(f"saved reference logits to {args.save_ref}")
             return
     else:
@@ -105,13 +114,17 @@ def main() -> None:
     if not (args.gguf and args.runtime):
         p.error("comparing needs --gguf and --runtime")
 
-    got = runtime(args, ids, t, loops)
+    got = runtime(args, ids, t, loops, act)
     masked = ids == MASK_TOKEN_ID
     cos = (ref * got).sum(-1) / (np.linalg.norm(ref, axis=-1) * np.linalg.norm(got, axis=-1) + 1e-12)
     agree = (ref.argmax(-1) == got.argmax(-1))[masked].mean()
-    print(f"max |diff| {np.abs(ref - got).max():.4g}   min cosine {cos.min():.5f}   "
+    print(f"[{act}] max |diff| {np.abs(ref - got).max():.4g}   min cosine {cos.min():.5f}   "
           f"argmax agreement on masked bytes {agree:.3f}")
-    if cos.min() < 0.99 or agree < 0.9:
+    # a8 compares the same math up to ggml's 8-bit activation blocks, so it
+    # must be tight. a4 is looser on purpose: that block noise moves values
+    # across INT4 rounding edges, and every flip is a full quantization step.
+    min_cos, min_agree = (0.9999, 0.97) if act == "a8" else (0.999, 0.8)
+    if cos.min() < min_cos or agree < min_agree:
         sys.exit("FAIL: runtime and PyTorch disagree")
     print("OK")
 
