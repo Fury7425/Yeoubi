@@ -107,6 +107,13 @@ jobs:
                   --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" --weight-type $wt 2>&1 \
                   | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
               done
+              # The argsort TopK fallback (devices without TOP_K_MASK) must hold too.
+              for ref in a4 block; do
+                echo "== $m on $dev, argsort TopK"
+                YEOUBI_NO_FAST_TOPK=1 python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
+                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
+                  | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
+              done
             done
           done
           exit $fail

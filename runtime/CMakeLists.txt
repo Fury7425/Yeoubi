@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.19)
 project(yeoubi_runtime C CXX)
 
 # Backends are ggml's own options, passed straight through, e.g.
@@ -11,14 +11,25 @@ set(YEOUBI_GGML_TAG "v1.0.0" CACHE STRING "ggml git tag to build against")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# Adds a Vulkan kernel for GGML_OP_TOP_K_MASK (cmake/patch_ggml.cmake).
+set(PATCH_GGML ${CMAKE_COMMAND} -DGGML_SRC=<SOURCE_DIR> -DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_ggml.cmake)
+
 if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/ggml/CMakeLists.txt)
-    add_subdirectory(ggml)  # local checkout wins (offline / patched builds)
+    # Local checkout wins (offline / patched builds). Patching is idempotent.
+    execute_process(COMMAND ${CMAKE_COMMAND} -DGGML_SRC=${CMAKE_CURRENT_SOURCE_DIR}/ggml
+                            -DPATCH_DIR=${CMAKE_CURRENT_SOURCE_DIR}/patches
+                            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_ggml.cmake
+                    COMMAND_ERROR_IS_FATAL ANY)
+    add_subdirectory(ggml)
 else()
     include(FetchContent)
     FetchContent_Declare(ggml
         GIT_REPOSITORY https://github.com/ggml-org/ggml.git
         GIT_TAG        ${YEOUBI_GGML_TAG}
-        GIT_SHALLOW    TRUE)
+        GIT_SHALLOW    TRUE
+        PATCH_COMMAND  ${PATCH_GGML}
+        UPDATE_DISCONNECTED TRUE)  # never re-pull the pinned tag over the patch
     FetchContent_MakeAvailable(ggml)
 endif()
 

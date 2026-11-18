@@ -42,6 +42,7 @@
 #define MAX_LOOPS 256
 #define MAX_TOPK  16    // experts per token
 #define N_CONST   64    // distinct scalar constants per graph
+#define ZEROS_MAX 8192  // widest row the fast TopK path handles (the Vulkan kernel's limit)
 
 typedef struct ggml_tensor ten;
 
@@ -82,7 +83,7 @@ typedef struct {
     int    n_experts, top_k, kv_bits, kv_bos_bits;
     double topk_ratio, rope_theta, rope_factor, timestep_scale, state_std, capacity_factor;
     // runtime
-    int act;
+    int act, fast_topk;
     ggml_backend_t backend, cpu;
     ggml_backend_sched_t sched;
     struct ggml_context *wctx;
@@ -215,6 +216,18 @@ static int dev_supports(ggml_backend_dev_t dev, enum ggml_type type) {
     return ok;
 }
 
+// Can the device run the fast TopK path (ggml_top_k + TOP_K_MASK) natively?
+static int dev_supports_topk_mask(ggml_backend_dev_t dev) {
+    struct ggml_init_params ip = { 8 * ggml_tensor_overhead(), NULL, true };
+    struct ggml_context *c = ggml_init(ip);
+    ten *a    = ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 64);
+    ten *idx  = ggml_top_k(c, a, 1126);
+    ten *mask = ggml_top_k_mask(c, ggml_new_tensor_2d(c, GGML_TYPE_F32, 2048, 1), idx, NULL, NULL, NULL);
+    int ok = ggml_backend_dev_supports_op(dev, idx) && ggml_backend_dev_supports_op(dev, mask);
+    ggml_free(c);
+    return ok;
+}
+
 // Q4_0 holding ternary values: per 32-block scale = |max|, codes {7, 8, 9}.
 // (ggml's own Q4_0 quantizer is asymmetric and would clip one sign to 7/8.)
 static void pack_q4_0_ternary(const float *x, uint8_t *y, int64_t n) {
@@ -326,6 +339,9 @@ static void model_load(model_t *m, const char *path, int weight_type) {
     int is_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     enum ggml_type wt = weight_type >= 0 ? (enum ggml_type) weight_type
                       : is_cpu && dev_supports(dev, GGML_TYPE_TQ2_0) ? GGML_TYPE_TQ2_0 : GGML_TYPE_Q4_0;
+    // YEOUBI_NO_FAST_TOPK=1 forces the argsort path (for A/B checks).
+    m->fast_topk = !getenv("YEOUBI_NO_FAST_TOPK") && dev_supports_topk_mask(dev);
+    fprintf(stderr, "topk: %s\n", m->fast_topk ? "top_k + top_k_mask" : "argsort");
 
     // Weights: mirror every GGUF tensor into one buffer on the chosen device,
     // fusing projections that read the same input (see fuse_slot).
@@ -462,7 +478,7 @@ typedef struct {
     struct ggml_context *ctx;
     struct ggml_cgraph *gf;
     model_t *m;
-    ten *rope_cos, *rope_sin, *consts, *eye, *tril, *tbias;
+    ten *rope_cos, *rope_sin, *consts, *eye, *tril, *tbias, *zeros;
     float cvals[N_CONST];
     int ncon, kv, layer;
 } gb_t;
@@ -520,10 +536,14 @@ static ten *q_int4(gb_t *b, ten *x) {
 }
 
 // HybridQuantizer "topk_int8": keep the int(n * ratio) largest |x| per token,
-// then INT8. One descending argsort gives both numbers needed: column k-1 is
-// the TopK threshold, column 0 the INT8 scale (the largest survives TopK).
-// Not ggml_top_k: its indices are unordered, so the threshold needs a k-wide
-// 1-element gather, which on Vulkan cost a third of the whole step.
+// then INT8 with the row's absmax (the largest survives TopK).
+//
+// Fast path, where the device has both ops: ggml_top_k (radix select) picks
+// exactly k indices, TOP_K_MASK turns them into a dense 0 / -inf row and exp
+// makes that 1 / 0. Vulkan gets TOP_K_MASK from runtime/cmake/patch_ggml.cmake.
+// Fallback: one descending argsort, whose column k-1 is the threshold.
+// (ggml_top_k's indices are unordered, so reading the threshold from them
+// would need a k-wide gather, which on Vulkan cost a third of each step.)
 // ponytail: ggml_round rounds halves away from zero, torch to even; exact
 // .5 products are ~1 in 10^6 values and move one value by one level.
 static ten *q_topk8(gb_t *b, ten *x) {
@@ -533,6 +553,11 @@ static ten *q_topk8(gb_t *b, ten *x) {
     if (k < 1) k = 1;
     ten *a = ggml_abs(c, x);
     if (k >= n) return q_int8(b, x, row_max(b, a));
+    if (b->m->fast_topk && n <= ZEROS_MAX) {
+        ten *zeros = ggml_view_2d(c, b->zeros, n, 1, (size_t) n * sizeof(float), 0);
+        ten *mask  = ggml_top_k_mask(c, zeros, ggml_top_k(c, a, k), NULL, NULL, NULL);
+        return q_int8(b, ggml_mul(c, x, ggml_exp(c, mask)), row_max(b, a));
+    }
     ten *order = ggml_argsort(c, a, GGML_SORT_ORDER_DESC);
     ten *col0  = ggml_cont(c, ggml_view_2d(c, order, 1, rows, order->nb[1], 0));
     ten *colk  = ggml_cont(c, ggml_view_2d(c, order, 1, rows, order->nb[1], (size_t) (k - 1) * order->nb[0]));
@@ -834,6 +859,7 @@ static void build_graph(model_t *m, int T, int n_loops, int has_sc, int has_nois
     b.rope_cos = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);  // broadcast over heads
     b.rope_sin = ggml_new_tensor_3d(c, GGML_TYPE_F32, hd, 1, Tp);
     b.consts   = ggml_new_tensor_1d(c, GGML_TYPE_F32, N_CONST);
+    if (m->fast_topk) b.zeros = ggml_new_tensor_1d(c, GGML_TYPE_F32, ZEROS_MAX);  // TOP_K_MASK's mask row
     if (m->has_moe) {
         b.eye  = ggml_new_tensor_2d(c, GGML_TYPE_F32, m->n_experts, m->n_experts);
         b.tril = ggml_new_tensor_2d(c, GGML_TYPE_F32, Tp, Tp);
@@ -841,7 +867,7 @@ static void build_graph(model_t *m, int T, int n_loops, int has_sc, int has_nois
     ten *in_sc    = has_sc ? ggml_new_tensor_2d(c, GGML_TYPE_F32, VOCAB, T) : NULL;
     ten *in_sig   = m->is_rdt ? ggml_new_tensor_2d(c, GGML_TYPE_F32, m->loop_dim, n_loops) : NULL;
     ten *in_noise = has_noise ? ggml_new_tensor_2d(c, GGML_TYPE_F32, D, Tp) : NULL;
-    ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.consts, b.eye, b.tril, in_sc, in_sig, in_noise };
+    ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.consts, b.zeros, b.eye, b.tril, in_sc, in_sig, in_noise };
     for (size_t i = 0; i < sizeof inputs / sizeof *inputs; i++) if (inputs[i]) ggml_set_input(inputs[i]);
 
     // NoiseEmbedding MLP (the sinusoid features come from the host).
@@ -937,6 +963,10 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
         free(cs);
     }
     set_input(b.consts, b.cvals, sizeof(float) * N_CONST);
+    if (b.zeros) {
+        static const float zeros[ZEROS_MAX];
+        set_input(b.zeros, zeros, sizeof zeros);
+    }
     if (b.eye) {
         int N = m->n_experts;
         float *e = calloc((size_t) N * N + (size_t) Tp * Tp, sizeof(float));

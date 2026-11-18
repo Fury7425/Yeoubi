@@ -1,0 +1,52 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// GGML_OP_TOP_K_MASK for ggml's Vulkan backend (added by runtime/cmake/patch_ggml.cmake).
+//
+// Same result as the CPU op for the case supports_op admits: no score, no
+// blocks, no extra, one mask row. res[c, row] = mask[c] when c is among the
+// row's picks, else -inf. One workgroup per row: the picks set bits in a
+// shared bitmask, then every cell is written exactly once, so no ordering
+// between buffer writes from different invocations is needed.
+
+#include "generic_head.glsl"
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};   // mask  [n_kv]
+layout (binding = 1) readonly buffer B {int data_b[];};      // picks [n_top, rows]
+layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};  // res   [n_kv, rows]
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 256;
+
+#define MAX_CELLS 8192  // supports_op admits n_kv <= MAX_CELLS
+shared uint keep[MAX_CELLS / 32];
+
+void main() {
+    const uint row = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationID.x;
+    if (row >= p.KY) {
+        return;  // uniform across the workgroup
+    }
+    const uint n_kv  = p.KX;
+    const uint n_top = uint(p.param1);
+
+    for (uint i = tid; i < (n_kv + 31u) / 32u; i += BLOCK_SIZE) {
+        keep[i] = 0u;
+    }
+    barrier();
+
+    for (uint j = tid; j < n_top; j += BLOCK_SIZE) {
+        const int c = data_b[row * n_top + j];
+        if (c >= 0 && uint(c) < n_kv) {  // picks out of range are skipped, as on the CPU
+            atomicOr(keep[uint(c) >> 5], 1u << (uint(c) & 31u));
+        }
+    }
+    barrier();
+
+    const float ninf = uintBitsToFloat(0xff800000u);
+    for (uint c = tid; c < n_kv; c += BLOCK_SIZE) {
+        const bool kept = (keep[c >> 5] & (1u << (c & 31u))) != 0u;
+        data_d[row * n_kv + c] = kept ? D_TYPE(data_a[c]) : D_TYPE(ninf);
+    }
+}
