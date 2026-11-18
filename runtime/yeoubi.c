@@ -395,6 +395,12 @@ static ten *local_residual(gb_t *b, ten *x, ten *nw, ten *w) {
 
 static int clampi(int i, int n) { return i < n ? i : n - 1; }
 
+// Inputs a given model never reads (b.one without soft ACT, ...) are pruned
+// from the graph and get no buffer; writing to them would assert.
+static void set_input(ten *t, const void *data, size_t size) {
+    if (t && t->buffer) ggml_backend_tensor_set(t, data, 0, size);
+}
+
 static ten *recurrent(gb_t *b, ten *x, ten *temb, int n_loops, ten *noise, ten *sig) {
     struct ggml_context *c = b->ctx;
     model_t *m = b->m;
@@ -498,7 +504,7 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
     if (!ggml_backend_sched_alloc_graph(m->sched, gf)) die("graph allocation failed");
 
     // Host-side inputs.
-    ggml_backend_tensor_set(in_ids, ids, 0, sizeof(int32_t) * T);
+    set_input(in_ids, ids, sizeof(int32_t) * T);
     {
         int half = m->t_dim / 2;
         float *tf = calloc(m->t_dim, sizeof(float));
@@ -507,17 +513,17 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
             tf[j] = sinf(a);
             tf[half + j] = cosf(a);
         }
-        ggml_backend_tensor_set(in_tf, tf, 0, sizeof(float) * m->t_dim);
+        set_input(in_tf, tf, sizeof(float) * m->t_dim);
         free(tf);
     }
     {
         int32_t *pos = malloc(sizeof(int32_t) * Tp);
         for (int i = 0; i < Tp; i++) pos[i] = i;
-        ggml_backend_tensor_set(b.pos, pos, 0, sizeof(int32_t) * Tp);
+        set_input(b.pos, pos, sizeof(int32_t) * Tp);
         free(pos);
     }
     float one = 1.0f;
-    ggml_backend_tensor_set(b.one, &one, 0, sizeof one);
+    set_input(b.one, &one, sizeof one);
     if (b.freq_factors) {
         // YaRN ramp from RotaryEmbedding._scaled_inv_freq, as a divisor of theta.
         int n = hd / 2;
@@ -527,10 +533,10 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
             ramp = fminf(fmaxf((ramp - 0.25f) / 0.5f, 0.0f), 1.0f);
             ff[i] = 1.0f / ((1.0f - ramp) + ramp / (float) m->rope_factor);
         }
-        ggml_backend_tensor_set(b.freq_factors, ff, 0, sizeof(float) * n);
+        set_input(b.freq_factors, ff, sizeof(float) * n);
     }
-    if (in_sc) ggml_backend_tensor_set(in_sc, sc, 0, sizeof(float) * VOCAB * T);
-    if (in_noise) ggml_backend_tensor_set(in_noise, noise, 0, sizeof(float) * D * Tp);
+    if (in_sc) set_input(in_sc, sc, sizeof(float) * VOCAB * T);
+    if (in_noise) set_input(in_noise, noise, sizeof(float) * D * Tp);
     if (in_sig) {
         float *sig = malloc(sizeof(float) * m->loop_dim * n_loops);
         int half = m->loop_dim / 2;
@@ -549,7 +555,7 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
                 }
             }
         }
-        ggml_backend_tensor_set(in_sig, sig, 0, sizeof(float) * m->loop_dim * n_loops);
+        set_input(in_sig, sig, sizeof(float) * m->loop_dim * n_loops);
         free(sig);
     }
 

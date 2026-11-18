@@ -141,12 +141,11 @@ def export_checkpoint(args: argparse.Namespace) -> None:
     if args.format == "gguf":
         if packed:
             raise ValueError("--format gguf ternarizes weights itself; drop --pack.")
-        if getattr(config, "use_moe", False):
-            raise ValueError("The native runtime does not support MoE checkpoints yet.")
         from .gguf_export import write_gguf
         output_path = os.path.join(args.output_dir, "model.gguf")
+        state = {k: v.detach().cpu().float().numpy() for k, v in model.state_dict().items()}
         # Readable only by runtime/ (Yeoubi's own graph), not by llama.cpp.
-        write_gguf(model, config, output_path, is_rdt=hasattr(model, "rdt_config"))
+        write_gguf(state, asdict(config), output_path, is_rdt=hasattr(model, "rdt_config"))
         logger.info("Exported native-runtime GGUF to %s", output_path)
         return
     if args.format == "safetensors":

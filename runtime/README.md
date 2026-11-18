@@ -26,6 +26,18 @@ OpenVINO, Hexagon SDK, and so on). See ggml's build docs for each one.
 python export.py --checkpoint checkpoints/final.pt --output_dir export/ --format gguf
 ```
 
+On a machine without torch, the numpy-only exporter writes the same file. It
+reads the checkpoint zip directly and resolves no pickled code, the same
+safety rule as `weights_only=True`:
+
+```bash
+python -m yeoubi.gguf_export checkpoints/final.pt export/model.gguf
+```
+
+Prebuilt executables (Windows and Linux with Vulkan, macOS with Metal) come
+out of every CI run of `.github/workflows/runtime.yml`, as `yeoubi-<OS>`
+artifacts.
+
 ```bash
 cmake -S runtime -B runtime/build -DGGML_VULKAN=ON -DGGML_CUDA=ON
 ```

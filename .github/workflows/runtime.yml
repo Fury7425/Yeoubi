@@ -73,6 +73,9 @@ jobs:
           python scripts/make_parity_fixture.py --out fixture
           for m in rdt std; do
             python export.py --checkpoint fixture/$m.pt --output_dir fixture/$m --format gguf
+            # The torch-free exporter must write the same file.
+            python -m yeoubi.gguf_export fixture/$m.pt fixture/$m/numpy.gguf
+            cmp fixture/$m/model.gguf fixture/$m/numpy.gguf
             for act in a4 a8; do
               python scripts/check_runtime_parity.py --checkpoint fixture/$m.pt --act $act \
                 --save-ref fixture/$m/ref_$act.npz
@@ -92,7 +95,7 @@ jobs:
                 echo "== $m on $dev"
                 python scripts/check_runtime_parity.py --ref fixture/$m/ref_$act.npz \
                   --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
-                  | grep -E '^\[a|FAIL|^OK|Error' || fail=1
+                  | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
               done
             done
           done

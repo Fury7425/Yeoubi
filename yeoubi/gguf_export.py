@@ -13,18 +13,23 @@ exact (up to fp16 rounding of the scale) and, unlike ggml's 2-bit ternary
 types, Q4_0 has a matmul kernel on every ggml backend (CUDA, HIP, Vulkan,
 Metal, SYCL, OpenCL/Adreno, Hexagon, OpenVINO, CPU), so no backend falls back
 to the CPU for the hot path.
+
+This module needs only numpy, so a machine without torch can export a
+training checkpoint directly:
+
+    python -m yeoubi.gguf_export checkpoints/step_25000.pt export/model.gguf
 """
 
 from __future__ import annotations
 
+import collections
 import math
+import pickle
 import struct
-from dataclasses import asdict
+import sys
+import zipfile
 
 import numpy as np
-import torch
-
-from .quantization import absmean_quantize
 
 _ALIGN = 32
 # gguf_type values (gguf.h). Floats go out as F64: the runtime computes
@@ -51,66 +56,74 @@ def _kv(key: str, value) -> bytes | None:
     return None
 
 
-def _q4_0_ternary(latent: torch.Tensor) -> bytes:
+def _absmean_ternary(w: np.ndarray) -> tuple[np.ndarray, np.float32]:
+    """``quantization.absmean_quantize`` in float32 numpy (round half to even, as torch)."""
+    scale = np.float32(max(np.abs(w).mean(dtype=np.float32), np.float32(1e-8)))
+    return np.clip(np.round(w / scale), -1, 1).astype(np.int8), scale
+
+
+def _q4_0_ternary(w: np.ndarray) -> bytes:
     """Absmean-ternarize exactly like ``BitLinear`` and encode as Q4_0 blocks."""
-    w_q, scale = absmean_quantize(latent.detach().float())
-    q = (w_q.to(torch.int8).numpy() + 8).astype(np.uint8)  # {7, 8, 9}
+    w_q, scale = _absmean_ternary(w)
+    q = (w_q + 8).astype(np.uint8)  # {7, 8, 9}
     out_f, in_f = q.shape
     q = q.reshape(out_f, in_f // 32, 32)
     # quantize_row_q4_0_ref: qs[j] = x[j] | x[j + 16] << 4
     qs = q[..., :16] | (q[..., 16:] << 4)
-    d = np.full(qs.shape[:-1] + (1,), float(scale), dtype=np.float16).view(np.uint8)
+    d = np.full(qs.shape[:-1] + (1,), scale, dtype=np.float16).view(np.uint8)
     return np.concatenate([d, qs], axis=-1).tobytes()
 
 
-def _collect_tensors(model: torch.nn.Module, config) -> list[tuple[str, tuple, int, bytes]]:
-    """Return ``(name, torch_shape, ggml_type, data)`` for every runtime tensor."""
+def _collect_tensors(state: dict, config: dict) -> list[tuple[str, tuple, int, bytes]]:
+    """Return ``(name, numpy_shape, ggml_type, data)`` for every runtime tensor."""
     tensors = []
-    tie = getattr(config, "tie_embeddings", False)
-    for name, value in model.state_dict().items():
+    tie = config.get("tie_embeddings", False)
+    for name, value in state.items():
         if tie and name == "unembed.weight":
             continue  # the runtime reuses embed.weight
-        value = value.detach().cpu()
+        value = np.ascontiguousarray(value, dtype=np.float32)
         if name.endswith(".latent_weight"):
             base = name[: -len("latent_weight")] + "weight"
             if value.shape[1] % 32 == 0:
-                tensors.append((base, tuple(value.shape), _GGML_Q4_0, _q4_0_ternary(value)))
+                tensors.append((base, value.shape, _GGML_Q4_0, _q4_0_ternary(value)))
             else:
                 # ponytail: odd widths stay dequantized F32; none exist at the
                 # shipped shapes, so a packed path for them is not worth it.
-                w_q, scale = absmean_quantize(value.float())
-                tensors.append((base, tuple(value.shape), _GGML_F32,
-                                (w_q * scale).float().numpy().tobytes()))
+                w_q, scale = _absmean_ternary(value)
+                tensors.append((base, value.shape, _GGML_F32,
+                                (w_q.astype(np.float32) * scale).tobytes()))
             continue
-        value = value.float()
         if name == "recurrent.injection.A_raw":
             # Precompute the LTI diagonal; the runtime never needs A_raw.
-            name, value = "recurrent.injection.A", 0.99 * torch.tanh(value)
+            name, value = "recurrent.injection.A", (np.float32(0.99) * np.tanh(value)).astype(np.float32)
         elif name.endswith("_local.weight"):
             # Depthwise conv (D, 1, K) -> (K, D): ggml then sees one contiguous
             # [D] row per tap, which the runtime multiplies into shifted views.
-            value = value.squeeze(1).t().contiguous()
-        tensors.append((name, tuple(value.shape), _GGML_F32, value.numpy().tobytes()))
+            value = np.ascontiguousarray(value[:, 0, :].T)
+        tensors.append((name, value.shape, _GGML_F32, value.tobytes()))
     return tensors
 
 
-def write_gguf(model: torch.nn.Module, config, path: str, *, is_rdt: bool) -> None:
+def write_gguf(state: dict, config: dict, path: str, *, is_rdt: bool) -> None:
+    """``state``: name -> float numpy array (a model state dict); ``config``: asdict(config)."""
+    if config.get("use_moe"):
+        raise ValueError("The native runtime does not support MoE checkpoints yet.")
     kvs = [_kv("general.architecture", "yeoubi"),
            _kv("yeoubi.model_type", "rdt" if is_rdt else "standard")]
-    for key, value in asdict(config).items():
+    for key, value in config.items():
         if isinstance(value, float) and not math.isfinite(value):
             continue
         entry = _kv(f"yeoubi.{key}", value)
         if entry is not None:
             kvs.append(entry)
 
-    tensors = _collect_tensors(model, config)
+    tensors = _collect_tensors(state, config)
     header = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kvs)))
     for entry in kvs:
         header += entry
     offset = 0
     for name, shape, ggml_type, data in tensors:
-        # ggml dims run innermost-first: reverse the torch shape.
+        # ggml dims run innermost-first: reverse the numpy shape.
         header += _str(name) + struct.pack("<I", len(shape))
         header += struct.pack(f"<{len(shape)}Q", *reversed(shape))
         header += struct.pack("<IQ", ggml_type, offset)
@@ -122,3 +135,112 @@ def write_gguf(model: torch.nn.Module, config, path: str, *, is_rdt: bool) -> No
         for _, _, _, data in tensors:
             f.write(data)
             f.write(b"\0" * ((-len(data)) % _ALIGN))
+
+
+# ---------------------------------------------------------------------------
+# Torch-free checkpoint reader
+# ---------------------------------------------------------------------------
+
+_STORAGE_DTYPES = {
+    "FloatStorage": "<f4", "DoubleStorage": "<f8", "HalfStorage": "<f2",
+    "BFloat16Storage": "bf16", "LongStorage": "<i8", "IntStorage": "<i4",
+    "ShortStorage": "<i2", "CharStorage": "i1", "ByteStorage": "u1",
+    "BoolStorage": "?", "UntypedStorage": "u1",
+}
+
+# Mirrors utils._LEGACY_MODEL_CONFIG_DEFAULTS + rdt._LEGACY_RDT_CONFIG_DEFAULTS
+# (copied: both modules import torch). Keep in sync when a field is added.
+_LEGACY_DEFAULTS = {
+    "use_sub_norm": False,
+    "int4_absmean": False,
+    "timestep_scale": 1.0,
+    "detach_recurrent_anchor": True,
+    "recurrent_state_init_std": 0.0,
+}
+
+
+class _Stub:
+    """Stand-in for every global the checkpoint names that we do not need.
+
+    Resolving nothing real is what keeps this as safe as torch's
+    ``weights_only=True``: no constructor from the file ever runs.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        pass
+
+
+class _Lazy:
+    """A tensor view, read from the zip only if asked for (optimizer state never is)."""
+
+    def __init__(self, storage, offset, size, stride):
+        self.storage, self.offset, self.size, self.stride = storage, offset, tuple(size), tuple(stride)
+
+    def numpy(self) -> np.ndarray:
+        zf, member, dtype = self.storage
+        raw = zf.read(member)
+        if dtype == "bf16":
+            flat = (np.frombuffer(raw, "<u2").astype(np.uint32) << 16).view(np.float32)
+        else:
+            flat = np.frombuffer(raw, dtype)
+        view = np.lib.stride_tricks.as_strided(
+            flat[self.offset:], self.size, tuple(s * flat.itemsize for s in self.stride),
+        )
+        return np.array(view)
+
+
+def _rebuild_tensor(storage, offset, size, stride, *_):
+    return _Lazy(storage, offset, size, stride)
+
+
+def read_checkpoint_numpy(path: str) -> dict:
+    """Load a ``torch.save`` zip checkpoint with numpy; tensors come back as ``_Lazy``."""
+    zf = zipfile.ZipFile(path)
+    pkl = next(n for n in zf.namelist() if n.endswith("/data.pkl"))
+    root = pkl[: -len("/data.pkl")]
+
+    class Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if (module, name) == ("collections", "OrderedDict"):
+                return collections.OrderedDict
+            if (module, name) == ("torch._utils", "_rebuild_tensor_v2"):
+                return _rebuild_tensor
+            if (module, name) == ("torch._utils", "_rebuild_parameter"):
+                return lambda data, *_: data
+            if module == "torch" and name in _STORAGE_DTYPES:
+                return _STORAGE_DTYPES[name]
+            return _Stub
+
+        def persistent_load(self, pid):
+            _, dtype, key, _location, _numel = pid
+            return (zf, f"{root}/data/{key}", dtype if isinstance(dtype, str) else "u1")
+
+    with zf.open(pkl) as f:
+        return Unpickler(f).load()
+
+
+def export_checkpoint_file(ckpt_path: str, out_path: str) -> None:
+    ckpt = read_checkpoint_numpy(ckpt_path)
+    is_rdt = bool(ckpt.get("rdt_config")) or any(
+        k.startswith(("prelude.", "recurrent.", "coda.")) for k in ckpt["model_state_dict"]
+    )
+    config = dict(ckpt.get("rdt_config") or ckpt.get("model_config") or {})
+    if not config:
+        raise ValueError("checkpoint has no embedded config; use export.py with fallback flags")
+    for key, legacy in _LEGACY_DEFAULTS.items():
+        config.setdefault(key, legacy)
+    if config.get("vocab_size", 258) != 258:
+        raise ValueError("not a byte-level checkpoint")
+    state = {k: v.numpy() for k, v in ckpt["model_state_dict"].items() if isinstance(v, _Lazy)}
+    write_gguf(state, config, out_path, is_rdt=is_rdt)
+    print(f"wrote {out_path} ({'rdt' if is_rdt else 'standard'}, step {ckpt.get('step', '?')}, "
+          f"{len(state)} tensors)")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("usage: python -m yeoubi.gguf_export CHECKPOINT.pt OUT.gguf")
+    export_checkpoint_file(sys.argv[1], sys.argv[2])
