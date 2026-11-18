@@ -96,7 +96,7 @@ path.
   `TQ2_0` on CPUs and `Q4_0` on GPUs. Every GPU backend has tuned `Q4_0`
   kernels, and `TQ2_0` was 1.5× slower on an Arc iGPU. The repack is exact,
   because every value is 0 or ± the scale. To force a type, for example for
-  benchmarking, pass `--weight-type q4|tq2|tq1`.
+  benchmarking, pass `--weight-type q4|tq2|tq1|f16`.
 - Activations are quantized the same way as in `sample.py`: INT4 into
   q/k/v/up/gate, TopK followed by INT8 into o/down, and INT8 into the other
   layers. `--act a8` matches the A8 training stage (INT8 everywhere), and

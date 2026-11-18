@@ -240,6 +240,7 @@ static void *repack_ternary(const ten *src, enum ggml_type to, size_t *size) {
     *size = ggml_row_size(to, cols) * rows;
     void *dst = malloc(*size);
     if (to == GGML_TYPE_Q4_0) pack_q4_0_ternary(f, dst, n);
+    else if (to == GGML_TYPE_F16) ggml_fp32_to_fp16_row(f, dst, n);  // exact: +/- an fp16 scale
     else ggml_quantize_chunk(to, f, dst, 0, rows, cols, NULL);
     free(f);
     return dst;
@@ -801,18 +802,27 @@ static ten *recurrent(gb_t *b, ten *x, ten *temb, int n_loops, ten *noise, ten *
 // self-conditioning probabilities [T][VOCAB]. out: logits [T][embed rows]
 // (unused for KV_COMMIT). kv: KV_NONE (full canvas), KV_READ (attend over the
 // committed cache), KV_COMMIT (store this canvas at t = 0).
-static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
-                    const float *sc, const float *noise, float *out, int kv) {
+// The last built graph. A denoising loop calls forward() with the same shape
+// every step, so the graph is built and scheduled once and only its inputs
+// change: rebuilding cost several ms of host time per step.
+static struct {
+    struct ggml_context *ctx;
+    gb_t b;
+    ten *in_ids, *in_tf, *in_sc, *in_sig, *in_noise, *logits;
+    int T, loops, kv, kv_len, has_sc, has_noise;
+} G;
+
+static void build_graph(model_t *m, int T, int n_loops, int has_sc, int has_noise, int kv) {
     int D = m->hidden, P = m->patch, Tp = T / P, hd = m->head_dim;
-    if (kv != KV_NONE) {
-        if (m->is_rdt && n_loops != m->kv_loops) die("KV cache was sized for %d loops", m->kv_loops);
-        if (m->kv_len + Tp > m->kv_cap) die("KV cache full");
-    }
     int visits = m->n_pre + m->n_post + (m->is_rdt ? m->n_rec * n_loops : 0);
     size_t graph_size = (size_t) 320 * (visits + 4) + 4096;  // nodes; ~200 per block visit with MoE
     size_t mem = ggml_tensor_overhead() * graph_size * 2 + ggml_graph_overhead_custom(graph_size, false);
     struct ggml_init_params ip = { mem, NULL, true };
-    struct ggml_context *c = ggml_init(ip);
+    if (G.ctx) ggml_free(G.ctx);
+    memset(&G, 0, sizeof G);
+    struct ggml_context *c = G.ctx = ggml_init(ip);
+    G.T = T; G.loops = n_loops; G.kv = kv; G.kv_len = m->kv_len; G.has_sc = has_sc; G.has_noise = has_noise;
+    gb_t *bp = &G.b;
     gb_t b = { 0 };
     b.ctx = c;
     b.m = m;
@@ -828,9 +838,9 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
         b.eye  = ggml_new_tensor_2d(c, GGML_TYPE_F32, m->n_experts, m->n_experts);
         b.tril = ggml_new_tensor_2d(c, GGML_TYPE_F32, Tp, Tp);
     }
-    ten *in_sc    = sc && m->self_cond_proj ? ggml_new_tensor_2d(c, GGML_TYPE_F32, VOCAB, T) : NULL;
+    ten *in_sc    = has_sc ? ggml_new_tensor_2d(c, GGML_TYPE_F32, VOCAB, T) : NULL;
     ten *in_sig   = m->is_rdt ? ggml_new_tensor_2d(c, GGML_TYPE_F32, m->loop_dim, n_loops) : NULL;
-    ten *in_noise = m->is_rdt && noise ? ggml_new_tensor_2d(c, GGML_TYPE_F32, D, Tp) : NULL;
+    ten *in_noise = has_noise ? ggml_new_tensor_2d(c, GGML_TYPE_F32, D, Tp) : NULL;
     ten *inputs[] = { in_ids, in_tf, b.rope_cos, b.rope_sin, b.consts, b.eye, b.tril, in_sc, in_sig, in_noise };
     for (size_t i = 0; i < sizeof inputs / sizeof *inputs; i++) if (inputs[i]) ggml_set_input(inputs[i]);
 
@@ -875,6 +885,35 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
 
     ggml_backend_sched_reset(m->sched);
     if (!ggml_backend_sched_alloc_graph(m->sched, b.gf)) die("graph allocation failed");
+    *bp = b;
+    G.in_ids = in_ids; G.in_tf = in_tf; G.in_sc = in_sc; G.in_sig = in_sig; G.in_noise = in_noise;
+    G.logits = logits;
+}
+
+// One denoiser call. ids: T byte IDs (T % patch == 0). sc: optional
+// self-conditioning probabilities [T][VOCAB]. out: logits [T][embed rows]
+// (unused for KV_COMMIT). kv: KV_NONE (full canvas), KV_READ (attend over the
+// committed cache), KV_COMMIT (store this canvas at t = 0).
+static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
+                    const float *sc, const float *noise, float *out, int kv) {
+    int D = m->hidden, P = m->patch, Tp = T / P, hd = m->head_dim;
+    if (kv != KV_NONE) {
+        if (m->is_rdt && n_loops != m->kv_loops) die("KV cache was sized for %d loops", m->kv_loops);
+        if (m->kv_len + Tp > m->kv_cap) die("KV cache full");
+    }
+    int has_sc = sc && m->self_cond_proj, has_noise = m->is_rdt && noise;
+    // YEOUBI_NO_GRAPH_REUSE=1 rebuilds every call; CI checks both give
+    // byte-identical samples.
+    static int no_reuse = -1;
+    if (no_reuse < 0) no_reuse = getenv("YEOUBI_NO_GRAPH_REUSE") != NULL;
+    // Commits always rebuild: their cache offsets move every time.
+    if (!G.ctx || no_reuse || kv == KV_COMMIT || G.T != T || G.loops != n_loops || G.kv != kv ||
+        G.kv_len != m->kv_len || G.has_sc != has_sc || G.has_noise != has_noise) {
+        build_graph(m, T, n_loops, has_sc, has_noise, kv);
+    }
+    gb_t b = G.b;
+    ten *in_ids = G.in_ids, *in_tf = G.in_tf, *in_sc = G.in_sc, *in_sig = G.in_sig;
+    ten *in_noise = G.in_noise, *logits = G.logits;
 
     // Host-side inputs.
     set_input(in_ids, ids, sizeof(int32_t) * T);
@@ -935,7 +974,6 @@ static void forward(model_t *m, const int32_t *ids, int T, float t, int n_loops,
     if (ggml_backend_sched_graph_compute(m->sched, b.gf) != GGML_STATUS_SUCCESS) die("graph compute failed");
     if (logits) ggml_backend_tensor_get(logits, out, 0, ggml_nbytes(logits));
     if (kv == KV_COMMIT) m->kv_len += Tp;
-    ggml_free(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,7 +1253,7 @@ static void usage(void) {
         "  --revise F            overwrite visible bytes above this confidence (default off)\n"
         "  --revise-t-max F      only revise when t <= F (default 0.5)\n"
         "  --act a4|a8|none      activation quant: trained A4 stage (default), A8 stage, off\n"
-        "  --weight-type T       q4 | tq2 | tq1: in-memory ternary format (default: best native one)\n"
+        "  --weight-type T       q4 | tq2 | tq1 | f16: in-memory ternary format (default: fastest for the device)\n"
         "  --dump-logits F       one forward at --t, write float32 logits, exit\n"
         "  --t F                 noise level for --dump-logits (default 1.0)\n"
         "  -v, --verbose         per-step progress and timing on stderr\n");
@@ -1265,7 +1303,7 @@ int main(int argc, char **argv) {
         else if (OPT("--weight-type")) {
             const char *v = argv[++i];
             weight_type = !strcmp(v, "q4") ? GGML_TYPE_Q4_0 : !strcmp(v, "tq2") ? GGML_TYPE_TQ2_0
-                        : !strcmp(v, "tq1") ? GGML_TYPE_TQ1_0 : -2;
+                        : !strcmp(v, "tq1") ? GGML_TYPE_TQ1_0 : !strcmp(v, "f16") ? GGML_TYPE_F16 : -2;
             if (weight_type == -2) usage();
         }
         else if (OPT("--remask")) {
@@ -1338,6 +1376,7 @@ int main(int argc, char **argv) {
     rng_state = o.seed;
     int rc = o.block ? run_block(&m, &o, prompt, plen) : run_canvas(&m, &o, prompt, plen);
 
+    if (G.ctx) ggml_free(G.ctx);
     ggml_backend_sched_free(m.sched);
     if (m.kvbuf) ggml_backend_buffer_free(m.kvbuf);
     if (m.kvctx) ggml_free(m.kvctx);

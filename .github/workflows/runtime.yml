@@ -101,7 +101,7 @@ jobs:
                   | grep -vE '^ggml_(metal|vulkan)|^(device|wrote) ' || fail=1
               done
               # Every in-memory ternary format must repack the TQ1_0 file exactly.
-              for wt in q4 tq2 tq1; do
+              for wt in q4 tq2 tq1 f16; do
                 echo "== $m on $dev as $wt"
                 python scripts/check_runtime_parity.py --ref fixture/$m/ref_none.npz \
                   --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" --weight-type $wt 2>&1 \
@@ -110,6 +110,15 @@ jobs:
             done
           done
           exit $fail
+
+      - name: Graph reuse gives identical samples
+        run: |
+          for args in "-m fixture/rdt/model.gguf -p Hello -n 64 --steps 6" \
+                      "-m fixture/moe/model.gguf -p Hello -n 48 --block 16 --steps 4"; do
+            "$EXE" $args -d CPU > reuse.txt
+            YEOUBI_NO_GRAPH_REUSE=1 "$EXE" $args -d CPU > rebuild.txt
+            cmp reuse.txt rebuild.txt
+          done
 
       - name: Sample smoke run
         run: |

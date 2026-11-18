@@ -113,7 +113,7 @@ def main() -> None:
     p.add_argument("--gguf")
     p.add_argument("--runtime", help="path to the built yeoubi executable")
     p.add_argument("--device", default=None, help="runtime --device (default: best)")
-    p.add_argument("--weight-type", choices=("q4", "tq2", "tq1"), default=None,
+    p.add_argument("--weight-type", choices=("q4", "tq2", "tq1", "f16"), default=None,
                    help="runtime --weight-type (default: the device's best native type)")
     p.add_argument("--prompt", default="The quick brown fox")
     p.add_argument("--length", type=int, default=64)
