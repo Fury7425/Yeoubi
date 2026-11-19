@@ -142,12 +142,17 @@ jobs:
           done
           exit $fail
 
+      # --weight-type pinned: each run times q4 against tq2 at load, and on the macOS
+      # runner the two tied within 5%, so the runs picked different (both exact, but
+      # differently rounded) kernels and the samples differed for that reason alone.
+      # ponytail: the flash-vs-matmul attention autotune can still flip on a near
+      # tie (margins seen so far are 2x or more); pin it too if this step flakes.
       - name: Graph reuse gives identical samples
         run: |
           for args in "-m fixture/rdt/model.gguf -p Hello -n 64 --steps 6" \
                       "-m fixture/moe/model.gguf -p Hello -n 48 --block 16 --steps 4"; do
-            "$EXE" $args -d CPU > reuse.txt
-            YEOUBI_NO_GRAPH_REUSE=1 "$EXE" $args -d CPU > rebuild.txt
+            "$EXE" $args -d CPU --weight-type q4 > reuse.txt
+            YEOUBI_NO_GRAPH_REUSE=1 "$EXE" $args -d CPU --weight-type q4 > rebuild.txt
             cmp reuse.txt rebuild.txt
           done
 
