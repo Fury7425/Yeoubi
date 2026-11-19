@@ -138,6 +138,13 @@ class TrainConfig:
     grad_accum_steps: int = 16
     grad_clip_norm: float = 1.0
     min_lr_ratio: float = 0.1       # cosine floor: decays to 10% of peak LR, not 0
+    # Warmup-stable-decay instead of cosine when decay_steps > 0: the LR holds at its
+    # peak until decay_start_step, then falls linearly to min_lr_ratio over
+    # decay_steps. A run whose length is set by free-GPU quota rather than by
+    # max_steps never reaches the cosine's tail; this lets any checkpoint be
+    # finished with a short decay branch while the main run keeps going.
+    decay_start_step: int = 0
+    decay_steps: int = 0
     a4_warmup_fraction: float = 0.10
     # Loss weighting: "mdlm" applies the continuous-time MDLM NELBO weight
     # w(t) per masked token (better sample-efficiency); "uniform" is plain
@@ -353,6 +360,10 @@ class ActivationSchedule:
         Returns:
             ``"A8"`` or ``"A4"``.
         """
+        # A fraction of 0 means never: without the guard the switch would still fire
+        # on the very last step, right before final.pt is written.
+        if self.a4_warmup_fraction <= 0:
+            return "A8"
         return "A4" if step >= self.transition_step else "A8"
 
     def __repr__(self) -> str:
@@ -378,6 +389,17 @@ def _cosine_with_warmup(
     progress = min(max(progress, 0.0), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+def _wsd(
+    step: int, warmup_steps: int, decay_start_step: int, decay_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> float:
+    """LR multiplier for warmup-stable-decay (see TrainConfig.decay_steps)."""
+    if step < warmup_steps:
+        return max(step, 0) / max(warmup_steps, 1)
+    progress = min(max(step - decay_start_step, 0) / decay_steps, 1.0)
+    return 1.0 - (1.0 - min_lr_ratio) * progress
 
 
 # ---------------------------------------------------------------------------
@@ -562,9 +584,16 @@ def _build_optimizer_and_scheduler(
         ``(optimizer, scheduler)`` — both wrappers around one or two underlying
         torch optimizers/schedulers.
     """
-    lr_lambda = lambda step: _cosine_with_warmup(  # noqa: E731
-        step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio
-    )
+    # Neither function is stored in a checkpoint (LambdaLR saves only its step), so a
+    # resume with decay flags switches an existing cosine run over to the decay.
+    if cfg.decay_steps > 0:
+        lr_lambda = lambda step: _wsd(  # noqa: E731
+            step, cfg.warmup_steps, cfg.decay_start_step, cfg.decay_steps, cfg.min_lr_ratio
+        )
+    else:
+        lr_lambda = lambda step: _cosine_with_warmup(  # noqa: E731
+            step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio
+        )
 
     if cfg.use_muon:
         muon_params, adamw_params = split_params_for_muon(model)
@@ -1035,6 +1064,8 @@ def train(cfg: TrainConfig) -> None:
         raise ValueError("correction_t_max must be in (0, 1]")
     if cfg.length_bucket_window < 0:
         raise ValueError("length_bucket_window must be >= 0")
+    if cfg.decay_steps < 0 or cfg.decay_start_step < 0:
+        raise ValueError("decay_steps and decay_start_step must be >= 0")
 
     # Multi-GPU: launched by torchrun (WORLD_SIZE > 1), one process per GPU with
     # DDP-averaged gradients. Plain `python train.py` stays single-process.
