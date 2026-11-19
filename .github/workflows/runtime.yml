@@ -230,6 +230,7 @@ jobs:
           EXE=build/bin/Release/yeoubi.exe
           echo "EXE=$EXE" >> "$GITHUB_ENV"
           "$EXE" --list-devices
+          cpu_name=$("$EXE" --list-devices | awk '$1 == "CPU" {$1 = ""; print}')
           python scripts/make_parity_fixture.py --out fixture
           fail=0
           for m in rdt std moe; do
@@ -247,9 +248,20 @@ jobs:
                 gate=1
                 case "$dev" in OPENVINO*) [ "$m" = std ] && [ "$ref" != block ] || gate=0 ;; esac
                 echo "== $m on $dev ($ref)$([ $gate = 0 ] && echo ', not gated')"
-                python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
-                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1 \
-                  | grep -E '^\[|FAIL|^topk|rror' || [ $gate = 0 ] || fail=1
+                out=$(python scripts/check_runtime_parity.py --ref fixture/$m/ref_$ref.npz \
+                  --gguf fixture/$m/model.gguf --runtime "$EXE" --device "$dev" 2>&1) && rc=0 || rc=$?
+                # 3221225501 = 0xC000001D, illegal instruction. OpenVINO's CPU plugin hit
+                # it on a Xeon Platinum 8573C runner, while an earlier run on that CPU
+                # model (2a61995, same OpenVINO code path) passed and AMD EPYC runners pass,
+                # while ggml's CPU backend ran fine on the same machine. The runner's
+                # VM decides it, not this code, so it is reported, not failed.
+                case "$dev" in OPENVINO*)
+                  if [ $rc != 0 ] && echo "$out" | grep -q 'exit status 3221225501'; then
+                    echo "SKIP: illegal instruction inside OpenVINO on $(echo "$cpu_name" | head -1)"
+                    continue
+                  fi ;;
+                esac
+                echo "$out" | grep -E '^\[|FAIL|^topk|rror' && [ $rc = 0 ] || [ $gate = 0 ] || fail=1
               done
             done
           done
