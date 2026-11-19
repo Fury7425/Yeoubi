@@ -146,6 +146,13 @@ class TrainConfig:
     decay_start_step: int = 0
     decay_steps: int = 0
     a4_warmup_fraction: float = 0.10
+    # >0: switch to the hybrid A4 stage at this absolute step, overriding
+    # a4_warmup_fraction. A run sized by free-GPU quota never reaches 90% of
+    # max_steps, and a decay branch's shortened max_steps would move the
+    # fraction's switch point, so a run that wants A4 names the step instead.
+    # Every session and branch of one run must pass the same value: a resume
+    # without it would switch an A4 checkpoint back to A8.
+    a4_start_step: int = 0
     # Loss weighting: "mdlm" applies the continuous-time MDLM NELBO weight
     # w(t) per masked token (better sample-efficiency); "uniform" is plain
     # mean cross-entropy over masked positions (legacy behaviour).
@@ -339,17 +346,23 @@ class ActivationSchedule:
     Stage 1 (first ~90% of training): A8 mode — all activations are INT8.
     Stage 2 (final ~10% of training): A4 mode — hybrid INT4 + TopK-INT8.
 
-    The transition point is ``max_steps * (1 - a4_warmup_fraction)``.
+    The transition point is ``a4_start_step`` when it is set, otherwise
+    ``max_steps * (1 - a4_warmup_fraction)``.
 
     Args:
         max_steps: Total number of training steps.
         a4_warmup_fraction: Fraction of total steps allocated to A4 mode.
+        a4_start_step: If > 0, the absolute step where A4 begins.
     """
 
-    def __init__(self, max_steps: int, a4_warmup_fraction: float = 0.10):
+    def __init__(self, max_steps: int, a4_warmup_fraction: float = 0.10, a4_start_step: int = 0):
         self.max_steps = max_steps
         self.a4_warmup_fraction = a4_warmup_fraction
-        self.transition_step = int(max_steps * (1.0 - a4_warmup_fraction))
+        self.a4_start_step = a4_start_step
+        self.transition_step = (
+            a4_start_step if a4_start_step > 0
+            else int(max_steps * (1.0 - a4_warmup_fraction))
+        )
 
     def get_mode(self, step: int) -> str:
         """Return the activation mode for the given step.
@@ -362,13 +375,14 @@ class ActivationSchedule:
         """
         # A fraction of 0 means never: without the guard the switch would still fire
         # on the very last step, right before final.pt is written.
-        if self.a4_warmup_fraction <= 0:
+        if self.a4_start_step <= 0 and self.a4_warmup_fraction <= 0:
             return "A8"
         return "A4" if step >= self.transition_step else "A8"
 
     def __repr__(self) -> str:
         return (f"ActivationSchedule(transition_step={self.transition_step}, "
-                f"max_steps={self.max_steps}, a4_frac={self.a4_warmup_fraction})")
+                f"max_steps={self.max_steps}, a4_frac={self.a4_warmup_fraction}, "
+                f"a4_start={self.a4_start_step})")
 
 
 # ---------------------------------------------------------------------------
@@ -1279,7 +1293,7 @@ def train(cfg: TrainConfig) -> None:
     loss_fn = MaskDiffusionLoss(weighting=loss_weighting, t_min=cfg.loss_t_min)
     logger.info("Loss weighting: %s (t_min=%.1e)", loss_weighting, cfg.loss_t_min)
     schedule = CosineSchedule()
-    act_schedule = ActivationSchedule(cfg.max_steps, cfg.a4_warmup_fraction)
+    act_schedule = ActivationSchedule(cfg.max_steps, cfg.a4_warmup_fraction, cfg.a4_start_step)
     logger.info("Activation schedule: %s", act_schedule)
 
     optimizer, lr_scheduler = _build_optimizer_and_scheduler(model, cfg)

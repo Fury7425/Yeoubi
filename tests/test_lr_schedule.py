@@ -42,3 +42,11 @@ def test_a4_fraction_zero_never_switches():
     schedule = train_mod.ActivationSchedule(1000, 0.0)
     assert schedule.get_mode(1000) == "A8"
     assert train_mod.ActivationSchedule(1000, 0.1).get_mode(900) == "A4"
+
+
+def test_a4_start_step_overrides_the_fraction():
+    # A decay branch passes fraction 0 and a shortened max_steps; the start step wins.
+    schedule = train_mod.ActivationSchedule(64_000, 0.0, a4_start_step=60_000)
+    assert schedule.get_mode(59_999) == "A8"
+    assert schedule.get_mode(60_000) == "A4"
+    assert train_mod.ActivationSchedule(929_577, 0.1, a4_start_step=70_000).get_mode(70_000) == "A4"
