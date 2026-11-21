@@ -9,21 +9,33 @@ run it, and any op a backend lacks runs on the CPU instead.
 |---|---|---|
 | NVIDIA | CUDA | `-DGGML_CUDA=ON` |
 | AMD | HIP/ROCm | `-DGGML_HIP=ON` |
-| Any GPU (AMD, NVIDIA, Intel Arc and Core Ultra iGPUs, Adreno, Mali) | Vulkan | `-DGGML_VULKAN=ON` |
+| Any GPU (AMD, NVIDIA, Intel, Adreno, Mali) | Vulkan | `-DGGML_VULKAN=ON` |
 | Apple GPU | Metal | `-DGGML_METAL=ON` (default on macOS) |
+| Intel CPU, GPU and NPU | OpenVINO | `-DGGML_OPENVINO=ON` |
 | Intel GPU | SYCL | `-DGGML_SYCL=ON` |
 | Qualcomm Hexagon NPU | Hexagon | `-DGGML_HEXAGON=ON` |
 | Qualcomm Adreno GPU | OpenCL | `-DGGML_OPENCL=ON` |
 | CPU (x86, ARM, RISC-V) | CPU | always on |
 
 Each backend needs its own SDK installed (CUDA toolkit, ROCm, Vulkan SDK,
-Hexagon SDK, and so on). See ggml's build docs for each one.
+OpenVINO, Hexagon SDK, and so on). See ggml's build docs for each one.
 
-Intel CPUs and GPUs use Vulkan: the prebuilt Windows exe runs on an Arc or
-Core Ultra iGPU with only the Intel graphics driver installed. OpenVINO was
-dropped: ggml's OpenVINO translator treats `VIEW` as a no-op, which broke
-RDT and MoE models and the KV-cached sampler, and its CPU plugin crashed on
-some CI machines.
+CI builds Vulkan for Windows and Linux and Metal for macOS; there is no
+prebuilt OpenVINO exe, so an OpenVINO build is made locally with
+`-DGGML_OPENVINO=ON` and the OpenVINO toolkit installed. OpenVINO picks its
+target from an environment variable,
+`GGML_OPENVINO_DEVICE`, which can be `CPU`, `GPU` or `NPU`, where `NPU` is
+the Core Ultra's AI Boost unit. With that set, select the OpenVINO entry
+from `--list-devices` with `-d`. The OpenVINO backend has no `TOP_K` or
+`TOP_K_MASK` and does not know the fused quantizer, so on that device the
+runtime uses its argsort and stock-op paths automatically.
+
+**OpenVINO support is experimental.** ggml's OpenVINO graph translator
+follows llama.cpp's graph conventions and treats `VIEW` as a no-op, which
+this runtime's graphs do not survive in most places. Flat (non-RDT) models
+in the full-canvas sampler match PyTorch on the OpenVINO CPU and GPU
+devices. RDT and MoE models, the KV-cached block sampler, and the NPU do
+not work yet. Use Vulkan for the Arc GPU.
 
 ## Build
 
