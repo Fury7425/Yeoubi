@@ -153,7 +153,7 @@ history).
 `runtime/yeoubi.c` is a C re-implementation, on ggml, of the eval forward pass
 (MoE and activation quantization included), `denoise()`, and `BlockDiffusionSampler`
 with its quantized KV cache. It is the deployment path for CUDA, HIP, Vulkan, Metal,
-SYCL, OpenVINO, Hexagon and OpenCL. Its input comes from `export.py --format gguf`
+SYCL, Hexagon and OpenCL; Intel GPUs go through Vulkan. Its input comes from `export.py --format gguf`
 or from the torch-free `python -m yeoubi.gguf_export CKPT OUT.gguf`
 (`yeoubi/gguf_export.py`), which stores ternary weights as exact Q4_0. **Any change
 to the forward pass in `model.py`/`rdt.py`, or to the samplers, must be mirrored

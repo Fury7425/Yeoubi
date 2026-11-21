@@ -4,7 +4,8 @@ project(yeoubi_runtime C CXX)
 
 # Backends are ggml's own options, passed straight through, e.g.
 #   -DGGML_CUDA=ON  -DGGML_HIP=ON  -DGGML_VULKAN=ON  -DGGML_METAL=ON
-#   -DGGML_SYCL=ON  -DGGML_OPENVINO=ON  -DGGML_HEXAGON=ON  -DGGML_OPENCL=ON
+#   -DGGML_SYCL=ON  -DGGML_HEXAGON=ON  -DGGML_OPENCL=ON
+# Intel CPUs and GPUs (Arc, Core Ultra iGPUs) use Vulkan.
 # Several may be enabled at once; --list-devices shows what was built.
 set(YEOUBI_GGML_TAG "v1.0.0" CACHE STRING "ggml git tag to build against")
 # One self-contained executable: nothing to copy next to it, nothing to install.
