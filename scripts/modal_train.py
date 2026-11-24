@@ -203,10 +203,9 @@ def run(mode, gpu, data_repo, ckpt_repo, micro_batch=0, compile_model=False,
         "--gradient_checkpointing", "false", "--save_every", "500",
         "--muon_weight_decay", "0.01", "--max_runtime_hours", f"{runtime:.3f}",
         "--num_workers", "2", "--wandb_project", "",
-        # validate() reads val_max_batches batches of batch_size, so a bigger batch would
-        # score more of val.jsonl than Kaggle does (50 x 4 = 200 sequences) and the
-        # numbers would stop being comparable across platforms.
-        "--val_max_batches", str(200 // micro),
+        # Validate in Kaggle's batches of 4 whatever the training batch, so both score
+        # the same 200 sequences at the same noise levels and their curves line up.
+        "--val_batch_size", "4",
     ]
     # Its own session, so a stop signal from Modal reaches train.py only as the SIGTERM
     # forwarded below. Sent to the whole group, it arrived as SIGINT and interrupted

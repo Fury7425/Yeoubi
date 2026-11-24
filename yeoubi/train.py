@@ -20,6 +20,7 @@ import os
 import signal
 import time
 from dataclasses import asdict, dataclass
+from dataclasses import replace as replace_fields   # "replace" is a local name below
 from typing import Optional
 
 import torch
@@ -258,6 +259,11 @@ class TrainConfig:
     async_checkpoint: bool = True
     # Maximum validation batches per evaluation run (reduce to speed up).
     val_max_batches: int = 50
+    # Sequences per validation batch; 0 means batch_size. validate() gives each
+    # sequence a fixed noise level in loader order, so another batch size scores a
+    # different sample and the curve stops matching other hardware: an H100 at batch
+    # 16 read about 0.07 above Kaggle's batch-4 numbers on the same checkpoint.
+    val_batch_size: int = 0
     # Batch training examples of similar length together: sort this many
     # consecutive examples by length before cutting batches, so almost no
     # position is padding (about a third were). Each batch carries a loss
@@ -1263,7 +1269,8 @@ def train(cfg: TrainConfig) -> None:
     val_loader = None
     if val_paths and is_main:   # validation and samples run on rank 0 only
         val_loader = _build_dataloader(
-            val_paths, cfg, pad_token_id
+            val_paths, replace_fields(cfg, batch_size=cfg.val_batch_size or cfg.batch_size),
+            pad_token_id,
         )
 
     # Loss, optimizer, scheduler
