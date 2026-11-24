@@ -1415,6 +1415,10 @@ def train(cfg: TrainConfig) -> None:
     running_loss = torch.zeros((), device=device)
     running_grad_norm = torch.zeros((), device=device)
     running_masked_frac = torch.zeros((), device=device)
+    # Optimizer steps summed into the running totals. Usually 50, but a resume from a
+    # step that is not a multiple of 50 makes the first window shorter, and dividing
+    # that by 50 logged a loss far too low (0.06 after a resume two steps short of one).
+    steps_since_log = 0
     step_in_accum = 0
     # Optimizer steps dropped for non-finite gradients since the last log line.
     skipped_steps = 0
@@ -1597,6 +1601,7 @@ def train(cfg: TrainConfig) -> None:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+            steps_since_log += 1
             step_in_accum = 0
 
             # --- Activation mode transition ---
@@ -1615,9 +1620,9 @@ def train(cfg: TrainConfig) -> None:
 
             # --- Logging ---
             if global_step % 50 == 0:
-                avg_loss = running_loss.item() / 50
-                avg_grad_norm = running_grad_norm.item() / 50
-                avg_masked_frac = running_masked_frac.item() / 50
+                avg_loss = running_loss.item() / steps_since_log
+                avg_grad_norm = running_grad_norm.item() / steps_since_log
+                avg_masked_frac = running_masked_frac.item() / steps_since_log
                 # Per-optimizer LR (one value when AdamW-only, two with Muon).
                 opt_lrs = [opt.param_groups[0]["lr"] for opt in optimizer.optimizers]
                 lr = opt_lrs[0]  # primary (AdamW) LR for the headline log line.
@@ -1638,8 +1643,8 @@ def train(cfg: TrainConfig) -> None:
                 wandb_logger.log(log_data, step=global_step)
                 if skipped_steps:
                     logger.warning(
-                        "Skipped %d of the last 50 optimizer steps: non-finite gradients.",
-                        skipped_steps,
+                        "Skipped %d of the last %d optimizer steps: non-finite gradients.",
+                        skipped_steps, steps_since_log,
                     )
                 # A stray overflow is routine under fp16 (the scaler grows its
                 # scale until one happens). A whole window of them means the
@@ -1653,6 +1658,7 @@ def train(cfg: TrainConfig) -> None:
                         "the newest checkpoint with --bf16 true or a lower learning rate."
                     )
                 skipped_steps = 0
+                steps_since_log = 0
                 running_loss.zero_()
                 running_grad_norm.zero_()
                 running_masked_frac.zero_()
