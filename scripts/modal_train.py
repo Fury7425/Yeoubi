@@ -16,8 +16,8 @@ Measure each GPU's speed first (about 10 minutes each, run side by side, nothing
     modal run scripts/modal_train.py --mode bench --gpus L4,A100-40GB,H100 \
         --data-repo NAME/yeoubi-data --ckpt-repo NAME/yeoubi-ckpt
 
-Then train on the cheapest-per-step GPU. --detach keeps it running after the terminal
-closes; follow it on modal.com/apps:
+Then train on the cheapest-per-step GPU. --detach plus the spawn in main() hand the run
+to Modal and return; follow it on modal.com/apps or with `modal app logs <app id> -f`:
     modal run --detach scripts/modal_train.py --mode train --gpu H100 --hours 7 \
         --sec-per-step 0.3 --data-repo NAME/yeoubi-data --ckpt-repo NAME/yeoubi-ckpt
 
@@ -287,8 +287,13 @@ def main(mode: str = "bench", gpu: str = "A100-40GB", gpus: str = "L4,A100-40GB,
         if price:
             print(f"{gpu} for {hours:g} h is about ${hours * price:.2f} of GPU time, "
                   "plus a little CPU and memory.")
-        run.with_options(gpu=gpu, timeout=int(hours * 3600 + 1800)).remote(
+        # spawn, not remote: the client returns at once and nothing local is left to stop
+        # the run. A killed `modal run --detach` client that was still waiting on .remote()
+        # sent a cancellation and ended a training run.
+        call = run.with_options(gpu=gpu, timeout=int(hours * 3600 + 1800)).spawn(
             "train", gpu, data_repo, ckpt_repo, micro_batch, compile_model,
             minutes, time.time() + hours * 3600, sec_per_step)
+        print(f"Training started as {call.object_id}. Follow it with "
+              "`python -m modal app logs <app id> -f` (`python -m modal app list` shows the id).")
     else:
         raise SystemExit("--mode is bench or train")
