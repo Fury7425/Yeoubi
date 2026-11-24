@@ -107,6 +107,14 @@ class CheckpointSync:
             if len(resumable) > KEEP:
                 # Deleted files keep counting toward storage until the history is squashed.
                 self.api.super_squash_history(self.repo)
+                # Squashing drops old files from the history, but the Hub keeps their
+                # stored bytes, still counted toward the storage limit, until they are
+                # deleted by hash: 89 of them (78 GB) filled the account at step 142000.
+                live = {f.lfs.sha256 for f in self.api.list_repo_tree(self.repo, expand=True)
+                        if getattr(f, "lfs", None)}
+                dead = [f for f in self.api.list_lfs_files(self.repo) if f.file_oid not in live]
+                if dead:
+                    self.api.permanently_delete_lfs_files(self.repo, dead)
 
     def loop(self):
         while True:
