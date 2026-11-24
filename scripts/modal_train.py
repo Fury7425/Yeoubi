@@ -209,7 +209,9 @@ def run(mode, gpu, data_repo, ckpt_repo, micro_batch=0, compile_model=False,
         "--bf16", "false" if gpu == "T4" else "true",
         "--compile_model", "true" if compile_model else "false",
         "--gradient_checkpointing", "false", "--save_every", "500",
-        "--muon_weight_decay", "0.01", "--max_runtime_hours", f"{runtime:.3f}",
+        # 0.005 from step 172000 (was 0.01); colab_train.ipynb says why. Keep it equal
+        # to the notebooks' value: sessions of one run must not disagree.
+        "--muon_weight_decay", "0.005", "--max_runtime_hours", f"{runtime:.3f}",
         "--num_workers", "2", "--wandb_project", "",
         # Validate in Kaggle's batches of 4 whatever the training batch, so both score
         # the same 200 sequences at the same noise levels and their curves line up.
