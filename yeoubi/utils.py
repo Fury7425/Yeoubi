@@ -505,7 +505,10 @@ def load_checkpoint(
         Dict with ``step``, ``activation_mode``, and any ``extra`` metadata.
     """
     ckpt = read_checkpoint(path, device=device, trust_checkpoint=trust_checkpoint)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # save_checkpoint stores the unwrapped model's keys, so a torch.compile wrapper
+    # (whose keys carry "_orig_mod.") must be unwrapped here too or a resume with
+    # --compile_model true fails on every key.
+    getattr(model, "_orig_mod", model).load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler is not None and ckpt.get("scheduler_state_dict") is not None:

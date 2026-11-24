@@ -159,7 +159,7 @@ def run(mode, gpu, data_repo, ckpt_repo, micro_batch=0, compile_model=False,
     # A preempted container restarts from the top, so the time left comes from a fixed
     # deadline rather than from --hours: a restart cannot overspend the budget.
     hours_left = minutes / 60 if mode == "bench" else (deadline - time.time()) / 3600
-    if hours_left < 0.1:
+    if mode == "train" and hours_left < 0.1:
         print("the deadline has passed; nothing to do")
         return {"gpu": gpu, "error": "deadline passed"}
     # Enough parts for the time left at sec_per_step, plus slack. Too few and the loader
